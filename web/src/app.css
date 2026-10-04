@@ -1,0 +1,44 @@
+/*
+ * Astryx owns every component surface. This file is deliberately tiny — it
+ * only covers what a design system legitimately does not: the document root
+ * and a couple of app-level primitives that have no component equivalent.
+ *
+ * Everything here uses Astryx tokens; no raw hex, no magic pixel values.
+ */
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-background-body);
+  color: var(--color-text-primary);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Tabular figures for dense numeric data (spend, tokens, latency). */
+.tnum {
+  font-family: var(--font-family-code);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+/* The console's signature monospace eyebrow label. */
+.eyebrow {
+  font-family: var(--font-family-code);
+  font-size: var(--text-size-xsm);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  /* Secondary, not disabled: the disabled tone fails AA contrast on both grounds. */
+  color: var(--color-text-secondary);
+}
+
+/* Recharts injects focusable wrappers that trap the keyboard; neutralise. */
+.recharts-wrapper:focus,
+.recharts-surface:focus {
+  outline: none;
+}

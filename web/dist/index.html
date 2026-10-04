@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <title>llm-router console</title>
+    <script>
+      // Apply the persisted colour mode before first paint, otherwise the page
+      // flashes the OS default until React mounts. Astryx's reset.css maps
+      // data-theme on <html> to color-scheme, which is what light-dark() reads.
+      try {
+        var m = localStorage.getItem("llmr_theme");
+        document.documentElement.setAttribute("data-theme", m === "light" ? "light" : "dark");
+      } catch (e) {
+        document.documentElement.setAttribute("data-theme", "dark");
+      }
+    </script>
+    <script type="module" crossorigin src="/assets/index-BtEp7lq8.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-C_A9CtZX.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

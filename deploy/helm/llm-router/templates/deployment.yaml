@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-llm-router
+  labels: &labels
+    app.kubernetes.io/name: llm-router
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels: *labels
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      containers:
+        - name: llm-router
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--mode={{ .Values.mode }}"]
+          ports:
+            - containerPort: 8080
+          env:
+            {{- $secret := .Values.existingSecret | default (printf "%s-llm-router" .Release.Name) }}
+            {{- if eq .Values.mode "all" }}
+            - name: LLMR_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: {{ $secret }}, key: database-url}}
+            - name: LLMR_ADMIN_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ $secret }}, key: admin-token, optional: true}}
+            - name: LLMR_ENCRYPTION_KEY
+              valueFrom: {secretKeyRef: {name: {{ $secret }}, key: encryption-key}}
+            {{- else }}
+            - name: LLMR_CONTROL_PLANE_URL
+              value: {{ required "controlPlaneUrl is required in mode=gateway" .Values.controlPlaneUrl | quote }}
+            - name: LLMR_NODE_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ $secret }}, key: node-token}}
+            - name: LLMR_SNAPSHOT_CACHE
+              value: /var/lib/llmrouter/snapshot.json
+            {{- end }}
+          {{- if eq .Values.mode "gateway" }}
+          volumeMounts:
+            - name: snapshot-cache
+              mountPath: /var/lib/llmrouter
+          {{- end }}
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8080}
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8080}
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+      {{- if eq .Values.mode "gateway" }}
+      volumes:
+        - name: snapshot-cache
+          emptyDir: {}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}

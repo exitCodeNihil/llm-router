@@ -1,0 +1,49 @@
+# Live reload for the Go gateway. Driven by `make dev`, which also starts the
+# Vite dev server for the console.
+#
+# Only .go files trigger a rebuild — the console has its own HMR and must never
+# cause a Go restart. node_modules and dist are excluded from the watcher
+# entirely to keep the file-descriptor count sane.
+
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  cmd = "go build -o ./tmp/llmrouter ./cmd/llmrouter"
+  bin = "./tmp/llmrouter"
+  # Inherits LLMR_* from the environment that `make dev` exports.
+  full_bin = "./tmp/llmrouter"
+
+  include_ext = ["go"]
+  exclude_dir = [
+    "tmp",
+    "bin",
+    "docs",
+    "deploy",
+    "catalog",
+    ".git",
+    ".github",
+    ".claude",
+    "web/node_modules",
+    "web/dist",
+    "web/src",
+    "web/scripts",
+  ]
+  exclude_regex = ["_test\\.go"]
+
+  # Debounce bursts of writes (e.g. gofmt-on-save across several files).
+  delay = 400
+  stop_on_error = false
+  send_interrupt = true
+  kill_delay = "2s"
+
+[log]
+  time = false
+  main_only = false
+
+[misc]
+  clean_on_exit = true
+
+[screen]
+  clear_on_rebuild = false
+  keep_scroll = true

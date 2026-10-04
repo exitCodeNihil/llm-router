@@ -1,0 +1,42 @@
+name: llm-router
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: llmrouter
+      POSTGRES_PASSWORD: llmrouter
+      POSTGRES_DB: llmrouter
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U llmrouter"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  llmrouter:
+    # `up -d` pulls the published image; `up -d --build` builds it from source instead.
+    image: ghcr.io/exitcodenihil/llm-router:${LLMR_VERSION:-latest}
+    build: ..
+    ports:
+      - "8080:8080"
+      - "8081:8081" # workspace IDE, on its own origin
+    environment:
+      LLMR_DATABASE_URL: postgres://llmrouter:llmrouter@postgres:5432/llmrouter
+      # Both are required and refuse placeholder values:
+      #   export LLMR_ADMIN_TOKEN=$(openssl rand -hex 16) LLMR_ENCRYPTION_KEY=$(openssl rand -hex 16)
+      LLMR_ADMIN_TOKEN: ${LLMR_ADMIN_TOKEN:?set LLMR_ADMIN_TOKEN (openssl rand -hex 16)}
+      LLMR_ENCRYPTION_KEY: ${LLMR_ENCRYPTION_KEY:?set LLMR_ENCRYPTION_KEY (openssl rand -hex 16)}
+      # The IDE is served from a second listener so a page rendered inside a
+      # workspace can never call the console's API as you.
+      LLMR_IDE_LISTEN: ":8081"
+      LLMR_IDE_ORIGIN: ${LLMR_IDE_ORIGIN:-http://localhost:8081}
+      # Registers the pass-through provider so Claude Code can use your own
+      # claude.ai subscription through the gateway. Stores no credential.
+      LLMR_SEED_CLAUDE_SUBSCRIPTION: ${LLMR_SEED_CLAUDE_SUBSCRIPTION:-1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

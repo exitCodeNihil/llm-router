@@ -1,0 +1,124 @@
+# Local development / testing stack: Postgres (gateway DB), Zitadel (OIDC IdP),
+# and Langfuse (observability). Works with `docker compose` and `podman compose`.
+#
+#   cd deploy
+#   docker compose -f docker-compose.dev.yml up -d
+#   ./dev-stack-setup.sh          # creates Zitadel project, SSO app, test users
+#
+# Run the gateway on the HOST, not in this compose file — the Zitadel issuer is
+# http://localhost:8082, which only resolves correctly from the host:
+#
+#   LLMR_DATABASE_URL=postgres://llmrouter:llmrouter@localhost:5433/llmrouter \
+#   LLMR_ADMIN_TOKEN=dev-admin-token \
+#   LLMR_ENCRYPTION_KEY=dev-encryption-key \
+#   go run ./cmd/llmrouter
+#
+# Credentials (dev-only, hardcoded on purpose):
+#   Zitadel console   http://localhost:8082  zitadel-admin@zitadel.localhost / Password1!
+#   Zitadel SSO user  testdev / Password1!               (created by the setup script)
+#   Langfuse UI       http://localhost:3001  admin@example.com / Password1!
+#   Langfuse API      public pk-lf-dev-1234 · secret sk-lf-dev-1234
+#     → paste these into the console: Settings → Observability, host http://localhost:3001
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: llmrouter
+      POSTGRES_PASSWORD: llmrouter
+      POSTGRES_DB: llmrouter
+    ports:
+      - "5433:5432" # 5433 to avoid clashing with any local postgres
+    volumes:
+      - pgdata-dev:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U llmrouter"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  zitadel-db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: zitadel
+    volumes:
+      - zitadel-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  zitadel:
+    image: ghcr.io/zitadel/zitadel:latest
+    command: start-from-init --masterkey "MasterkeyNeedsToHave32Characters" --tlsMode disabled
+    depends_on:
+      zitadel-db:
+        condition: service_healthy
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./zitadel-pat:/pat
+    environment:
+      ZITADEL_DATABASE_POSTGRES_HOST: zitadel-db
+      ZITADEL_DATABASE_POSTGRES_PORT: 5432
+      ZITADEL_DATABASE_POSTGRES_DATABASE: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_USERNAME: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_PASSWORD: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: disable
+      ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: postgres
+      ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: postgres
+      ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
+      ZITADEL_EXTERNALDOMAIN: localhost
+      ZITADEL_EXTERNALPORT: 8082
+      ZITADEL_EXTERNALSECURE: "false"
+      # machine user whose PAT lands in ./zitadel-pat/pat.txt for the setup script
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_USERNAME: automation
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_NAME: automation
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_EXPIRATIONDATE: "2030-01-01T00:00:00Z"
+      ZITADEL_FIRSTINSTANCE_PATPATH: /pat/pat.txt
+
+  langfuse-db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  langfuse:
+    image: docker.io/langfuse/langfuse:2
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    ports:
+      - "3001:3000"
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      NEXTAUTH_SECRET: dev-nextauth-secret-0123456789abcdef
+      NEXTAUTH_URL: http://localhost:3001
+      SALT: dev-salt
+      TELEMETRY_ENABLED: "false"
+      # deterministic dev project + login so the gateway config is copy-paste
+      LANGFUSE_INIT_ORG_ID: org-dev
+      LANGFUSE_INIT_ORG_NAME: llm-router
+      LANGFUSE_INIT_PROJECT_ID: proj-dev
+      LANGFUSE_INIT_PROJECT_NAME: llm-router-dev
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-dev-1234
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-dev-1234
+      LANGFUSE_INIT_USER_EMAIL: admin@example.com
+      LANGFUSE_INIT_USER_NAME: Admin
+      LANGFUSE_INIT_USER_PASSWORD: Password1!
+
+volumes:
+  pgdata-dev:
+  zitadel-pgdata:
+  langfuse-pgdata:
