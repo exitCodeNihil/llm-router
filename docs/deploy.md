@@ -1,15 +1,6 @@
 # Deploying
 
-Three ways to run llm-router, smallest first. All of them are the same binary; only
-where Postgres lives and who terminates TLS changes. Environment variables are listed in
-[configuration.md](configuration.md#environment--flags).
-
-| You want | Use |
-|---|---|
-| Try it, or run it for a team on one machine | [Docker Compose](#docker-compose) |
-| Run it on a cluster | [Kubernetes with Helm](#kubernetes-with-helm) |
-| Serve callers in another region | [Edge nodes](edge.md) |
-| No containers | `go build -o llmrouter ./cmd/llmrouter` (the console is committed in `web/dist`, so no Node needed), then run `./llmrouter --mode=all` with `LLMR_DATABASE_URL`, `LLMR_ENCRYPTION_KEY` and `LLMR_ADMIN_TOKEN` set |
+One binary everywhere. What changes is where Postgres lives and who terminates TLS.
 
 ## Docker Compose
 
@@ -18,32 +9,20 @@ git clone https://github.com/exitcodenihil/llm-router && cd llm-router
 ./deploy/quickstart.sh
 ```
 
-The script writes `deploy/.env` once (admin token and encryption key from `openssl rand`),
-starts Postgres and the gateway, waits for `/healthz`, and prints the console URL. It
-never overwrites `deploy/.env`: **back it up**. `LLMR_ENCRYPTION_KEY` protects stored provider
-credentials, and starting with a different key makes them unreadable.
+This writes `deploy/.env` once, starts Postgres and the gateway, and prints the console URL. **Back
+up `deploy/.env`**: `LLMR_ENCRYPTION_KEY` protects stored provider keys, and a different key makes
+them unreadable. Use `--build` to build from source, and `LLMR_VERSION=0.1.0` in `deploy/.env` to
+pin a release. Only 8080 (console and API) and 8081 (workspace IDEs) are published.
 
-- `./deploy/quickstart.sh --build` builds the image from source instead of pulling it.
-- Pin a release with `LLMR_VERSION=0.1.0` in `deploy/.env` (image tags have no `v` prefix).
-- Postgres is not published to the host; only 8080 (console and API) and 8081 (workspace
-  IDEs) are. Bind them to localhost when something else terminates TLS:
-  change `"8080:8080"` to `"127.0.0.1:8080:8080"` in `deploy/docker-compose.yml`.
-
-### TLS with Caddy
-
-Put a reverse proxy in front for HTTPS. Save as `deploy/Caddyfile`:
+For HTTPS, add Caddy. `deploy/Caddyfile`:
 
 ```
 router.example.com {
 	reverse_proxy llmrouter:8080
 }
-# Only if you use workspaces:
-ide.example.com {
-	reverse_proxy llmrouter:8081
-}
 ```
 
-and as `deploy/docker-compose.caddy.yml`:
+`deploy/docker-compose.caddy.yml`:
 
 ```yaml
 services:
@@ -56,18 +35,15 @@ volumes:
   caddy-data:
 ```
 
-then `docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.caddy.yml up -d`.
-With workspaces, also set in `deploy/.env`: `LLMR_IDE_ORIGIN=https://ide.example.com` and
-`LLMR_COOKIE_DOMAIN=.example.com`.
+```bash
+docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.caddy.yml up -d
+```
 
-## Kubernetes with Helm
+## Kubernetes
 
-The chart in [`deploy/helm/llm-router`](../deploy/helm/llm-router) runs the control plane
-(`mode=all`) or an edge node (`mode=gateway`). It does not ship a database: bring a managed
-Postgres (RDS, Cloud SQL, Azure Database, CloudNativePG, ...) and point `LLMR_DATABASE_URL`
-at an existing empty database. The gateway creates its own schema on start.
-
-Keep secrets out of Helm values by creating them yourself:
+The Helm chart in `deploy/helm/llm-router` runs the control plane (`mode=all`) or an edge node
+(`mode=gateway`). Bring your own Postgres and point at an existing empty database; the gateway
+creates its schema on start.
 
 ```bash
 kubectl create secret generic llm-router \
@@ -75,28 +51,62 @@ kubectl create secret generic llm-router \
   --from-literal=admin-token="$(openssl rand -hex 16)" \
   --from-literal=encryption-key="$(openssl rand -hex 16)"
 
-helm install llm-router ./deploy/helm/llm-router \
-  --set existingSecret=llm-router \
-  --set ingress.enabled=true,ingress.host=router.example.com \
-  --set ingress.className=nginx
+helm install llm-router ./deploy/helm/llm-router --set existingSecret=llm-router \
+  --set ingress.enabled=true,ingress.host=router.example.com,ingress.className=nginx
 ```
 
-For TLS add `ingress.tls` (a standard Ingress `tls:` list) or let your ingress controller
-issue certificates through `ingress.annotations`. Probes use `/healthz`. Keep `replicas: 1`
-for the control plane; scale out with [edge nodes](edge.md).
+Add `ingress.tls` for HTTPS. Keep one control-plane replica and scale with edge nodes.
 
-`helm upgrade llm-router ./deploy/helm/llm-router --set image.tag=<version>` upgrades.
+## Edge nodes
+
+Stateless gateways near your callers. They sync config from the control plane, check keys and
+budgets locally, keep serving if the control plane goes down, and ship usage back in batches. In
+the console open **Edge nodes**, register a node, and copy its one-time token, then:
+
+```bash
+LLMR_CONTROL_PLANE_URL=https://router.example.com LLMR_NODE_TOKEN=llmrn_… \
+  llmrouter --mode=gateway --listen :8080
+# or: helm install edge ./deploy/helm/llm-router \
+#       --set mode=gateway,controlPlaneUrl=https://router.example.com,nodeToken=llmrn_…
+```
+
+Config changes reach nodes in about 2 seconds. Budgets and rate limits are enforced per node, so
+with N nodes a budget can overshoot by about N times the spend per sync. Edge nodes can't create
+users: a first-time user has to reach the control plane once.
+
+## Configuration
+
+| Variable | Used by | Meaning |
+|---|---|---|
+| `LLMR_DATABASE_URL` | control plane | Postgres URL (required) |
+| `LLMR_ENCRYPTION_KEY` | control plane | Encrypts provider keys and signs sessions; 16+ characters, required |
+| `LLMR_ADMIN_TOKEN` | control plane | Bootstrap admin token, 12+ characters (optional) |
+| `LLMR_LISTEN` | all | Listen address, default `:8080` |
+| `LLMR_MODE` | all | `all` (default) or `gateway` |
+| `LLMR_CONTROL_PLANE_URL`, `LLMR_NODE_TOKEN` | edge | Where to sync from and how to authenticate |
+| `LLMR_SNAPSHOT_CACHE` | edge | Config cache path (default `/var/lib/llmrouter/snapshot.json`) |
+| `LLMR_SEED_CLAUDE_SUBSCRIPTION` | control plane | `1` adds the [subscription pass-through](clients.md#on-your-claudeai-subscription) provider and models |
+| `LLMR_IDE_LISTEN`, `LLMR_IDE_ORIGIN`, `LLMR_COOKIE_DOMAIN` | control plane | [Workspace IDE](workspaces.md) listener, its public origin, and the session cookie domain when it is another hostname |
+
+Placeholder secrets such as `change-me` are refused. Generate them with `openssl rand -hex 16`.
+
+## Operating
+
+- **Langfuse**: **Observability** exports request traces. Rules choose which traffic is exported
+  and whether prompts leave the gateway (off by default). With no rules, nothing is exported.
+  Wrong credentials are rejected per batch, so check the delivery health on that page.
+- **Response headers**: every `/v1` response from an upstream carries `X-Request-Id`,
+  `X-Llmr-Provider`, `X-Llmr-Upstream` and `X-Llmr-Attempts`.
+- **Upgrades**: pull the new tag and restart. Migrations apply on start and only go forward, so
+  back up Postgres first.
 
 ## Production checklist
 
-- **Postgres**: managed, with backups. Everything (keys, budgets, usage, config) lives there.
-- **`LLMR_ENCRYPTION_KEY`**: stored in your secret manager and backed up. Rotating it means
-  re-entering provider keys and signing everyone out.
-- **TLS** in front of 8080. API keys and the admin token travel in headers.
-- **Admin token**: it is a bootstrap credential. Create real admin accounts (or configure
-  SSO) in the console and unset `LLMR_ADMIN_TOKEN` when you no longer need it.
-- **Workspaces** need a container runtime socket or a Kubernetes service account, which is
-  host- or cluster-level trust. Leave them off unless you need them, and read
-  [Workspaces](configuration.md#workspaces) first. Do not expose 8081 otherwise.
-- **Upgrades**: pull the new tag and restart. Schema migrations apply on start and are
-  forward-only, so take a database backup first; there is no downgrade.
+- Managed Postgres with backups.
+- `LLMR_ENCRYPTION_KEY` in a secret manager and backed up. Rotating it means re-entering provider
+  keys and signing everyone out.
+- TLS in front of 8080.
+- Create real admin accounts or SSO, then unset `LLMR_ADMIN_TOKEN`.
+- Leave [workspaces](workspaces.md) off unless you need them. They need a container socket or
+  cluster credentials, which is host-level trust.
+- Set `LLMR_IDE_ORIGIN` if you use workspaces, and don't expose 8081 otherwise.

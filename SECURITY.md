@@ -14,7 +14,7 @@ it, before details are made public.
 
 **In scope:** the gateway, management API, console, edge protocol, auth (keys, sessions,
 SSO, cloud tokens), and the workspace isolation described in
-[docs/configuration.md](docs/configuration.md#workspaces).
+[docs/workspaces.md](docs/workspaces.md).
 
 **Out of scope:** issues that need an attacker who already holds the admin token or the
 `LLMR_ENCRYPTION_KEY`, and the workspace container runtime socket being powerful (it is, and

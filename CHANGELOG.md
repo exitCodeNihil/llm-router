@@ -7,11 +7,11 @@ Initial release.
 - OpenAI-compatible gateway (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
   `/v1/models`) with streaming passthrough and exact token accounting
 - Providers: Azure OpenAI / AI Foundry (Entra ID or api-key outbound auth, native price
-  catalog), Google Vertex AI (Application Default Credentials, a service-account JSON key,
-  or an express-mode API key; Gemini and every Model Garden MaaS model through the
+  catalog), Google Vertex AI (Application Default Credentials or a service-account JSON key;
+  Gemini and every Model Garden MaaS model through the
   OpenAI-compatible endpoint, Claude through rawPredict; publisher-catalogue discovery and
-  `gcp/` catalog prices), OpenRouter (discovery carries its published prices into the
-  model's custom pricing) and any OpenAI-compatible backend (vLLM, LM Studio, TGI, Ollama)
+  `gcp/` catalog prices), OpenRouter (discovery fills in its published prices from the
+  catalog) and any OpenAI-compatible backend (vLLM, LM Studio, TGI, Ollama)
   with custom per-model pricing
 - Pass-through auth mode (`oauth_passthrough`): forwards the caller's own upstream
   credential and `anthropic-beta` header instead of storing one, so Claude Code can run
