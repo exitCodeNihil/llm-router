@@ -39,11 +39,11 @@ func (m *Server) availableModels(w http.ResponseWriter, r *http.Request) {
 	}
 	// The caller's own policy: what a personal key of theirs may call.
 	me := &auth.Identity{User: snap.UsersByID[CallerFrom(r.Context()).UserID]}
-	for _, name := range snap.ModelNames() {
+	// Every name, patterns included: "claude-*" tells a member which names work.
+	for name, ds := range snap.DeploymentsByModel {
 		if !me.ModelAllowed(name) {
 			continue
 		}
-		ds := snap.DeploymentsByModel[name]
 		am := availableModel{Name: name, Backends: len(ds), Passthrough: snap.CallerCredentialOnly(name), Status: "ok"}
 		seen := map[string]bool{}
 		cold := 0

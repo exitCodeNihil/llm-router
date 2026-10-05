@@ -35,6 +35,11 @@ Entra ID on Foundry needs the "Azure AI User" role on the resource.
 Upstream names starting with `claude` use the Anthropic protocol automatically, which Foundry and
 Vertex require. A provider can serve a given upstream model under one model name only.
 
+**Patterns**: a model name ending in `*` matches every name with that prefix. If the upstream
+name ends in `*` too, the requested name is sent on, so `claude-*` with upstream `claude-*` serves
+every Claude model, including ones released later. Exact names win, then the longest prefix. A
+pattern has one price for every name it serves.
+
 ## Routing
 
 Give several models the same **Model name** (the same model on Vertex and OpenRouter, say). The

@@ -119,11 +119,11 @@ func (g *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			usageCounts{}, http.StatusNotFound, start, nil, "", telemetryDecision(snap, id),
 			emitExtra{ErrorCode: code})
 	}
-	if !id.ModelAllowed(areq.Model) {
+	alias, deployments := snap.Resolve(areq.Model)
+	if !id.ModelAllowed(areq.Model, alias) {
 		refuse("model_not_allowed")
 		return
 	}
-	deployments := snap.DeploymentsByModel[areq.Model]
 	if len(deployments) == 0 {
 		refuse("model_not_found")
 		return

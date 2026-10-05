@@ -25,11 +25,13 @@ type Identity struct {
 // the caller carries — the team's, the user's and the key's. A nil list at
 // any level means that level does not restrict. So an admin can pin a team
 // or a person to a set of models once, and no key they mint can widen it.
-func (id *Identity) ModelAllowed(model string) bool {
+// names are the requested model and, when it resolved through a pattern, that
+// pattern ("claude-*"): a level passes when it lists either.
+func (id *Identity) ModelAllowed(names ...string) bool {
 	if id == nil {
 		return false
 	}
-	if id.Team != nil && id.Team.AllowedModels != nil && !id.Team.AllowedModels[model] {
+	if id.Team != nil && !allows(id.Team.AllowedModels, names) {
 		return false
 	}
 	if id.User != nil {
@@ -39,14 +41,28 @@ func (id *Identity) ModelAllowed(model string) bool {
 		if policy == nil {
 			policy = id.User.TeamModels
 		}
-		if policy != nil && !policy[model] {
+		if !allows(policy, names) {
 			return false
 		}
 	}
-	if id.Key != nil && id.Key.AllowedModels != nil && !id.Key.AllowedModels[model] {
+	if id.Key != nil && !allows(id.Key.AllowedModels, names) {
 		return false
 	}
 	return true
+}
+
+// allows reports whether a policy list admits any of names. A nil list does
+// not restrict; an empty one admits nothing.
+func allows(list map[string]bool, names []string) bool {
+	if list == nil {
+		return true
+	}
+	for _, n := range names {
+		if list[n] {
+			return true
+		}
+	}
+	return false
 }
 
 // GenerateKey returns (secret, sha256 hash, display prefix).

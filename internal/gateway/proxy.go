@@ -54,14 +54,14 @@ func (g *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "missing_model", "model field is required")
 		return
 	}
-	if !id.ModelAllowed(body.Model) {
+	alias, deployments := snap.Resolve(body.Model)
+	if !id.ModelAllowed(body.Model, alias) {
 		writeError(w, http.StatusNotFound, "invalid_request_error", "model_not_allowed",
 			"model "+body.Model+" is not available for this API key")
 		g.emit(snap, id, nil, body, reqID, usageCounts{}, http.StatusNotFound, start, nil, "",
 			telemetryDecision(snap, id), emitExtra{ErrorCode: "model_not_allowed"})
 		return
 	}
-	deployments := snap.DeploymentsByModel[body.Model]
 	if len(deployments) == 0 {
 		writeError(w, http.StatusNotFound, "invalid_request_error", "model_not_found",
 			"model "+body.Model+" does not exist")

@@ -224,7 +224,7 @@ function DeploymentForm({
             value={modelName}
             onChange={setModelName}
             placeholder="gpt-4o"
-            description="What clients send as the model"
+            description="What clients send as the model. End with * to match a prefix, e.g. claude-*"
             isRequired
           />
           <Typeahead

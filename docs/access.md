@@ -14,6 +14,8 @@ full key is shown once; only a hash is stored. Send it as `Authorization: Bearer
 - A person's default is the union of their teams' lists; a team with no list allows everything.
 - A user's own list replaces that default.
 - A key can only narrow it further.
+- Listing a [pattern](providers.md#add-a-model) such as `claude-*` allows every name it serves,
+  but not a model that has its own exact name.
 
 A request must pass every list that applies. `/v1/models` on a key returns what it may call.
 

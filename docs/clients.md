@@ -11,20 +11,17 @@ your models filled in. Examples below use `http://localhost:8080`.
 Claude Code keeps its own login. The gateway forwards it untouched and records every request;
 no credential is stored.
 
-1. The quickstart adds an `anthropic-subscription` provider with the current Claude models. Claude
-   Code's default names change between releases, and any the gateway lacks fail with
-   `404 model … does not exist`. Add each missing one under **Models → Add model**,
-   typing the same name as model and upstream (a pass-through provider can't list models), or map
-   them with `ANTHROPIC_DEFAULT_*_MODEL` as below. To create the provider by hand: **Providers →
-   Add provider**, type *OpenAI-compatible*, Base URL `https://api.anthropic.com`, Auth mode
-   *Forward the caller's token*.
+1. The quickstart adds an `anthropic-subscription` provider with one model, `claude-*`, which passes
+   any Claude model name through, so new Claude models work without changes. To add it by hand:
+   **Providers → Add provider**, type *OpenAI-compatible*, Base URL `https://api.anthropic.com`,
+   Auth mode *Forward the caller's token*; then **Models → Add model** with `claude-*` as both the
+   model and upstream name.
 2. Point Claude Code at the gateway. The key goes in a header so the subscription token stays in
    `Authorization`:
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:8080
 export ANTHROPIC_CUSTOM_HEADERS="X-Llmr-Key: llmr_…"
-export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
 claude
 ```
 
@@ -33,6 +30,8 @@ claude
 - Spend reads $0 and budgets don't apply (rate limits do). Watch tokens and cache hits instead.
 - A 429 with an empty message usually means Anthropic didn't recognise the request, not that your
   quota is used up.
+- An exact model name wins over `claude-*`: if another provider also serves, say,
+  `claude-sonnet-5-5`, requests for that name go there. Give such models their own names.
 - Use your own subscription with your own Claude Code. It is not a way to share one subscription
   across a team; check Anthropic's terms.
 

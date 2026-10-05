@@ -37,7 +37,6 @@ function snippets(base: string, key: string, models: string[], subscription: boo
           `# The gateway key rides in X-Llmr-Key — do NOT set ANTHROPIC_AUTH_TOKEN here.`,
           `export ANTHROPIC_BASE_URL=${base}`,
           `export ANTHROPIC_CUSTOM_HEADERS="X-Llmr-Key: ${key}"`,
-          `export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`,
           `claude`,
         ]
       : [
@@ -112,7 +111,9 @@ export function ConnectDialog({
   const [subscription, setSubscription] = useState(false);
   const models = [...(allowedModels ?? all.data ?? [])].sort();
   const base = window.location.origin;
-  const code = snippets(base, secret ?? KEY_PLACEHOLDER, models, subscription);
+  // A pattern such as "claude-*" is not a model id a client can send.
+  const ids = models.filter((m) => !m.endsWith("*"));
+  const code = snippets(base, secret ?? KEY_PLACEHOLDER, ids, subscription);
 
   return (
     <Dialog

@@ -7,6 +7,7 @@ package snapshot
 import (
 	"math/rand"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -259,13 +260,67 @@ func (s *Snapshot) SortDeployments() {
 	}
 }
 
-// ModelNames returns the distinct public model names, for /v1/models.
+// ModelNames returns the distinct model names a client can send as they are,
+// for /v1/models and model pickers. Patterns are left out: "claude-*" is not a
+// model id, and a client that sent it would reach no upstream model.
 func (s *Snapshot) ModelNames() []string {
 	names := make([]string, 0, len(s.DeploymentsByModel))
 	for name := range s.DeploymentsByModel {
-		names = append(names, name)
+		if !IsPattern(name) {
+			names = append(names, name)
+		}
 	}
 	return names
+}
+
+// IsPattern reports whether a model name is a prefix pattern such as "claude-*".
+func IsPattern(name string) bool { return strings.HasSuffix(name, "*") }
+
+// Resolve returns the model a requested name maps to and its backends in
+// routing order. An exact name wins; otherwise the longest pattern whose prefix
+// matches, so "claude-*" serves Claude models that did not exist when it was
+// added. A pattern backend whose upstream name also ends in "*" is sent the
+// rest of the requested name, on a per-request copy: snapshot rows are shared
+// by every request in flight.
+func (s *Snapshot) Resolve(name string) (string, []*Deployment) {
+	if IsPattern(name) {
+		return name, nil
+	}
+	if ds := s.DeploymentsByModel[name]; len(ds) > 0 {
+		return name, ds
+	}
+	// ponytail: scans every model name on an exact miss, well under a microsecond
+	// for hundreds of names; precompute the patterns in SortDeployments if that grows.
+	best := ""
+	for p := range s.DeploymentsByModel {
+		if IsPattern(p) && len(p) > len(best) && strings.HasPrefix(name, p[:len(p)-1]) {
+			best = p
+		}
+	}
+	if best == "" {
+		return name, nil
+	}
+	ds := s.DeploymentsByModel[best]
+	rest := name[len(best)-1:]
+	out, copied := ds, false
+	for i, d := range ds {
+		if !IsPattern(d.UpstreamName) {
+			continue
+		}
+		up := strings.TrimSuffix(d.UpstreamName, "*") + rest
+		// Azure puts the upstream name in a URL path segment, sent with the
+		// gateway's own credential: it must never become a dot segment.
+		if up == "." || up == ".." {
+			return name, nil
+		}
+		if !copied {
+			out, copied = append([]*Deployment(nil), ds...), true
+		}
+		dd := *d
+		dd.UpstreamName = up
+		out[i] = &dd
+	}
+	return best, out
 }
 
 // CallerCredentialOnly reports whether every backend for name forwards the
