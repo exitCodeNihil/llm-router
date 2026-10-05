@@ -16,7 +16,11 @@ Initial release.
 - Pass-through auth mode (`oauth_passthrough`): forwards the caller's own upstream
   credential and `anthropic-beta` header instead of storing one, so Claude Code can run
   on a Claude subscription through the gateway (clients authenticate with `X-Llmr-Key`);
-  that traffic is always recorded unpriced
+  that traffic is always recorded unpriced. `LLMR_SEED_CLAUDE_SUBSCRIPTION=1` seeds it with
+  one `claude-*` model, so new Claude models need no gateway update
+- Wildcard model names: a model name ending in `*` serves every name with that prefix
+  (exact names first, then the longest prefix), with the requested name sent upstream when
+  the upstream name ends in `*` too
 - Virtual API keys, users, teams; budgets (daily/monthly/total) and rpm/tpm rate limits
   per key/user/team; model policy on teams, users and keys (a person's default is the union of
   their teams' policies; keys only narrow), per-member budget shares within a team,

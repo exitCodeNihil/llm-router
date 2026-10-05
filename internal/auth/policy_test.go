@@ -41,3 +41,26 @@ func TestModelAllowedIsTheIntersection(t *testing.T) {
 		t.Error("nil identity must not be allowed anything")
 	}
 }
+
+// Listing a pattern admits every name that resolved through it, and nothing
+// else: an exact row sharing the prefix stays locked.
+func TestModelAllowedThroughPattern(t *testing.T) {
+	key := &Identity{Key: &snapshot.Key{AllowedModels: map[string]bool{"claude-*": true}}, User: &snapshot.User{}}
+	if !key.ModelAllowed("claude-opus-6", "claude-*") {
+		t.Error("claude-* should admit a name that resolved to it")
+	}
+	if key.ModelAllowed("claude-sonnet-5", "claude-sonnet-5") {
+		t.Error("claude-* must not unlock an exact row that shares the prefix")
+	}
+	mixed := &Identity{
+		Key:  &snapshot.Key{AllowedModels: map[string]bool{"claude-*": true}},
+		User: &snapshot.User{AllowedModels: map[string]bool{"claude-opus-6": true}},
+	}
+	if !mixed.ModelAllowed("claude-opus-6", "claude-*") {
+		t.Error("each level may admit the request by either name")
+	}
+	none := &Identity{Key: &snapshot.Key{AllowedModels: map[string]bool{}}, User: &snapshot.User{}}
+	if none.ModelAllowed("claude-opus-6", "claude-*") {
+		t.Error("an empty list admits nothing")
+	}
+}

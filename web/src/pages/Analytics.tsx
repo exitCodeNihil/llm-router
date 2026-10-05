@@ -102,6 +102,8 @@ export default function Analytics() {
           ...(available.data ?? []).map((m) => m.name),
         ]),
       ]
+        // Usage rows carry the requested name, never a pattern like "claude-*".
+        .filter((m) => !m.endsWith("*"))
         .sort()
         .map((m) => ({ value: m, label: m })),
     ],
