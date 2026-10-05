@@ -43,6 +43,58 @@ Cursor, OpenCode and the SDKs.
 
 ![Mint a key and connect Claude Code](docs/media/keys-connect.gif)
 
+### Docker, without cloning
+
+The image is published for amd64 and arm64 at `ghcr.io/exitcodenihil/llm-router` — `latest`,
+or pin a release such as `:0.1.0`. It needs Postgres, so Compose is the easy way. In an empty
+directory:
+
+```bash
+# Keep this file: the encryption key protects stored provider credentials.
+printf 'LLMR_ADMIN_TOKEN=%s\nLLMR_ENCRYPTION_KEY=%s\n' "$(openssl rand -hex 16)" "$(openssl rand -hex 16)" > .env
+```
+
+```yaml
+# docker-compose.yml
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: llmrouter
+      POSTGRES_PASSWORD: llmrouter
+      POSTGRES_DB: llmrouter
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U llmrouter"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  llmrouter:
+    image: ghcr.io/exitcodenihil/llm-router:latest
+    ports:
+      - "8080:8080"
+      - "8081:8081" # workspace IDEs, on their own origin
+    environment:
+      LLMR_DATABASE_URL: postgres://llmrouter:llmrouter@postgres:5432/llmrouter
+      LLMR_ADMIN_TOKEN: ${LLMR_ADMIN_TOKEN:?run the printf line above}
+      LLMR_ENCRYPTION_KEY: ${LLMR_ENCRYPTION_KEY:?run the printf line above}
+      LLMR_IDE_LISTEN: ":8081"
+      LLMR_IDE_ORIGIN: http://localhost:8081
+      LLMR_SEED_CLAUDE_SUBSCRIPTION: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+```
+
+```bash
+docker compose up -d      # then open http://localhost:8080
+```
+
 <details>
 <summary>Prefer plain <code>docker run</code>?</summary>
 
@@ -50,7 +102,6 @@ Cursor, OpenCode and the SDKs.
 export LLMR_ADMIN_TOKEN=$(openssl rand -hex 16)
 export LLMR_ENCRYPTION_KEY=$(openssl rand -hex 16)   # keep both
 
-docker build -t llm-router .
 docker network create llmr
 
 docker run -d --name llmr-postgres --network llmr \
@@ -63,7 +114,7 @@ docker run -d --name llm-router --network llmr -p 8080:8080 -p 8081:8081 \
   -e LLMR_ENCRYPTION_KEY=$LLMR_ENCRYPTION_KEY \
   -e LLMR_IDE_LISTEN=:8081 -e LLMR_IDE_ORIGIN=http://localhost:8081 \
   -e LLMR_SEED_CLAUDE_SUBSCRIPTION=1 \
-  llm-router
+  ghcr.io/exitcodenihil/llm-router:latest
 ```
 </details>
 
