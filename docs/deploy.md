@@ -9,7 +9,7 @@ where Postgres lives and who terminates TLS changes. Environment variables are l
 | Try it, or run it for a team on one machine | [Docker Compose](#docker-compose) |
 | Run it on a cluster | [Kubernetes with Helm](#kubernetes-with-helm) |
 | Serve callers in another region | [Edge nodes](edge.md) |
-| No containers | Download the binary from the [Releases](../../../releases) page and run `llmrouter --mode=all` with `LLMR_DATABASE_URL`, `LLMR_ENCRYPTION_KEY` and `LLMR_ADMIN_TOKEN` set |
+| No containers | `go build -o llmrouter ./cmd/llmrouter` (the console is committed in `web/dist`, so no Node needed), then run `./llmrouter --mode=all` with `LLMR_DATABASE_URL`, `LLMR_ENCRYPTION_KEY` and `LLMR_ADMIN_TOKEN` set |
 
 ## Docker Compose
 

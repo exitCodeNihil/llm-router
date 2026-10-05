@@ -47,45 +47,15 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-  binaries:
-    needs: check
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - {os: linux, arch: amd64}
-          - {os: linux, arch: arm64}
-          - {os: darwin, arch: amd64}
-          - {os: darwin, arch: arm64}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-      # web/dist is committed, so no node build is needed.
-      - run: |
-          CGO_ENABLED=0 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} \
-            go build -ldflags="-s -w -X main.version=${{ github.ref_name }}" -o llmrouter ./cmd/llmrouter
-          tar czf llm-router_${{ github.ref_name }}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz llmrouter LICENSE README.md
-      - uses: actions/upload-artifact@v4
-        with:
-          name: bin-${{ matrix.os }}-${{ matrix.arch }}
-          path: "*.tar.gz"
-
   release:
-    needs: [image, binaries]
+    needs: image
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: bin-*
-          merge-multiple: true
-      - run: sha256sum *.tar.gz > checksums.txt
       - name: Release notes from CHANGELOG
         run: awk -v h="## ${GITHUB_REF_NAME}" 'index($0,h)==1{f=1;next} /^## /{f=0} f' CHANGELOG.md > notes.md
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
           pre=""; case "$GITHUB_REF_NAME" in *-*) pre="--prerelease";; esac
-          gh release create "$GITHUB_REF_NAME" *.tar.gz checksums.txt --title "$GITHUB_REF_NAME" --notes-file notes.md $pre
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md $pre
