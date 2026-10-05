@@ -220,7 +220,11 @@ func tryDeployments(ctx context.Context, deployments []*snapshot.Deployment, ups
 			continue
 		}
 		if res.StatusCode == http.StatusTooManyRequests || res.StatusCode >= 500 {
-			upstreamHealth.fail(d.ID, retryAfter(res), time.Now())
+			// A pass-through 429 is the caller's own plan quota, not a sick backend:
+			// cooling the shared row would mark it down for every other subscriber.
+			if res.StatusCode >= 500 || d.Provider.AuthMode != "oauth_passthrough" {
+				upstreamHealth.fail(d.ID, retryAfter(res), time.Now())
+			}
 			if i < len(deployments)-1 {
 				res.Body.Close()
 				slog.Warn("upstream returned retryable status; failing over",
