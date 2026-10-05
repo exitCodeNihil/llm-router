@@ -87,6 +87,8 @@ func (g *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, provider.ErrNoCallerCredential) {
 			writeError(w, http.StatusBadRequest, "invalid_request_error", "missing_credential", err.Error())
+			g.emit(snap, id, nil, body, reqID, usageCounts{}, http.StatusBadRequest, start, nil, "", dec,
+				emitExtra{Attempts: attempts, ErrorCode: "missing_credential"})
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "server_error", "internal_error", err.Error())

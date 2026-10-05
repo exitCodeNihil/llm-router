@@ -232,6 +232,20 @@ func TestOAuthPassthrough(t *testing.T) {
 	if gotAuth != "" {
 		t.Errorf("gateway key leaked upstream: %q", gotAuth)
 	}
+	// The refusal is recorded, so an operator sees who tried to use the
+	// subscription without one: on both surfaces.
+	if rec := doReq(t, g, key, `{"model":"claude-sonnet-5","messages":[]}`); rec.Code != 400 {
+		t.Errorf("/v1/chat/completions: want 400, got %d", rec.Code)
+	}
+	if n := len(cw.events); n != 3 {
+		t.Fatalf("want 3 usage rows (1 served, 2 refused), got %d", n)
+	}
+	for _, e := range cw.events[1:] {
+		if e.StatusCode != 400 || e.ErrorCode != "missing_credential" || e.ModelName != "claude-sonnet-5" {
+			t.Errorf("refusal row = %d %q %q, want 400 missing_credential claude-sonnet-5",
+				e.StatusCode, e.ErrorCode, e.ModelName)
+		}
+	}
 }
 
 func TestAuthAndModelACL(t *testing.T) {
