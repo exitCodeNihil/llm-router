@@ -1,12 +1,14 @@
 package gateway
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/exitcodenihil/llm-router/internal/provider"
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
 )
 
@@ -94,5 +96,45 @@ func TestAllCoolingStillTries(t *testing.T) {
 	got = orderByHealth([]*snapshot.Deployment{b, a}, now)
 	if got[0] != a || got[1] != b {
 		t.Fatalf("healthy must come first: %v", got)
+	}
+}
+
+// A pass-through 429 is one caller's plan limit: it still fails over, but must
+// not cool the row every other subscriber shares. A 5xx still cools it.
+func TestPassthrough429DoesNotCool(t *testing.T) {
+	var status atomic.Int32
+	status.Store(http.StatusTooManyRequests)
+	sub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "3600")
+		w.WriteHeader(int(status.Load()))
+	}))
+	defer sub.Close()
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	}))
+	defer backup.Close()
+
+	d := stubDeployment(sub.URL, "claude-*", "sub-429", 0)
+	d.Provider.AuthMode = "oauth_passthrough"
+	b := stubDeployment(backup.URL, "claude-*", "backup-429", 1)
+	defer upstreamHealth.ok(d.ID)
+	defer upstreamHealth.ok(b.ID)
+	ctx := provider.WithInbound(context.Background(), provider.Inbound{Authorization: "Bearer x"})
+	body := func(*snapshot.Deployment) ([]byte, error) { return []byte(`{}`), nil }
+
+	res, chosen, _, err := tryDeployments(ctx, []*snapshot.Deployment{d, b}, "/chat/completions", body)
+	if err != nil || chosen != b {
+		t.Fatalf("want failover to the backup, got %v, err %v", chosen, err)
+	}
+	res.Body.Close()
+	if upstreamHealth.cooling(d.ID, time.Now()) {
+		t.Error("a pass-through 429 cooled the shared row")
+	}
+
+	status.Store(http.StatusServiceUnavailable)
+	res, _, _, _ = tryDeployments(ctx, []*snapshot.Deployment{d, b}, "/chat/completions", body)
+	res.Body.Close()
+	if !upstreamHealth.cooling(d.ID, time.Now()) {
+		t.Error("a pass-through 5xx should still cool the row")
 	}
 }
