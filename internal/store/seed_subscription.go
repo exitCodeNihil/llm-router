@@ -31,7 +31,12 @@ func (s *Store) SeedClaudeSubscription(ctx context.Context) error {
 	}
 	// The names Claude Code's built-in picker resolves to; each is served by the
 	// same name upstream over the Anthropic Messages protocol.
-	for _, model := range []string{"claude-fable-5-1", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"} {
+	for _, model := range []string{
+		"claude-fable-5-1",
+		"claude-opus-5-5", "claude-opus-5",
+		"claude-sonnet-5-5", "claude-sonnet-5",
+		"claude-haiku-4-5-20251001", "claude-haiku-4-5",
+	} {
 		if _, err := s.Pool.Exec(ctx, `
 			INSERT INTO model_deployments (id, provider_id, model_name, upstream_name, api_flavor)
 			VALUES ($1, $2, $3, $3, 'anthropic')`, uuid.New(), pid, model); err != nil {

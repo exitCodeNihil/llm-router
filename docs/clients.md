@@ -11,9 +11,9 @@ your models filled in. Examples below use `http://localhost:8080`.
 Claude Code keeps its own login. The gateway forwards it untouched and records every request;
 no credential is stored.
 
-1. The quickstart adds an `anthropic-subscription` provider with a few Claude models. Claude Code
-   asks for its own default names (for example `claude-haiku-4-5-20251001`), and any the gateway
-   lacks fail with `404 model … does not exist`. Add each missing one under **Models → Add model**,
+1. The quickstart adds an `anthropic-subscription` provider with the current Claude models. Claude
+   Code's default names change between releases, and any the gateway lacks fail with
+   `404 model … does not exist`. Add each missing one under **Models → Add model**,
    typing the same name as model and upstream (a pass-through provider can't list models), or map
    them with `ANTHROPIC_DEFAULT_*_MODEL` as below. To create the provider by hand: **Providers →
    Add provider**, type *OpenAI-compatible*, Base URL `https://api.anthropic.com`, Auth mode
@@ -62,8 +62,8 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL=small-model      # background tasks
   and tools all work.
 - Other upstreams get requests translated to chat completions. Text, base64 images, tools and
   streaming work; `thinking`, `cache_control` and document blocks are dropped.
-- A slot you don't map asks for Claude Code's own default name (for example
-  `claude-haiku-4-5-20251001`) and gets `404 model … does not exist`.
+- A slot you don't map asks for Claude Code's own default name, and fails unless the gateway has a
+  model by that name.
 - Claude Code warns about names it doesn't recognise and assumes a 200k-token context. Append `[1m]`
   (`ANTHROPIC_MODEL=my-model[1m]`) if the model takes 1M; the suffix is stripped before the request.
 
