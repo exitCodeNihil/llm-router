@@ -156,6 +156,8 @@ func (g *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		}
 		if errors.Is(err, provider.ErrNoCallerCredential) {
 			writeAnthError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			g.emit(snap, id, nil, &reqBody{Model: areq.Model, Stream: areq.Stream}, reqID, usageCounts{},
+				http.StatusBadRequest, start, nil, "", dec, emitExtra{Attempts: attempts, ErrorCode: "missing_credential"})
 			return
 		}
 		writeAnthError(w, http.StatusInternalServerError, "api_error", err.Error())
