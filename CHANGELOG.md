@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.1 (2026-10-06)
+
+- Console: the Playground warns when there are no models to chat with, and the Providers and
+  Models pages flag pass-through providers and models, which can't be used in the Playground or
+  in workspaces
+- Compose: an optional, commented-out Langfuse stack in `deploy/docker-compose.yml`
+  ([how to enable](docs/deploy.md#langfuse-in-compose))
+
 ## v0.1.0 (2026-10-05)
 
 Initial release.
