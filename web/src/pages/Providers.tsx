@@ -8,6 +8,7 @@ import { Button } from "@astryxdesign/core/Button";
 import { IconButton } from "@astryxdesign/core/IconButton";
 import { Icon } from "@astryxdesign/core/Icon";
 import { Badge } from "@astryxdesign/core/Badge";
+import { Banner } from "@astryxdesign/core/Banner";
 import { Code } from "@astryxdesign/core/Code";
 import { Table, pixel, proportional } from "@astryxdesign/core/Table";
 import type { TableColumn } from "@astryxdesign/core/Table";
@@ -178,6 +179,14 @@ function ProviderForm({ editing, onClose }: { editing: Provider | null; onClose:
             options={modes.map((m) => ({ value: m.value, label: m.label }))}
           />
         </Grid>
+
+        {authMode === "oauth_passthrough" && (
+          <Banner
+            status="warning"
+            title="Not available in the Playground or workspaces"
+            description="Models on this provider only work for clients that send their own login, such as Claude Code. The Playground and workspace agents have none to forward."
+          />
+        )}
 
         {isVertex && (
           <Grid columns={{ minWidth: 200, repeat: "fit" }} gap={3}>

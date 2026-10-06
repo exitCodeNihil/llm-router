@@ -27,6 +27,8 @@ claude
 
 - Do not set `ANTHROPIC_AUTH_TOKEN`: it replaces your subscription token and Anthropic rejects the
   gateway key.
+- Only clients that send their own login can use it, so `claude-*` does not appear in the
+  Playground or for workspace agents. Use another provider's model there.
 - Spend reads $0 and budgets don't apply (rate limits do). Watch tokens and cache hits instead.
 - A 429 with an empty message usually means Anthropic didn't recognise the request, not that your
   quota is used up.

@@ -344,6 +344,15 @@ export default function Chat() {
         {/* Composer: outside the scroller, so it never scrolls away. */}
         <div style={{ paddingInline: "var(--spacing-3)", paddingBottom: "var(--spacing-3)" }}>
           <div style={measure}>
+            {!s.models.isLoading && models.length === 0 && (
+              <div style={{ marginBottom: "var(--spacing-2)" }}>
+                <Banner
+                  status="warning"
+                  title="No models to chat with"
+                  description="Add a provider and a model first. A pass-through model such as claude-* forwards the caller's own login, so the Playground can't use it."
+                />
+              </div>
+            )}
             <Composer
               draft={draft}
               onDraftChange={setDraft}
