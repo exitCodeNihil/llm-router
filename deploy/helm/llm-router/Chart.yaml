@@ -2,5 +2,5 @@ apiVersion: v2
 name: llm-router
 description: Open-source LLM gateway - one OpenAI- and Anthropic-compatible endpoint for Azure OpenAI, Google Vertex AI, OpenRouter, vLLM and any OpenAI-compatible backend, with keys, budgets, teams, SSO, and edge gateways.
 type: application
-version: 0.1.0 # x-release-please-version
-appVersion: "0.1.0" # x-release-please-version
+version: 0.1.1 # x-release-please-version
+appVersion: "0.1.1" # x-release-please-version
