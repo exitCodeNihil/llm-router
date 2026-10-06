@@ -38,5 +38,127 @@ services:
       postgres:
         condition: service_healthy
 
+  # ── Optional: Langfuse, for request traces ───────────────────────────────────
+  # Self-hosted Langfuse v3: web, worker, Postgres, ClickHouse, Redis, MinIO (about 2 GB RAM).
+  # To turn it on, uncomment the services below and the four langfuse volumes at the bottom
+  # of this file, then:
+  #   for v in NEXTAUTH_SECRET SALT ENCRYPTION_KEY PASSWORD SECRET_KEY; do
+  #     echo "LANGFUSE_$v=$(openssl rand -hex 32)"; done >> deploy/.env
+  #   docker compose -f deploy/docker-compose.yml up -d
+  # In the console, Observability: host http://langfuse-web:3000, public key pk-lf-llm-router,
+  # secret key = LANGFUSE_SECRET_KEY from deploy/.env. The Langfuse UI is http://localhost:3001,
+  # login admin@example.com / LANGFUSE_PASSWORD. More in docs/deploy.md.
+  # Keep the Langfuse images on :3. v4 rejects the ingestion API the gateway exports with.
+  ## ---- uncomment from here ----
+  # langfuse-worker:
+  #   image: docker.io/langfuse/langfuse-worker:3
+  #   depends_on: &langfuse-deps
+  #     langfuse-db: {condition: service_healthy}
+  #     langfuse-clickhouse: {condition: service_healthy}
+  #     langfuse-redis: {condition: service_healthy}
+  #     langfuse-minio: {condition: service_healthy}
+  #   environment: &langfuse-env
+  #     # The services below are not published, so their passwords are fixed, like postgres above.
+  #     DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+  #     CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+  #     CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+  #     CLICKHOUSE_USER: clickhouse
+  #     CLICKHOUSE_PASSWORD: clickhouse
+  #     CLICKHOUSE_CLUSTER_ENABLED: "false"
+  #     REDIS_HOST: langfuse-redis
+  #     REDIS_AUTH: redis
+  #     LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  #     LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+  #     LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+  #     LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+  #     LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+  #     LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  #     SALT: ${LANGFUSE_SALT:?set LANGFUSE_SALT (see the recipe above)}
+  #     ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:?set LANGFUSE_ENCRYPTION_KEY (see the recipe above)}
+  #     NEXTAUTH_URL: ${LANGFUSE_URL:-http://localhost:3001}
+  #     TELEMETRY_ENABLED: "false"
+  #
+  # langfuse-web:
+  #   image: docker.io/langfuse/langfuse:3
+  #   depends_on: *langfuse-deps
+  #   ports:
+  #     # Loopback only. Drop "127.0.0.1:" to reach it from other machines, and set LANGFUSE_URL.
+  #     - "127.0.0.1:3001:3000"
+  #   environment:
+  #     <<: *langfuse-env
+  #     NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:?set LANGFUSE_NEXTAUTH_SECRET (see the recipe above)}
+  #     AUTH_DISABLE_SIGNUP: "true"
+  #     # First boot creates this project, its keys and the one login.
+  #     LANGFUSE_INIT_ORG_ID: llm-router
+  #     LANGFUSE_INIT_ORG_NAME: llm-router
+  #     LANGFUSE_INIT_PROJECT_ID: llm-router
+  #     LANGFUSE_INIT_PROJECT_NAME: llm-router
+  #     LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-llm-router
+  #     LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:?set LANGFUSE_SECRET_KEY (see the recipe above)}
+  #     LANGFUSE_INIT_USER_EMAIL: admin@example.com
+  #     LANGFUSE_INIT_USER_NAME: Admin
+  #     LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_PASSWORD:?set LANGFUSE_PASSWORD (see the recipe above)}
+  #
+  # langfuse-db:
+  #   image: postgres:17
+  #   environment:
+  #     POSTGRES_USER: langfuse
+  #     POSTGRES_PASSWORD: langfuse
+  #     POSTGRES_DB: langfuse
+  #   volumes:
+  #     - langfuse-db:/var/lib/postgresql/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U langfuse"]
+  #     interval: 2s
+  #     timeout: 2s
+  #     retries: 15
+  #
+  # langfuse-clickhouse:
+  #   image: docker.io/clickhouse/clickhouse-server:25.12
+  #   user: "101:101"
+  #   environment:
+  #     CLICKHOUSE_DB: default
+  #     CLICKHOUSE_USER: clickhouse
+  #     CLICKHOUSE_PASSWORD: clickhouse
+  #   volumes:
+  #     - langfuse-clickhouse:/var/lib/clickhouse
+  #   healthcheck:
+  #     test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+  #     interval: 5s
+  #     timeout: 5s
+  #     retries: 10
+  #
+  # langfuse-redis:
+  #   image: docker.io/redis:7
+  #   command: --requirepass redis --maxmemory-policy noeviction
+  #   volumes:
+  #     - langfuse-redis:/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "REDISCLI_AUTH=redis redis-cli ping | grep -q PONG"]
+  #     interval: 3s
+  #     timeout: 5s
+  #     retries: 10
+  #
+  # langfuse-minio:
+  #   image: cgr.dev/chainguard/minio
+  #   entrypoint: sh
+  #   # Creates the bucket Langfuse writes events to before starting.
+  #   command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+  #   environment:
+  #     MINIO_ROOT_USER: minio
+  #     MINIO_ROOT_PASSWORD: miniosecret
+  #   volumes:
+  #     - langfuse-minio:/data
+  #   healthcheck:
+  #     test: ["CMD", "mc", "ready", "local"]
+  #     interval: 2s
+  #     timeout: 5s
+  #     retries: 10
+  ## ---- to here ----
+
 volumes:
   pgdata:
+  # langfuse-db:
+  # langfuse-clickhouse:
+  # langfuse-redis:
+  # langfuse-minio:
