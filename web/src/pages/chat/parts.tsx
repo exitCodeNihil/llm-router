@@ -323,7 +323,16 @@ export function StreamingMessage({
   );
 }
 
-export function ThreadEmptyState() {
+export function ThreadEmptyState({ noModels }: { noModels?: boolean }) {
+  if (noModels) {
+    return (
+      <EmptyState
+        icon={<IconSignal width={28} height={28} />}
+        title="No models to chat with yet"
+        description="Add a provider, then a model (Providers and Models in the sidebar). The seeded claude-* model is for Claude Code on your claude.ai login, so it is not offered here."
+      />
+    );
+  }
   return (
     <EmptyState
       icon={<IconSignal width={28} height={28} />}
@@ -500,7 +509,9 @@ export function Composer({
             ? "Drop images or text files…"
             : model
               ? `Message ${model}…`
-              : "Pick a model to start"
+              : isDisabled
+                ? "Add a model to start"
+                : "Pick a model to start"
         }
         /**
          * Custom input purely to reach ChatComposerInput's onFiles / onPaste.

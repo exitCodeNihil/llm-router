@@ -336,7 +336,7 @@ export default function Chat() {
             </div>
           ) : (
             <Center minHeight="100%">
-              <ThreadEmptyState />
+              <ThreadEmptyState noModels={!s.models.isLoading && models.length === 0} />
             </Center>
           )}
         </div>
