@@ -30,4 +30,12 @@ export work. Container tooling prefers podman and falls back to docker (`ENGINE=
   work on a fresh clone. After console changes run `make web` and commit the result.
 - Console styling lives in `web/src/theme.ts` only (see [web/README.md](web/README.md)).
 
+## Releases
+
+Releases are automatic ([Release Please](https://github.com/googleapis/release-please)). Title PRs
+as conventional commits and squash-merge them: `fix:` is a patch, `feat:` a patch before 1.0 and a
+minor after, and `chore:`, `docs:`, `ci:` and `test:` don't release. A release PR collects them
+into the changelog and the version (including the Helm chart). Merging it tags the release and
+publishes the image. Don't edit `CHANGELOG.md` or tag by hand.
+
 By contributing you agree your work is licensed under the Apache License 2.0.
