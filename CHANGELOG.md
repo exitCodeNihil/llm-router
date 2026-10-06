@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.1](https://github.com/exitCodeNihil/llm-router/compare/v0.1.0...v0.1.1) (2026-10-06)
+
+
+### Features
+
+* optional Langfuse stack in the compose file ([#3](https://github.com/exitCodeNihil/llm-router/issues/3)) ([ec16b29](https://github.com/exitCodeNihil/llm-router/commit/ec16b29584909d3ed1a0bf28bfb5df31cdb56794))
+
+
+### Bug Fixes
+
+* warn that pass-through models can't be used in the Playground ([#2](https://github.com/exitCodeNihil/llm-router/issues/2)) ([7626597](https://github.com/exitCodeNihil/llm-router/commit/7626597ca1cb36be3794a0e8cc123c9c2eb6afb3))
+
 ## v0.1.0 (2026-10-05)
 
 Initial release.
