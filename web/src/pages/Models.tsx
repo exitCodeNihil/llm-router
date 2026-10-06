@@ -9,6 +9,7 @@ import { IconButton } from "@astryxdesign/core/IconButton";
 import { Icon } from "@astryxdesign/core/Icon";
 import { Code } from "@astryxdesign/core/Code";
 import { Badge } from "@astryxdesign/core/Badge";
+import { Banner } from "@astryxdesign/core/Banner";
 import { Tooltip } from "@astryxdesign/core/Tooltip";
 import { Switch } from "@astryxdesign/core/Switch";
 import { Table, pixel, proportional } from "@astryxdesign/core/Table";
@@ -218,6 +219,14 @@ function DeploymentForm({
           }))}
         />
 
+        {selectedProvider?.auth_mode === "oauth_passthrough" && (
+          <Banner
+            status="warning"
+            title="Not available in the Playground or workspaces"
+            description="This provider forwards the caller's own login, so the model only works from clients that send one, such as Claude Code."
+          />
+        )}
+
         <Grid columns={{ minWidth: 220, repeat: "fit" }} gap={3}>
           <TextInput
             label="Model name"
@@ -403,6 +412,16 @@ export default function Models() {
     () => new Map((health.data ?? []).map((c) => [c.deployment_id, c])),
     [health.data],
   );
+  const providerRows = useProviders();
+  const passthrough = useMemo(
+    () =>
+      new Set(
+        (providerRows.data ?? [])
+          .filter((p) => p.auth_mode === "oauth_passthrough")
+          .map((p) => p.id),
+      ),
+    [providerRows.data],
+  );
 
   // Search only: the row order *is* the routing order, so no column sort.
   const tools = useTableTools(
@@ -500,6 +519,11 @@ export default function Models() {
         return (
           <HStack gap={1.5} vAlign="center">
             <Text type="body">{d.provider_name}</Text>
+            {passthrough.has(d.provider_id) && (
+              <Tooltip content="Forwards the caller's own login. Works from Claude Code, not from the Playground or workspaces.">
+                <Badge variant="neutral" label="pass-through" />
+              </Tooltip>
+            )}
             {c && (
               <Tooltip
                 content={`${c.failures} consecutive failure${c.failures === 1 ? "" : "s"} — traffic goes to the next backend; retried in ${secs}s`}
