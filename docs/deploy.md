@@ -12,7 +12,8 @@ git clone https://github.com/exitcodenihil/llm-router && cd llm-router
 This writes `deploy/.env` once, starts Postgres and the gateway, and prints the console URL. **Back
 up `deploy/.env`**: `LLMR_ENCRYPTION_KEY` protects stored provider keys, and a different key makes
 them unreadable. Use `--build` to build from source, and `LLMR_VERSION=0.1.0` in `deploy/.env` to
-pin a release. Only 8080 (console and API) and 8081 (workspace IDEs) are published.
+pin a release. Only 8080 (console and API) and 8081 (workspace IDEs) are published, plus 3001 on
+loopback if you turn on [Langfuse](#langfuse-in-compose).
 
 For HTTPS, add Caddy. `deploy/Caddyfile`:
 
@@ -94,11 +95,31 @@ Placeholder secrets such as `change-me` are refused. Generate them with `openssl
 
 - **Langfuse**: **Observability** exports request traces. Rules choose which traffic is exported
   and whether prompts leave the gateway (off by default). With no rules, nothing is exported.
-  Wrong credentials are rejected per batch, so check the delivery health on that page.
+  Wrong credentials are rejected per batch, so check the delivery health on that page. Need a
+  Langfuse to point it at? [Compose can run one](#langfuse-in-compose).
 - **Response headers**: every `/v1` response from an upstream carries `X-Request-Id`,
   `X-Llmr-Provider`, `X-Llmr-Upstream` and `X-Llmr-Attempts`.
 - **Upgrades**: pull the new tag and restart. Migrations apply on start and only go forward, so
   back up Postgres first.
+
+### Langfuse in Compose
+
+`deploy/docker-compose.yml` ends with a commented-out Langfuse: web, worker, Postgres, ClickHouse,
+Redis and MinIO, about 2 GB of RAM. Uncomment the services and the four `langfuse-*` volumes, then:
+
+```bash
+for v in NEXTAUTH_SECRET SALT ENCRYPTION_KEY PASSWORD SECRET_KEY; do
+  echo "LANGFUSE_$v=$(openssl rand -hex 32)"; done >> deploy/.env
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+In the console, **Observability**: host `http://langfuse-web:3000`, public key `pk-lf-llm-router`,
+secret key `LANGFUSE_SECRET_KEY` from `deploy/.env`. Langfuse itself is at http://localhost:3001
+(loopback only), login `admin@example.com` and `LANGFUSE_PASSWORD`. Sign-up is off.
+
+- That host is the Compose-internal name, so the **Trace** links on the Requests page don't open
+  from your browser. Open `http://localhost:3001/project/llm-router/traces/<request id>` instead.
+- Keep the images on `:3`. Langfuse 4 rejects the ingestion API the gateway exports with.
 
 ## Production checklist
 
