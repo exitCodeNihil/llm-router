@@ -42,9 +42,10 @@ services:
   # Self-hosted Langfuse v3: web, worker, Postgres, ClickHouse, Redis, MinIO (about 2 GB RAM).
   # To turn it on, uncomment the services below and the four langfuse volumes at the bottom
   # of this file, then:
+  #   cd deploy
   #   for v in NEXTAUTH_SECRET SALT ENCRYPTION_KEY PASSWORD SECRET_KEY; do
-  #     echo "LANGFUSE_$v=$(openssl rand -hex 32)"; done >> deploy/.env
-  #   docker compose -f deploy/docker-compose.yml up -d
+  #     echo "LANGFUSE_$v=$(openssl rand -hex 32)"; done >> .env
+  #   docker compose up -d
   # In the console, Observability: host http://langfuse-web:3000, public key pk-lf-llm-router,
   # secret key = LANGFUSE_SECRET_KEY from deploy/.env. The Langfuse UI is http://localhost:3001,
   # login admin@example.com / LANGFUSE_PASSWORD. More in docs/deploy.md.

@@ -26,7 +26,7 @@ git clone https://github.com/exitcodenihil/llm-router && cd llm-router
 
 It generates `deploy/.env` once (**back it up**), starts Postgres and the gateway, and prints the
 URL. Open <http://localhost:8080>, create the first admin on the setup screen, then add a provider
-and a model:
+and a model. Want [workspaces](docs/workspaces.md) too? Add `--workspaces`.
 
 ![Add a provider and a model](docs/media/quickstart.gif)
 

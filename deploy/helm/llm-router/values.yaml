@@ -20,6 +20,14 @@ existingSecret: ""
 controlPlaneUrl: ""
 nodeToken: ""        # or key node-token in existingSecret
 
+# Workspaces (docs/workspaces.md), mode=all only. Adds RBAC for pods, exec, PVCs and secrets
+# in this release's namespace, plus the IDE listener on 8081 served from its own origin.
+workspaces:
+  enabled: false
+  ideOrigin: ""      # public URL of the IDE, e.g. https://ide.example.com (required when enabled)
+  ideHost: ""        # with ingress.enabled: adds this host, routed to the IDE listener
+  cookieDomain: ""   # only when the console and IDE hosts need a shared session cookie
+
 service:
   type: ClusterIP
   port: 8080

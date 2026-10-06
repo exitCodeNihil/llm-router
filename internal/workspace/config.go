@@ -1,6 +1,9 @@
 package workspace
 
-import "errors"
+import (
+	"errors"
+	"os"
+)
 
 // Config is the workspace connector (settings key 'workspaces'). It is a
 // control-plane concern only, so it deliberately does not ride in the routing
@@ -71,7 +74,9 @@ func New(c Config) (Runtime, error) {
 		if c.Socket == "" {
 			return nil, errors.New("no container socket configured")
 		}
-		return NewDocker(c.Socket), nil
+		// LLMR_WORKSPACE_NETWORK is deployment topology, not a per-install
+		// choice, so like the cluster credentials it comes from the environment.
+		return NewDocker(c.Socket, os.Getenv("LLMR_WORKSPACE_NETWORK")), nil
 	}
 }
 

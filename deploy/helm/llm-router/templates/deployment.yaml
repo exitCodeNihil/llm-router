@@ -13,6 +13,10 @@ spec:
     metadata:
       labels: *labels
     spec:
+      {{- $ws := and .Values.workspaces.enabled (eq .Values.mode "all") }}
+      {{- if $ws }}
+      serviceAccountName: {{ .Release.Name }}-llm-router
+      {{- end }}
       containers:
         - name: llm-router
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
@@ -20,6 +24,10 @@ spec:
           args: ["--mode={{ .Values.mode }}"]
           ports:
             - containerPort: 8080
+            {{- if $ws }}
+            - name: ide
+              containerPort: 8081
+            {{- end }}
           env:
             {{- $secret := .Values.existingSecret | default (printf "%s-llm-router" .Release.Name) }}
             {{- if eq .Values.mode "all" }}
@@ -29,6 +37,16 @@ spec:
               valueFrom: {secretKeyRef: {name: {{ $secret }}, key: admin-token, optional: true}}
             - name: LLMR_ENCRYPTION_KEY
               valueFrom: {secretKeyRef: {name: {{ $secret }}, key: encryption-key}}
+            {{- if $ws }}
+            - name: LLMR_IDE_LISTEN
+              value: ":8081"
+            - name: LLMR_IDE_ORIGIN
+              value: {{ required "workspaces.ideOrigin is required when workspaces are enabled" .Values.workspaces.ideOrigin | quote }}
+            {{- with .Values.workspaces.cookieDomain }}
+            - name: LLMR_COOKIE_DOMAIN
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             {{- else }}
             - name: LLMR_CONTROL_PLANE_URL
               value: {{ required "controlPlaneUrl is required in mode=gateway" .Values.controlPlaneUrl | quote }}

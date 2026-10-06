@@ -16,8 +16,8 @@ Nothing here is special — a workspace image just needs `git`, `tar`, `pi` and
 
 The image's `CMD` runs code-server with `--auth none`: it is reachable only
 through the gateway's proxy, which checks your session and that you own the
-workspace. On Docker the port is published to `127.0.0.1` only; on Kubernetes it
-is never published at all.
+workspace. On Docker the port is published to `127.0.0.1` only, or not at all when
+`LLMR_WORKSPACE_NETWORK` is set; on Kubernetes it is never published.
 
 ## The one rule
 
