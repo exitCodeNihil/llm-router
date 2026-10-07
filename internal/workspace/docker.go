@@ -24,10 +24,15 @@ import (
 // only if we start needing the parts of the API that are genuinely awkward.
 type Docker struct {
 	http *http.Client
+	// network names a user-defined network that the gateway and every workspace
+	// share. Set, the IDE is reached by container name on that network and no
+	// port is published; unset, it is published on the host's loopback, which
+	// only works when the gateway runs on the host itself.
+	network string
 }
 
-func NewDocker(socket string) *Docker {
-	return &Docker{http: &http.Client{
+func NewDocker(socket, network string) *Docker {
+	return &Docker{network: network, http: &http.Client{
 		// No Client.Timeout: exec responses stream for as long as the command
 		// runs. A deadline belongs on the request context, not here.
 		Transport: &http.Transport{
@@ -188,12 +193,17 @@ func (c *Docker) create(ctx context.Context, name string, spec Spec) error {
 		"CapDrop":     []string{"ALL"},
 		"SecurityOpt": []string{"no-new-privileges"},
 		"PidsLimit":   512,
-		// code-server has no password of its own, so it must not be reachable
-		// from anywhere but this host — the gateway's proxy is the only door.
-		// An empty HostPort lets the runtime pick a free one.
-		"PortBindings": map[string]any{
+	}
+	// code-server has no password of its own, so it must not be reachable
+	// from anywhere but the gateway's proxy. Either nothing is published and
+	// only the shared network can reach it, or it is published on this host's
+	// loopback, where an empty HostPort lets the runtime pick a free one.
+	if c.network != "" {
+		host["NetworkMode"] = c.network
+	} else {
+		host["PortBindings"] = map[string]any{
 			IDEPort + "/tcp": []any{map[string]any{"HostIp": "127.0.0.1", "HostPort": ""}},
-		},
+		}
 	}
 	if spec.MemoryMB > 0 {
 		host["Memory"] = int64(spec.MemoryMB) * 1 << 20
@@ -309,6 +319,9 @@ func (c *Docker) Running(ctx context.Context, name string) (bool, error) {
 // than storing it means a container recreated on a different port still
 // resolves, and nothing has to be kept in sync.
 func (c *Docker) IDEEndpoint(ctx context.Context, name string) (string, error) {
+	if c.network != "" {
+		return "http://" + net.JoinHostPort(name, IDEPort), nil
+	}
 	resp, err := c.do(ctx, http.MethodGet, "/containers/"+name+"/json", nil, "")
 	if err != nil {
 		return "", err

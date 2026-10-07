@@ -127,7 +127,7 @@ func testClient(t *testing.T, h http.HandlerFunc) *Docker {
 	srv := &http.Server{Handler: h}
 	go srv.Serve(l)
 	t.Cleanup(func() { srv.Close() })
-	return NewDocker(sock)
+	return NewDocker(sock, "")
 }
 
 func TestCreateRequest(t *testing.T) {
@@ -171,6 +171,44 @@ func TestCreateRequest(t *testing.T) {
 	}
 	if body["WorkingDir"] != Root {
 		t.Errorf("WorkingDir = %v, want %s", body["WorkingDir"], Root)
+	}
+}
+
+// code-server has no password, so how it is exposed is a security property:
+// loopback only by default, and not published at all on a shared network.
+func TestCreateExposure(t *testing.T) {
+	create := func(network string) (host map[string]any, c *Docker) {
+		var body map[string]any
+		c = testClient(t, func(w http.ResponseWriter, r *http.Request) {
+			json.NewDecoder(r.Body).Decode(&body)
+			w.Write([]byte(`{"Id":"abc123"}`))
+		})
+		c.network = network
+		if err := c.create(context.Background(), "llmr-ws-1", Spec{Image: "node:22-slim"}); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		host, _ = body["HostConfig"].(map[string]any)
+		return host, c
+	}
+
+	host, _ := create("")
+	bind, _ := host["PortBindings"].(map[string]any)[IDEPort+"/tcp"].([]any)
+	if len(bind) != 1 || bind[0].(map[string]any)["HostIp"] != "127.0.0.1" {
+		t.Errorf("PortBindings = %v, want one binding on 127.0.0.1", host["PortBindings"])
+	}
+	if _, ok := host["NetworkMode"]; ok {
+		t.Errorf("NetworkMode = %v, want none without a shared network", host["NetworkMode"])
+	}
+
+	host, c := create("llm-router-workspaces")
+	if host["NetworkMode"] != "llm-router-workspaces" {
+		t.Errorf("NetworkMode = %v", host["NetworkMode"])
+	}
+	if _, ok := host["PortBindings"]; ok {
+		t.Errorf("PortBindings = %v, want nothing published on a shared network", host["PortBindings"])
+	}
+	if got, err := c.IDEEndpoint(context.Background(), "llmr-ws-1"); err != nil || got != "http://llmr-ws-1:"+IDEPort {
+		t.Errorf("IDEEndpoint = %q, %v", got, err)
 	}
 }
 

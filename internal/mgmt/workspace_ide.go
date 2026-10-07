@@ -19,8 +19,9 @@ const idePrefix = "/ide"
 //
 // code-server runs with no password of its own — it is reachable only through
 // here, and only after requireWorkspaceAccess and the owner check in
-// loadWorkspace have both passed. On Docker it is published to 127.0.0.1; on
-// Kubernetes it is not published at all.
+// loadWorkspace have both passed. On Docker it is published to 127.0.0.1, or not
+// at all on a shared network (LLMR_WORKSPACE_NETWORK); on Kubernetes it is not
+// published either.
 //
 // ReverseProxy has handled Connection: Upgrade since Go 1.20, which is what
 // makes the IDE's terminal and language-server sockets work through it — that

@@ -13,7 +13,8 @@ This writes `deploy/.env` once, starts Postgres and the gateway, and prints the 
 up `deploy/.env`**: `LLMR_ENCRYPTION_KEY` protects stored provider keys, and a different key makes
 them unreadable. Use `--build` to build from source, and `LLMR_VERSION=0.1.0` in `deploy/.env` to
 pin a release. Only 8080 (console and API) and 8081 (workspace IDEs) are published, plus 3001 on
-loopback if you turn on [Langfuse](#langfuse-in-compose).
+loopback if you turn on [Langfuse](#langfuse-in-compose). For [workspaces](workspaces.md), run
+`./deploy/quickstart.sh --workspaces`.
 
 For HTTPS, add Caddy. `deploy/Caddyfile`:
 
@@ -40,6 +41,8 @@ volumes:
 docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.caddy.yml up -d
 ```
 
+With workspaces on, add `-f deploy/docker-compose.workspaces.yml`.
+
 ## Kubernetes
 
 The Helm chart in `deploy/helm/llm-router` runs the control plane (`mode=all`) or an edge node
@@ -56,7 +59,8 @@ helm install llm-router ./deploy/helm/llm-router --set existingSecret=llm-router
   --set ingress.enabled=true,ingress.host=router.example.com,ingress.className=nginx
 ```
 
-Add `ingress.tls` for HTTPS. Keep one control-plane replica and scale with edge nodes.
+Add `ingress.tls` for HTTPS. Keep one control-plane replica and scale with edge nodes. For
+[workspaces](workspaces.md#kubernetes) add `--set workspaces.enabled=true,workspaces.ideOrigin=https://ide.example.com`.
 
 ## Edge nodes
 
@@ -88,6 +92,7 @@ users: a first-time user has to reach the control plane once.
 | `LLMR_SNAPSHOT_CACHE` | edge | Config cache path (default `/var/lib/llmrouter/snapshot.json`) |
 | `LLMR_SEED_CLAUDE_SUBSCRIPTION` | control plane | `1` adds the [subscription pass-through](clients.md#on-your-claudeai-subscription) provider and models |
 | `LLMR_IDE_LISTEN`, `LLMR_IDE_ORIGIN`, `LLMR_COOKIE_DOMAIN` | control plane | [Workspace IDE](workspaces.md) listener, its public origin, and the session cookie domain when it is another hostname |
+| `LLMR_WORKSPACE_NETWORK` | control plane | Docker network shared with workspaces, so a containerised gateway reaches each IDE by name (set by `docker-compose.workspaces.yml`). Unset, the IDE is published on the host's loopback |
 
 Placeholder secrets such as `change-me` are refused. Generate them with `openssl rand -hex 16`.
 
@@ -108,9 +113,10 @@ Placeholder secrets such as `change-me` are refused. Generate them with `openssl
 Redis and MinIO, about 2 GB of RAM. Uncomment the services and the four `langfuse-*` volumes, then:
 
 ```bash
+cd deploy
 for v in NEXTAUTH_SECRET SALT ENCRYPTION_KEY PASSWORD SECRET_KEY; do
-  echo "LANGFUSE_$v=$(openssl rand -hex 32)"; done >> deploy/.env
-docker compose -f deploy/docker-compose.yml up -d
+  echo "LANGFUSE_$v=$(openssl rand -hex 32)"; done >> .env
+docker compose up -d
 ```
 
 In the console, **Observability**: host `http://langfuse-web:3000`, public key `pk-lf-llm-router`,

@@ -1,0 +1,36 @@
+{{- if and .Values.workspaces.enabled (eq .Values.mode "all") }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-llm-router
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-llm-router-workspaces
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, create, delete]
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [get, create]
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get, create, delete]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create, update, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-llm-router-workspaces
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-llm-router-workspaces
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-llm-router
+{{- end }}

@@ -10,6 +10,11 @@ spec:
   ports:
     - port: {{ .Values.service.port }}
       targetPort: 8080
+    {{- if and .Values.workspaces.enabled (eq .Values.mode "all") }}
+    - name: ide
+      port: 8081
+      targetPort: ide
+    {{- end }}
   selector:
     app.kubernetes.io/name: llm-router
     app.kubernetes.io/instance: {{ .Release.Name }}

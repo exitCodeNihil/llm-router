@@ -1,0 +1,21 @@
+# Adds workspaces to docker-compose.yml. Easiest: ./quickstart.sh --workspaces
+# By hand:
+#   docker compose -f docker-compose.yml -f docker-compose.workspaces.yml up -d
+# The gateway gets your container socket, which is root on the host. See docs/workspaces.md.
+services:
+  llmrouter:
+    user: root # the image's default user cannot open the socket
+    security_opt:
+      - label=disable # SELinux (Fedora, RHEL, podman machine) blocks the socket otherwise
+    volumes:
+      # Docker: /var/run/docker.sock. Rootless podman: /run/user/<uid>/podman/podman.sock.
+      - ${LLMR_CONTAINER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+    environment:
+      # Workspaces join this network, so the gateway reaches each IDE by name and nothing
+      # is published. Postgres stays off it, so a workspace can't reach the database.
+      LLMR_WORKSPACE_NETWORK: llm-router-workspaces
+    networks: [default, workspaces]
+
+networks:
+  workspaces:
+    name: llm-router-workspaces
