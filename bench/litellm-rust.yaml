@@ -1,0 +1,26 @@
+# LiteLLM's Rust gateway (early beta, built from BerriAI/litellm at the commit in run.sh) for the
+# benchmark. Same config format as the Python proxy, but the standalone binary only does master-key
+# auth: no virtual keys, database, spend logging, fallbacks, retries or timeouts yet. Plain YAML,
+# no anchors, in case its parser doesn't do merge keys. OpenAI-compatible upstreams are `openai_like/`:
+# its chat completions route does not take `openai/` yet. It streams only on /v1/messages to an
+# Anthropic upstream; OpenAI-format streaming returns 501 ("unsupported by the rust path").
+model_list:
+  - { model_name: fast, litellm_params: { model: openai_like/fast, api_base: "http://mock:9000/v1", api_key: x } }
+  - { model_name: chat, litellm_params: { model: openai_like/chat, api_base: "http://mock:9000/v1", api_key: x } }
+  - { model_name: long, litellm_params: { model: openai_like/long, api_base: "http://mock:9000/v1", api_key: x } }
+  - { model_name: slow, litellm_params: { model: openai_like/slow, api_base: "http://mock:9000/v1", api_key: x } }
+  - { model_name: err429, litellm_params: { model: openai_like/err429, api_base: "http://mock:9000/v1", api_key: x } }
+  - { model_name: tok10, litellm_params: { model: openai_like/tok10, api_base: "http://mock:9000/v1", api_key: x } }
+  - { model_name: tok0, litellm_params: { model: openai_like/tok0, api_base: "http://mock:9000/v1", api_key: x } }
+  - { model_name: a-fast, litellm_params: { model: anthropic/fast, api_base: "http://mock:9000", api_key: x } }
+  - { model_name: a-chat, litellm_params: { model: anthropic/chat, api_base: "http://mock:9000", api_key: x } }
+  - { model_name: a-long, litellm_params: { model: anthropic/long, api_base: "http://mock:9000", api_key: x } }
+  - { model_name: tls-chat, litellm_params: { model: openai_like/chat, api_base: "https://mock:9443/v1", api_key: x } }
+
+litellm_settings:
+  # It doesn't read SSL_CERT_FILE, so it can't trust the mock's certificate; this only affects the
+  # one HTTPS model (TLS still runs, the certificate just isn't checked).
+  ssl_verify: false
+
+general_settings:
+  master_key: sk-bench-master

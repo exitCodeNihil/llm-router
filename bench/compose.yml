@@ -1,0 +1,117 @@
+# Benchmark stack, driven by ./run.sh. One gateway profile runs at a time, each with its own
+# Postgres; the load generator and mock run on the same network, so load never crosses a
+# published port. Published ports are bound to loopback and only used for setup.
+name: llmr-bench
+
+x-common: &common
+  ulimits:
+    nofile: { soft: 65536, hard: 65536 }
+  sysctls:
+    net.core.somaxconn: 8192
+    net.ipv4.ip_local_port_range: "1024 65535"
+    net.ipv4.tcp_tw_reuse: 1
+  # Logs would go to journald, outside the container's cgroup, where nobody gets billed for them.
+  logging:
+    driver: none
+
+services:
+  mock:
+    <<: *common
+    image: gcr.io/distroless/static-debian12
+    command: ["/bench/mock", "-tls-addr", ":9443", "-cert", "/bench/tls/cert.pem", "-key", "/bench/tls/key.pem"]
+    volumes: ["./bin:/bench:ro"]
+    cpus: ${MOCK_CPUS:-2}
+    ports: ["127.0.0.1:19000:9000"]
+
+  pg:
+    <<: *common
+    image: docker.io/library/postgres:17
+    profiles: [router, litellm, otari]
+    environment: { POSTGRES_USER: bench, POSTGRES_PASSWORD: bench, POSTGRES_DB: bench }
+    cpus: ${PG_CPUS:-2}
+    mem_limit: 2g
+    healthcheck: { test: ["CMD", "pg_isready", "-U", "bench"], interval: 1s, timeout: 2s, retries: 60 }
+
+  router:
+    <<: *common
+    image: ghcr.io/exitcodenihil/llm-router:0.1.2
+    profiles: [router]
+    depends_on: { pg: { condition: service_healthy } }
+    environment:
+      LLMR_DATABASE_URL: postgres://bench:bench@pg:5432/bench
+      LLMR_ADMIN_TOKEN: bench-admin-token
+      LLMR_ENCRYPTION_KEY: bench-encryption-key-0123456789
+      LLMR_SEED_CLAUDE_SUBSCRIPTION: ${SEED_SUB:-0}
+      SSL_CERT_FILE: /tls/bundle.pem
+    volumes: ["./bin/tls:/tls:ro"]
+    cpus: ${GW_CPUS:-1}
+    mem_limit: 8g
+    ports: ["127.0.0.1:18080:8080"]
+
+  litellm:
+    <<: *common
+    image: ghcr.io/berriai/litellm:v1.104.0
+    profiles: [litellm]
+    depends_on: { pg: { condition: service_healthy } }
+    command: ["--config", "/litellm.yaml", "--port", "4000", "--num_workers", "${GW_CPUS:-1}"]
+    environment:
+      DATABASE_URL: postgresql://bench:bench@pg:5432/bench
+      LITELLM_MASTER_KEY: sk-bench-master
+      LITELLM_SALT_KEY: sk-bench-salt-0123456789
+      LITELLM_LOG: ERROR
+      LITELLM_MODE: PRODUCTION
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
+      SSL_CERT_FILE: /tls/bundle.pem
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    volumes: ["./${LITELLM_CONFIG:-litellm.yaml}:/litellm.yaml:ro", "./bin/tls:/tls:ro"]
+    cpus: ${GW_CPUS:-1}
+    mem_limit: 8g
+    ports: ["127.0.0.1:14000:4000"]
+
+  otari:
+    <<: *common
+    image: docker.io/mzdotai/otari:0.15.0
+    profiles: [otari]
+    depends_on: { pg: { condition: service_healthy } }
+    command: ["otari", "serve", "--config", "/otari.yml", "--log-level", "WARNING"]
+    environment:
+      OTARI_MASTER_KEY: bench-master-key-0123456789
+      OTARI_PROVIDER_ACCOUNT_PEPPER: bench-pepper-0123456789-0123456789-0123456789
+      SSL_CERT_FILE: /tls/bundle.pem
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    volumes: ["./${OTARI_CONFIG:-otari.yml}:/otari.yml:ro", "./bin/tls:/tls:ro"]
+    cpus: ${GW_CPUS:-1}
+    mem_limit: 8g
+    ports: ["127.0.0.1:18000:8000"]
+
+  # LiteLLM's Rust gateway: no published image yet, ./run.sh build-lrust builds it from source.
+  lrust:
+    <<: *common
+    image: localhost/litellm-gateway:${LRUST_TAG:-7b439d91}
+    profiles: [lrust]
+    environment:
+      LITELLM_CONFIG: /config.yaml
+      RUST_LOG: warn
+      SSL_CERT_FILE: /tls/bundle.pem
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    volumes: ["./${LRUST_CONFIG:-litellm-rust.yaml}:/config.yaml:ro", "./bin/tls:/tls:ro"]
+    cpus: ${GW_CPUS:-1}
+    mem_limit: 8g
+    ports: ["127.0.0.1:14001:4000"]
+
+  loadgen:
+    <<: *common
+    image: gcr.io/distroless/static-debian12
+    profiles: [tools]
+    entrypoint: ["/bench/loadgen"]
+    environment: { SSL_CERT_FILE: /bench/tls/bundle.pem }
+    volumes: ["./bin:/bench:ro", "./results:/results"]
+    cpus: ${LOADGEN_CPUS:-2}
+
+  k6:
+    <<: *common
+    image: docker.io/grafana/k6:2.3.0
+    profiles: [tools]
+    user: "0" # to write the summary into the bind-mounted results
+    volumes: ["./k6.js:/k6.js:ro", "./results:/results"]
+    cpus: ${LOADGEN_CPUS:-2}
