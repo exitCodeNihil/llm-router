@@ -1,0 +1,51 @@
+# LiteLLM for the benchmark: every model is the mock upstream (the profile is the upstream model
+# name), set up as LiteLLM's production guide recommends for one container
+# (https://docs.litellm.ai/docs/proxy/prod): workers = vCPUs (run.sh passes --num_workers), quiet
+# logs, spend writes batched every 60 s, Postgres, no Redis (single instance).
+#
+# Retries are off everywhere (max_retries: 0 also stops the OpenAI SDK's own two retries) so the
+# failover tests measure one failover, as with the other gateways.
+x-oai: &oai { api_base: http://mock:9000/v1, api_key: x, max_retries: 0, input_cost_per_token: 0.000001, output_cost_per_token: 0.000002 }
+x-anth: &anth { api_base: http://mock:9000, api_key: x, max_retries: 0, input_cost_per_token: 0.000001, output_cost_per_token: 0.000002 }
+
+model_list:
+  - { model_name: fast, litellm_params: { <<: *oai, model: openai/fast } }
+  - { model_name: chat, litellm_params: { <<: *oai, model: openai/chat } }
+  - { model_name: long, litellm_params: { <<: *oai, model: openai/long } }
+  - { model_name: slow, litellm_params: { <<: *oai, model: openai/slow } }
+  - { model_name: err429, litellm_params: { <<: *oai, model: openai/err429 } }
+  - { model_name: tok10, litellm_params: { <<: *oai, model: openai/tok10 } }
+  - { model_name: tok0, litellm_params: { <<: *oai, model: openai/tok0 } }
+  - { model_name: a-fast, litellm_params: { <<: *anth, model: anthropic/fast } }
+  - { model_name: a-chat, litellm_params: { <<: *anth, model: anthropic/chat } }
+  - { model_name: a-long, litellm_params: { <<: *anth, model: anthropic/long } }
+  - { model_name: tls-chat, litellm_params: { <<: *oai, model: openai/chat, api_base: "https://mock:9443/v1" } }
+  # Failover pairs: a failing primary group and the group it falls back to.
+  - { model_name: fo500, litellm_params: { <<: *oai, model: openai/err500.fo } }
+  - { model_name: fo500-b, litellm_params: { <<: *oai, model: openai/fast.fo500 } }
+  - { model_name: fo429, litellm_params: { <<: *oai, model: openai/err429.fo } }
+  - { model_name: fo429-b, litellm_params: { <<: *oai, model: openai/fast.fo429 } }
+  - { model_name: foflaky, litellm_params: { <<: *oai, model: openai/flaky.fo } }
+  - { model_name: foflaky-b, litellm_params: { <<: *oai, model: openai/fast.foflaky } }
+  - { model_name: fohang, litellm_params: { <<: *oai, model: openai/hang.fo, timeout: 5, stream_timeout: 5 } }
+  - { model_name: fohang-b, litellm_params: { <<: *oai, model: openai/fast.fohang } }
+
+router_settings:
+  num_retries: 0
+  fallbacks: [{ fo500: [fo500-b] }, { fo429: [fo429-b] }, { foflaky: [foflaky-b] }, { fohang: [fohang-b] }]
+
+litellm_settings:
+  set_verbose: false
+  json_logs: true
+  request_timeout: 600
+  num_retries: 0
+  # Anthropic-format requests to an OpenAI model otherwise go to /v1/responses, which an
+  # OpenAI-compatible server (vLLM, LM Studio, this mock) may not serve.
+  use_chat_completions_url_for_anthropic_messages: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  proxy_batch_write_at: 60
+  disable_error_logs: true
+  # disable_spend_logs: true  (run.sh turns this on for the "minimal" variant)

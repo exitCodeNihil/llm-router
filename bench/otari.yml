@@ -1,0 +1,73 @@
+# Otari for the benchmark: every model is the mock upstream (the profile is the upstream model
+# name). Otari runs one process by design (`otari serve` rejects --workers > 1).
+#
+# client_args max_retries: 0 stops the OpenAI/Anthropic SDKs' own two retries, so the failover
+# tests measure one failover, as with the other gateways.
+database_url: "postgresql://bench:bench@pg:5432/bench"
+master_key: ${OTARI_MASTER_KEY}
+default_pricing: false
+require_pricing: true
+pricing_refresh: manual
+model_discovery: false
+
+providers:
+  mock_oai:
+    provider_type: openai
+    api_base: "http://mock:9000/v1"
+    api_key: x
+    models: [fast, chat, long, slow, err429, tok10, tok0]
+    client_args: { max_retries: 0 }
+  mock_anth:
+    provider_type: anthropic
+    api_base: "http://mock:9000"
+    api_key: x
+    models: [fast, chat, long]
+    client_args: { max_retries: 0 }
+  mock_tls:
+    provider_type: openai
+    api_base: "https://mock:9443/v1"
+    api_key: x
+    models: [chat]
+    client_args: { max_retries: 0 }
+  # Failover: failing primaries (with a 5 s timeout so a hung one can fail over) and backups.
+  mock_fo:
+    provider_type: openai
+    api_base: "http://mock:9000/v1"
+    api_key: x
+    models: [err500.fo, err429.fo, flaky.fo, hang.fo]
+    client_args: { max_retries: 0, timeout: 5 }
+  mock_bk:
+    provider_type: openai
+    api_base: "http://mock:9000/v1"
+    api_key: x
+    models: [fast.fo500, fast.fo429, fast.foflaky, fast.fohang]
+    client_args: { max_retries: 0 }
+
+routing:
+  enabled: true
+  policies:
+    fo500: { select: [{ default: "mock_fo:err500.fo" }], on_failure: ["mock_bk:fast.fo500"] }
+    fo429: { select: [{ default: "mock_fo:err429.fo" }], on_failure: ["mock_bk:fast.fo429"] }
+    foflaky: { select: [{ default: "mock_fo:flaky.fo" }], on_failure: ["mock_bk:fast.foflaky"] }
+    fohang: { select: [{ default: "mock_fo:hang.fo" }], on_failure: ["mock_bk:fast.fohang"] }
+
+pricing:
+  mock_oai:fast: &price { input_price_per_million: 1, output_price_per_million: 2 }
+  mock_oai:chat: *price
+  mock_oai:long: *price
+  mock_oai:slow: *price
+  mock_oai:err429: *price
+  mock_oai:tok10: *price
+  mock_oai:tok0: *price
+  mock_anth:fast: *price
+  mock_anth:chat: *price
+  mock_anth:long: *price
+  mock_tls:chat: *price
+  mock_fo:err500.fo: *price
+  mock_fo:err429.fo: *price
+  mock_fo:flaky.fo: *price
+  mock_fo:hang.fo: *price
+  mock_bk:fast.fo500: *price
+  mock_bk:fast.fo429: *price
+  mock_bk:fast.foflaky: *price
+  mock_bk:fast.fohang: *price
