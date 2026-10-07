@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/exitCodeNihil/llm-router/compare/v0.1.1...v0.1.2) (2026-10-07)
+
+
+### Features
+
+* run workspaces from a containerised gateway ([#8](https://github.com/exitCodeNihil/llm-router/issues/8)) ([00b40e4](https://github.com/exitCodeNihil/llm-router/commit/00b40e4661b44bb0cfc0d6e40c33a54a2e1a72b2))
+
 ## [0.1.1](https://github.com/exitCodeNihil/llm-router/compare/v0.1.0...v0.1.1) (2026-10-06)
 
 
