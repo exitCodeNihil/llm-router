@@ -96,6 +96,10 @@ export interface Deployment {
   output_per_1m: number | null;
   /** Optional cache-read rate; unset bills cache reads at input_per_1m. */
   cached_input_per_1m: number | null;
+  /** Gateways in a group with this region try this deployment first. */
+  region: string;
+  /** How long to wait for the upstream's response headers before failing over; null = default. */
+  timeout_ms: number | null;
   enabled: boolean;
   created_at: string;
 }
@@ -211,6 +215,18 @@ export interface TokenIssuer {
   claim_mapping: ClaimMapping | null;
   enabled: boolean;
   created_at: string;
+}
+
+export type DataRule = "inherit" | "no_content" | "no_export";
+
+export interface GatewayGroup {
+  id: string;
+  name: string;
+  region: string;
+  allowed_teams: string[] | null; // null or empty = every team
+  data_rule: DataRule;
+  created_at: string;
+  live_instances: number;
 }
 
 export interface EdgeNode {
@@ -418,7 +434,9 @@ export interface Node {
   id: string;
   name: string;
   addr: string;
-  role: "leader" | "";
+  role: "leader" | "gateway" | "";
+  group?: string;
+  region?: string;
   version: string;
   version_skew: boolean;
   uptime_s: number;

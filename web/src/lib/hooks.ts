@@ -16,6 +16,7 @@ import type {
   Deployment,
   DeploymentReq,
   EdgeNode,
+  GatewayGroup,
   ExportedEvent,
   FlowEdgeRow,
   LiveMetrics,
@@ -512,6 +513,36 @@ export const useDeleteEdgeNode = () =>
   useInvalidatingMutation(
     (id: string) => api.del(`/api/edge-nodes/${id}`),
     [["edge-nodes"]],
+  );
+
+// ── Gateway groups ──────────────────────────────────────────────
+export function useGatewayGroups() {
+  return useQuery({
+    queryKey: ["gateway-groups"],
+    queryFn: () => api.get<GatewayGroup[]>("/api/gateway-groups"),
+    refetchInterval: 15_000,
+  });
+}
+export type GatewayGroupInput = Pick<GatewayGroup, "name" | "region" | "allowed_teams" | "data_rule">;
+export const useCreateGatewayGroup = () =>
+  useInvalidatingMutation(
+    (b: GatewayGroupInput) => api.post<{ id: string; join_token: string }>("/api/gateway-groups", b),
+    [["gateway-groups"]],
+  );
+export const useUpdateGatewayGroup = () =>
+  useInvalidatingMutation(
+    ({ id, ...b }: GatewayGroupInput & { id: string }) => api.patch(`/api/gateway-groups/${id}`, b),
+    [["gateway-groups"]],
+  );
+export const useRotateGatewayToken = () =>
+  useInvalidatingMutation(
+    (id: string) => api.post<{ join_token: string }>(`/api/gateway-groups/${id}/rotate-token`, {}),
+    [["gateway-groups"]],
+  );
+export const useDeleteGatewayGroup = () =>
+  useInvalidatingMutation(
+    (id: string) => api.del(`/api/gateway-groups/${id}`),
+    [["gateway-groups"], ["nodes"]],
   );
 
 // ── Usage ───────────────────────────────────────────────────────

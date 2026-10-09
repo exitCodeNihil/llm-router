@@ -3,6 +3,7 @@ package limits
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/exitcodenihil/llm-router/internal/auth"
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
@@ -92,5 +93,86 @@ func TestTPM(t *testing.T) {
 	c.RecordUsage(id, 60, 0)
 	if ok, _, code, _ := c.Check(id, s); ok || code != "rate_limit_exceeded" {
 		t.Fatalf("expected tpm denial, got ok=%v code=%s", ok, code)
+	}
+}
+
+// A burst at the end of one minute and another at the start of the next must
+// not pass twice the limit: the previous minute still counts, fading out.
+func TestSlidingWindowAcrossMinuteBoundary(t *testing.T) {
+	rpm := 10
+	id := &auth.Identity{Key: &snapshot.Key{ID: "k1", RPMLimit: &rpm}}
+	s := &snapshot.Snapshot{}
+	c := New()
+	at := time.UnixMilli(59_000) // 1 s before the boundary
+	c.now = func() time.Time { return at }
+	passed := 0
+	for range 20 {
+		if ok, _, _, _ := c.Check(id, s); ok {
+			passed++
+		}
+	}
+	at = time.UnixMilli(61_000) // 1 s after it: the old minute still counts ~58/60
+	for range 20 {
+		if ok, _, _, _ := c.Check(id, s); ok {
+			passed++
+		}
+	}
+	if passed > rpm+1 {
+		t.Fatalf("%d requests passed across the boundary, limit %d", passed, rpm)
+	}
+	at = time.UnixMilli(120_000 + 59_000) // a minute later the window has emptied
+	if ok, _, _, _ := c.Check(id, s); !ok {
+		t.Fatal("a request a minute later must pass")
+	}
+}
+
+// Counts from gateways and from the control plane's own traffic add up.
+func TestIngestCombinesGateways(t *testing.T) {
+	rpm := 10
+	id := &auth.Identity{Key: &snapshot.Key{ID: "k1", RPMLimit: &rpm}}
+	c := New()
+	at := time.UnixMilli(600_000)
+	c.now = func() time.Time { return at }
+	s := &snapshot.Snapshot{KeysByHash: map[[32]byte]*snapshot.Key{{1}: id.Key}}
+	c.Check(id, s)               // one request through the control plane itself
+	c.Ingest("key:k1", 10, 5, 0) // gateway A
+	c.Ingest("key:k1", 10, 4, 0) // gateway B
+	if ok, _, _, _ := c.Check(id, s); ok {
+		t.Fatal("10 requests from the control plane and two gateways should exhaust a 10 rpm key")
+	}
+	if r := c.Export(s, "").Rates["key:k1"]; r[0] != 10 {
+		t.Fatalf("exported rpm = %v, want 10 this minute", r)
+	}
+}
+
+// Export sends every budgeted scope on a fresh cursor, then only what changed,
+// and everything again after a snapshot swap or a control-plane restart.
+func TestExportCursor(t *testing.T) {
+	budget := 5.0
+	k1 := &snapshot.Key{ID: "k1", BudgetUSD: &budget}
+	k2 := &snapshot.Key{ID: "k2", BudgetUSD: &budget}
+	free := &snapshot.Key{ID: "k3"}
+	s := &snapshot.Snapshot{
+		KeysByHash: map[[32]byte]*snapshot.Key{{1}: k1, {2}: k2, {3}: free},
+		Spend:      map[string]snapshot.Spend{"key:k1": {USD: 1}},
+	}
+	c := New()
+	first := c.Export(s, "")
+	if len(first.Spend) != 2 || first.Spend["key:k1"] != 1 || first.Spend["key:k2"] != 0 {
+		t.Fatalf("first export = %v, want both budgeted keys", first.Spend)
+	}
+	if again := c.Export(s, first.Cursor); len(again.Spend) != 0 {
+		t.Fatalf("nothing changed, got %v", again.Spend)
+	}
+	c.AddSpend("key:k1", 0.5)
+	if next := c.Export(s, first.Cursor); len(next.Spend) != 1 || next.Spend["key:k1"] != 1.5 {
+		t.Fatalf("after spend, got %v", next.Spend)
+	}
+	s2 := &snapshot.Snapshot{KeysByHash: s.KeysByHash, Spend: map[string]snapshot.Spend{"key:k1": {USD: 1.5}}}
+	if swapped := c.Export(s2, first.Cursor); len(swapped.Spend) != 2 || swapped.Spend["key:k1"] != 1.5 {
+		t.Fatalf("after a snapshot swap, got %v", swapped.Spend)
+	}
+	if other := New().Export(s, first.Cursor); len(other.Spend) != 2 {
+		t.Fatalf("a cursor from another process must get everything, got %v", other.Spend)
 	}
 }

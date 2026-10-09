@@ -107,6 +107,7 @@ func (g *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Lets any caller correlate a response with its usage row and see which
 	// deployment actually served it, including whether failover kicked in.
 	setRoutingHeaders(w, reqID, chosen, attempts)
+	forwardRetryAfter(w, resp)
 
 	capture := dec.CaptureContent
 	var counts usageCounts
@@ -189,10 +190,14 @@ func setRoutingHeaders(w http.ResponseWriter, reqID string,
 		"X-Request-Id, X-Llmr-Provider, X-Llmr-Upstream, X-Llmr-Attempts")
 }
 
+// defaultUpstreamTimeout bounds the wait for an upstream's response headers
+// when a deployment sets no timeout_ms of its own.
+const defaultUpstreamTimeout = 10 * time.Minute
+
 // tryDeployments tries each deployment in priority order, failing over on
-// connect errors, 429, and 5xx. Retries happen only before any byte reaches
-// the client. Returns (nil, nil, nil) when every deployment failed, and a
-// non-nil error only for unrecoverable request-build failures or a dead client.
+// connect errors, timeouts, 429, and 5xx. Retries happen only before any byte
+// reaches the client. Returns (nil, nil, nil) when every deployment failed, and
+// a non-nil error only for unrecoverable request-build failures or a dead client.
 func tryDeployments(ctx context.Context, deployments []*snapshot.Deployment, upstreamPath string,
 	buildBody func(*snapshot.Deployment) ([]byte, error)) (*http.Response, *snapshot.Deployment, int, error) {
 	deployments = orderByHealth(deployments, time.Now())
@@ -206,21 +211,37 @@ func tryDeployments(ctx context.Context, deployments []*snapshot.Deployment, ups
 		if err != nil {
 			return nil, nil, attempts, err
 		}
-		req, err := provider.NewRequest(ctx, d, upstreamPath, upBody)
+		// The timeout covers the wait for response headers only: a long stream
+		// that has started is not cut off.
+		timeout := defaultUpstreamTimeout
+		if d.TimeoutMS != nil {
+			timeout = time.Duration(*d.TimeoutMS) * time.Millisecond
+		}
+		actx, cancel := context.WithCancel(ctx)
+		timer := time.AfterFunc(timeout, cancel)
+		req, err := provider.NewRequest(actx, d, upstreamPath, upBody)
 		if err != nil {
+			timer.Stop()
+			cancel()
 			lastBuildErr = err
 			slog.Warn("upstream request build failed", "deployment", d.UpstreamName, "err", err)
 			continue
 		}
 		res, err := provider.Client.Do(req)
-		if err != nil {
+		if timedOut := !timer.Stop(); err != nil || timedOut {
+			cancel()
+			if res != nil {
+				res.Body.Close()
+			}
 			if ctx.Err() != nil {
 				return nil, nil, attempts, ctx.Err()
 			}
 			upstreamHealth.fail(d.ID, 0, time.Now())
-			slog.Warn("upstream connect failed", "provider", d.Provider.Name, "deployment", d.UpstreamName, "err", err)
+			slog.Warn("upstream failed", "provider", d.Provider.Name, "deployment", d.UpstreamName,
+				"timed_out", actx.Err() != nil, "err", err)
 			continue
 		}
+		res.Body = cancelOnClose{res.Body, cancel}
 		if res.StatusCode == http.StatusTooManyRequests || res.StatusCode >= 500 {
 			// A pass-through 429 is the caller's own plan quota, not a sick backend:
 			// cooling the shared row would mark it down for every other subscriber.
@@ -239,6 +260,28 @@ func tryDeployments(ctx context.Context, deployments []*snapshot.Deployment, ups
 		return res, d, attempts, nil
 	}
 	return nil, nil, attempts, lastBuildErr
+}
+
+// cancelOnClose releases a request's context once its body is done.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
+}
+
+// forwardRetryAfter passes the upstream's Retry-After on with a 429 or 503 the
+// client receives, so it knows when to come back.
+func forwardRetryAfter(w http.ResponseWriter, resp *http.Response) {
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+		if v := resp.Header.Get("Retry-After"); v != "" {
+			w.Header().Set("Retry-After", v)
+		}
+	}
 }
 
 // orderByHealth keeps priority order but moves deployments in cooldown to the

@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/exitcodenihil/llm-router/internal/metrics"
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
 )
 
@@ -163,6 +164,36 @@ func (m *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 			"version": ver, "version_skew": skew, "uptime_s": uptime,
 			"cpu_pct": round1(cpu), "mem_pct": round1(mem), "rps": round1(m.liveRPS(id)),
 			"p50_ms": 0, "last_seen": row["last_seen_at"], "status": status, // ponytail: per-edge p50 not tracked
+		})
+	}
+
+	// Gateway instances sync every 2 s, so a few missed syncs already mean trouble.
+	rows, _ = listRows(r.Context(), m.Store.Pool,
+		`SELECT i.id, i.name, g.name AS group_name, g.region, i.last_seen_at
+		FROM gateway_instances i JOIN gateway_groups g ON g.id = i.group_id
+		WHERE i.last_seen_at > now() - interval '10 minutes' ORDER BY g.name, i.joined_at`)
+	for _, row := range rows {
+		id, _ := row["id"].(string)
+		name, _ := row["name"].(string)
+		group, _ := row["group_name"].(string)
+		lastSeen, _ := row["last_seen_at"].(time.Time)
+		var nm metrics.NodeMetric
+		if m.NodeStore != nil {
+			nm, _ = m.NodeStore.Get(id)
+		}
+		skew := nm.Version != "" && nm.Version != selfVer
+		status := "ok"
+		switch {
+		case now.Sub(lastSeen) > 30*time.Second:
+			status = "err"
+		case now.Sub(lastSeen) > 10*time.Second || skew:
+			status = "warn"
+		}
+		nodes = append(nodes, map[string]any{
+			"id": id, "name": name, "addr": "", "role": "gateway", "group": group, "region": row["region"],
+			"version": nm.Version, "version_skew": skew, "uptime_s": nm.UptimeS,
+			"cpu_pct": round1(nm.CPUPct), "mem_pct": round1(nm.MemPct), "rps": round1(m.liveRPS(id)),
+			"p50_ms": 0, "last_seen": row["last_seen_at"], "status": status,
 		})
 	}
 

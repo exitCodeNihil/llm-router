@@ -138,3 +138,54 @@ func TestPassthrough429DoesNotCool(t *testing.T) {
 		t.Error("a pass-through 5xx should still cool the row")
 	}
 }
+
+// A deployment that sends no response headers within its timeout is given up
+// on and the next one serves, instead of the request hanging forever.
+func TestTimeoutFailsOver(t *testing.T) {
+	release := make(chan struct{})
+	hung := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-release }))
+	defer hung.Close()
+	defer close(release)
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer backup.Close()
+
+	d := stubDeployment(hung.URL, "m", "hung", 0)
+	ms := 100
+	d.TimeoutMS = &ms
+	b := stubDeployment(backup.URL, "m", "backup-timeout", 1)
+	defer upstreamHealth.ok(d.ID)
+	defer upstreamHealth.ok(b.ID)
+	body := func(*snapshot.Deployment) ([]byte, error) { return []byte(`{}`), nil }
+
+	start := time.Now()
+	res, chosen, attempts, err := tryDeployments(context.Background(), []*snapshot.Deployment{d, b}, "/chat/completions", body)
+	if err != nil || chosen != b || attempts != 2 {
+		t.Fatalf("want failover to the backup on attempt 2, got %v (%d), err %v", chosen, attempts, err)
+	}
+	// The served body must still read after the timer is stopped.
+	buf := make([]byte, 64)
+	n, _ := res.Body.Read(buf)
+	res.Body.Close()
+	if string(buf[:n]) != `{"ok":true}` {
+		t.Fatalf("backup body = %q", buf[:n])
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("failover took %v; the 100 ms timeout did not apply", took)
+	}
+	if !upstreamHealth.cooling(d.ID, time.Now()) {
+		t.Error("a timed-out deployment should cool")
+	}
+}
+
+func TestForwardRetryAfter(t *testing.T) {
+	for status, want := range map[int]string{429: "7", 503: "7", 500: "", 200: ""} {
+		w := httptest.NewRecorder()
+		resp := &http.Response{StatusCode: status, Header: http.Header{"Retry-After": {"7"}}}
+		forwardRetryAfter(w, resp)
+		if got := w.Header().Get("Retry-After"); got != want {
+			t.Errorf("status %d: Retry-After = %q, want %q", status, got, want)
+		}
+	}
+}

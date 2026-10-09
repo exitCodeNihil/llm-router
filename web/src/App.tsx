@@ -19,7 +19,7 @@ import Providers from "./pages/Providers";
 import Models from "./pages/Models";
 import ModelsAvailable from "./pages/ModelsAvailable";
 import Pricing from "./pages/Pricing";
-import EdgeNodes from "./pages/EdgeNodes";
+import Gateways from "./pages/Gateways";
 import Settings from "./pages/Settings";
 // Both pull in the chart bundle too.
 const Analytics = lazy(() => import("./pages/Analytics"));
@@ -70,7 +70,8 @@ export default function App() {
           <Route path="/models" element={isAdmin ? <Models /> : <ModelsAvailable />} />
           {isAdmin && <Route path="/deployments" element={<Navigate to="/models" replace />} />}
           {isAdmin && <Route path="/pricing" element={<Pricing />} />}
-          {isAdmin && <Route path="/edge-nodes" element={<EdgeNodes />} />}
+          {isAdmin && <Route path="/gateways" element={<Gateways />} />}
+          {isAdmin && <Route path="/edge-nodes" element={<Navigate to="/gateways" replace />} />}
           {isAdmin && <Route path="/observability" element={<Observability />} />}
           {isAdmin && <Route path="/settings" element={<Settings />} />}
           <Route path="*" element={<Navigate to="/" replace />} />

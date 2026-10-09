@@ -174,6 +174,7 @@ func (g *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	// The Anthropic surface published no routing attribution at all, so a Claude
 	// Code request could not be correlated with its usage row.
 	setRoutingHeaders(w, reqID, chosen, attempts)
+	forwardRetryAfter(w, resp)
 
 	capture := dec.CaptureContent
 	var counts usageCounts

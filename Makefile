@@ -44,7 +44,7 @@ GO_SOURCES := $(shell find . -name '*.go' -not -path './web/node_modules/*' 2>/d
 
 .DEFAULT_GOAL := help
 .PHONY: help dev dev-api dev-web build web theme run test test-go test-web \
-        check fmt fmt-check vet tidy audit verify verify-chat demo-gifs tools clean distclean \
+        check test-db fmt fmt-check vet tidy audit verify verify-chat demo-gifs tools clean distclean \
         deps db-url stack stack-down stack-logs db-wait db-reset db-shell image image-run bench
 
 # ── Help ─────────────────────────────────────────────────────────────────────
@@ -103,6 +103,13 @@ test: test-go test-web ## Go tests + console typecheck
 
 test-go: ## Go tests
 	@go test ./...
+
+test-db: ## Tests that need Postgres, against a throwaway container
+	@$(ENGINE) run -d --rm --name llmr-test-db -e POSTGRES_USER=t -e POSTGRES_PASSWORD=t -e POSTGRES_DB=t \
+	  -p 127.0.0.1:55433:5432 docker.io/library/postgres:17 >/dev/null
+	@until $(ENGINE) exec llmr-test-db pg_isready -U t >/dev/null 2>&1; do sleep 1; done; sleep 1
+	@LLMR_TEST_DATABASE_URL='postgres://t:t@127.0.0.1:55433/t?sslmode=disable' go test ./internal/gwsync; \
+	  s=$$?; $(ENGINE) rm -f llmr-test-db >/dev/null; exit $$s
 
 test-web: $(NODE_DEPS) ## Console typecheck
 	@npm --prefix $(WEB) run typecheck
