@@ -34,7 +34,7 @@ services:
 
   router:
     <<: *common
-    image: ghcr.io/exitcodenihil/llm-router:0.1.2
+    image: ${ROUTER_IMAGE:-ghcr.io/exitcodenihil/llm-router:0.1.2}
     profiles: [router]
     depends_on: { pg: { condition: service_healthy } }
     environment:

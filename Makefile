@@ -45,7 +45,7 @@ GO_SOURCES := $(shell find . -name '*.go' -not -path './web/node_modules/*' 2>/d
 .DEFAULT_GOAL := help
 .PHONY: help dev dev-api dev-web build web theme run test test-go test-web \
         check fmt fmt-check vet tidy audit verify verify-chat demo-gifs tools clean distclean \
-        deps db-url stack stack-down stack-logs db-wait db-reset db-shell image image-run
+        deps db-url stack stack-down stack-logs db-wait db-reset db-shell image image-run bench
 
 # ── Help ─────────────────────────────────────────────────────────────────────
 
@@ -226,3 +226,9 @@ image-run: image ## Run the built image against the dev Postgres
 	  -e LLMR_ADMIN_TOKEN="$(LLMR_ADMIN_TOKEN)" \
 	  -e LLMR_ENCRYPTION_KEY="$(LLMR_ENCRYPTION_KEY)" \
 	  $(IMAGE)
+
+# ── Benchmark ────────────────────────────────────────────────────────────────
+
+bench: ## Full gateway comparison of this checkout, into docs/benchmarks.md (hours)
+	@$(MAKE) --no-print-directory image ENGINE=podman IMAGE=localhost/llm-router:bench
+	cd bench && ROUTER_IMAGE=localhost/llm-router:bench ./run.sh all && ./run.sh docs
