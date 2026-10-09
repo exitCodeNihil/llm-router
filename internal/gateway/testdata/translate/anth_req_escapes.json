@@ -1,0 +1,55 @@
+{
+  "fn": "anth_req_to_oai",
+  "model": "up",
+  "in": "{\"model\":\"m\",\"max_tokens\":10,\"system\":[{\"type\":\"text\",\"text\":\"a\\\"b\"},{\"type\":\"text\",\"text\":\"\\\\c\\n\"}],\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<b>&amp;</b> \\u00e9\\u2028 😀\"},{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image\\/png\",\"data\":\"ab\\/cd+==\"}}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"x\\ty\"},{\"type\":\"text\",\"text\":\"\\u0041\"},{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"n\",\"input\":{\"q\": \"a\\\"b\",  \"n\": 1.50}}]},{\"role\":\"\\u0061ssistant\",\"content\":[{\"type\":\"text\",\"text\":\"escaped role\"}]},{\"role\":\"user\",\"content\":\"tab\\there\"}],\"stop_sequences\":[\"<END>\"]}",
+  "out": {
+    "max_tokens": 10,
+    "messages": [
+      {
+        "content": "a\"b\\c\n",
+        "role": "system"
+      },
+      {
+        "content": [
+          {
+            "text": "\u003cb\u003e\u0026amp;\u003c/b\u003e é\u2028 😀",
+            "type": "text"
+          },
+          {
+            "image_url": {
+              "url": "data:image/png;base64,ab/cd+=="
+            },
+            "type": "image_url"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": "x\tyA",
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "id": "t",
+            "type": "function",
+            "function": {
+              "name": "n",
+              "arguments": "{\"q\": \"a\\\"b\",  \"n\": 1.50}"
+            }
+          }
+        ]
+      },
+      {
+        "content": "escaped role",
+        "role": "assistant"
+      },
+      {
+        "content": "tab\there",
+        "role": "user"
+      }
+    ],
+    "model": "up",
+    "stop": [
+      "\u003cEND\u003e"
+    ]
+  }
+}

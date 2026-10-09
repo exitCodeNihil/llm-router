@@ -1,0 +1,18 @@
+{
+  "fn": "anth_resp_to_oai",
+  "model": "claude",
+  "req_id": "req123",
+  "in": "{",
+  "out": {
+    "error": {
+      "code": "upstream_error",
+      "message": "unparseable upstream response",
+      "type": "server_error"
+    }
+  },
+  "usage": {
+    "prompt": 0,
+    "completion": 0,
+    "cached": 0
+  }
+}

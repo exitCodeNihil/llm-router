@@ -1,0 +1,57 @@
+{
+  "fn": "anth_resp_to_oai",
+  "model": "claude",
+  "req_id": "req123",
+  "in": {
+    "content": [
+      {
+        "type": "thinking",
+        "thinking": "hmm",
+        "signature": "s"
+      },
+      {
+        "type": "text",
+        "text": "part one, ",
+        "citations": [
+          {
+            "type": "char_location"
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "text": "part two"
+      }
+    ],
+    "stop_reason": "max_tokens",
+    "usage": {
+      "input_tokens": 3,
+      "output_tokens": 4
+    }
+  },
+  "out": {
+    "choices": [
+      {
+        "finish_reason": "length",
+        "index": 0,
+        "message": {
+          "content": "part one, part two",
+          "role": "assistant"
+        }
+      }
+    ],
+    "id": "chatcmpl-req123",
+    "model": "claude",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 4,
+      "prompt_tokens": 3,
+      "total_tokens": 7
+    }
+  },
+  "usage": {
+    "prompt": 3,
+    "completion": 4,
+    "cached": 0
+  }
+}

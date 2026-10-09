@@ -1,0 +1,49 @@
+{
+  "fn": "anth_req_to_oai",
+  "model": "up",
+  "in": {
+    "model": "m",
+    "max_tokens": 10,
+    "system": [
+      {
+        "type": "text",
+        "text": "You are Claude Code.",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      },
+      {
+        "type": "image",
+        "source": {
+          "type": "base64",
+          "media_type": "image/png",
+          "data": "iVBORw0KGgo="
+        }
+      },
+      {
+        "type": "text",
+        "text": " Be brief."
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      }
+    ]
+  },
+  "out": {
+    "max_tokens": 10,
+    "messages": [
+      {
+        "content": "You are Claude Code. Be brief.",
+        "role": "system"
+      },
+      {
+        "content": "hi",
+        "role": "user"
+      }
+    ],
+    "model": "up"
+  }
+}

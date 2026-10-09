@@ -1,0 +1,13 @@
+{
+  "fn": "anth_req_to_oai",
+  "model": "up",
+  "in": {
+    "model": "m",
+    "messages": []
+  },
+  "out": {
+    "max_tokens": 0,
+    "messages": [],
+    "model": "up"
+  }
+}

@@ -1,0 +1,186 @@
+{
+  "fn": "oai_req_to_anth",
+  "model": "claude-x",
+  "in": {
+    "model": "claude",
+    "messages": [
+      {
+        "role": "system",
+        "content": "s1"
+      },
+      {
+        "role": "user",
+        "content": "a"
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "b"
+          }
+        ]
+      },
+      {
+        "role": "developer",
+        "content": [
+          {
+            "type": "text",
+            "text": "s2"
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "data:image/png;base64,AA=="
+            }
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": ""
+      },
+      {
+        "role": "user",
+        "content": "c"
+      },
+      {
+        "role": "assistant",
+        "content": "thinking...",
+        "tool_calls": [
+          {
+            "id": "t1",
+            "type": "function",
+            "function": {
+              "name": "f",
+              "arguments": "{\"x\":1}"
+            }
+          },
+          {
+            "id": "t2",
+            "type": "function",
+            "function": {
+              "name": "g",
+              "arguments": "{}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "t1",
+        "content": "r1"
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "t2",
+        "content": [
+          {
+            "type": "text",
+            "text": "r2"
+          },
+          {
+            "type": "text",
+            "text": "!"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": "next"
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "done"
+          },
+          {
+            "type": "refusal",
+            "refusal": "no"
+          }
+        ]
+      },
+      {
+        "role": "system",
+        "content": null
+      }
+    ]
+  },
+  "out": {
+    "max_tokens": 4096,
+    "messages": [
+      {
+        "content": [
+          {
+            "text": "a",
+            "type": "text"
+          },
+          {
+            "text": "b",
+            "type": "text"
+          },
+          {
+            "text": "c",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "thinking...",
+            "type": "text"
+          },
+          {
+            "id": "t1",
+            "input": {
+              "x": 1
+            },
+            "name": "f",
+            "type": "tool_use"
+          },
+          {
+            "id": "t2",
+            "input": {},
+            "name": "g",
+            "type": "tool_use"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "content": "r1",
+            "tool_use_id": "t1",
+            "type": "tool_result"
+          },
+          {
+            "content": "r2!",
+            "tool_use_id": "t2",
+            "type": "tool_result"
+          },
+          {
+            "text": "next",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "done",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      }
+    ],
+    "model": "claude-x",
+    "system": "s1\n\ns2\n\n"
+  }
+}

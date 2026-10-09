@@ -163,6 +163,7 @@ func run() error {
 		mux.Handle("/", console.SPA())
 
 	case "gateway":
+		slog.Warn("edge nodes (--mode=gateway) are deprecated: create a gateway group and run llm-router-gateway instead")
 		client := edge.NewClient(cfg.ControlPlaneURL, cfg.NodeToken, cfg.SnapshotCache, holder)
 		go client.Run(ctx)
 		shipper := edge.NewShipper(cfg.ControlPlaneURL, cfg.NodeToken)

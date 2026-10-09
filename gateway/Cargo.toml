@@ -1,0 +1,36 @@
+[package]
+name = "llmr-gateway"
+version = "0.0.0" # the release version comes from LLMR_VERSION at build time
+edition = "2024"
+publish = false
+description = "llm-router's data-plane gateway: joins a control plane, serves /v1."
+license = "Apache-2.0"
+
+[[bin]]
+name = "llmr-gateway"
+path = "src/main.rs"
+
+[dependencies]
+arc-swap = "1"
+bytes = "1"
+fastrand = "2"
+flate2 = "1"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "http2", "native-tokio", "tls12"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "client-legacy", "http1", "http2"] }
+memchr = "2"
+mimalloc = { version = "0.1", default-features = false }
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "signal", "sync", "fs", "io-util"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

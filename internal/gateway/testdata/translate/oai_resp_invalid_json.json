@@ -1,0 +1,18 @@
+{
+  "fn": "oai_resp_to_anth",
+  "model": "m",
+  "req_id": "req123",
+  "in": "not json",
+  "out": {
+    "error": {
+      "message": "unparseable upstream response",
+      "type": "api_error"
+    },
+    "type": "error"
+  },
+  "usage": {
+    "prompt": 0,
+    "completion": 0,
+    "cached": 0
+  }
+}

@@ -37,6 +37,7 @@ ENGINE     ?= $(shell command -v podman >/dev/null 2>&1 && echo podman || echo d
 COMPOSE    ?= $(ENGINE) compose
 DEV_STACK  := deploy/docker-compose.dev.yml
 IMAGE      ?= llm-router:dev
+GATEWAY_IMAGE ?= llm-router-gateway:dev
 DB_NAME    ?= llmrouter
 DB_SERVICE ?= postgres
 
@@ -45,7 +46,7 @@ GO_SOURCES := $(shell find . -name '*.go' -not -path './web/node_modules/*' 2>/d
 .DEFAULT_GOAL := help
 .PHONY: help dev dev-api dev-web build web theme run test test-go test-web \
         check test-db fmt fmt-check vet tidy audit verify verify-chat demo-gifs tools clean distclean \
-        deps db-url stack stack-down stack-logs db-wait db-reset db-shell image image-run bench
+        deps db-url stack stack-down stack-logs db-wait db-reset db-shell image image-gateway image-run bench bench-images bench-rgw
 
 # ── Help ─────────────────────────────────────────────────────────────────────
 
@@ -227,6 +228,10 @@ image: ## Build the container image (IMAGE=llm-router:dev)
 	@$(ENGINE) build -t $(IMAGE) -f Dockerfile .
 	@$(ENGINE) images $(IMAGE) --format "  built {{.Repository}}:{{.Tag}}  {{.Size}}"
 
+image-gateway: ## Build the Rust gateway image (GATEWAY_IMAGE=llm-router-gateway:dev)
+	@$(ENGINE) build -t $(GATEWAY_IMAGE) -f gateway/Dockerfile gateway
+	@$(ENGINE) images $(GATEWAY_IMAGE) --format "  built {{.Repository}}:{{.Tag}}  {{.Size}}"
+
 image-run: image ## Run the built image against the dev Postgres
 	@$(ENGINE) run --rm -p $(PORT):8080 \
 	  -e LLMR_DATABASE_URL="postgres://llmrouter:llmrouter@host.containers.internal:5433/llmrouter" \
@@ -236,6 +241,14 @@ image-run: image ## Run the built image against the dev Postgres
 
 # ── Benchmark ────────────────────────────────────────────────────────────────
 
-bench: ## Full gateway comparison of this checkout, into docs/benchmarks.md (hours)
+BENCH_IMAGES := ROUTER_IMAGE=localhost/llm-router:bench RGW_IMAGE=localhost/llm-router-gateway:bench
+
+bench-images:
 	@$(MAKE) --no-print-directory image ENGINE=podman IMAGE=localhost/llm-router:bench
-	cd bench && ROUTER_IMAGE=localhost/llm-router:bench ./run.sh all && ./run.sh docs
+	@$(MAKE) --no-print-directory image-gateway ENGINE=podman GATEWAY_IMAGE=localhost/llm-router-gateway:bench
+
+bench: bench-images ## Full gateway comparison of this checkout, into docs/benchmarks.md (hours)
+	cd bench && $(BENCH_IMAGES) GATEWAYS="router rgw lrust litellm otari" ./run.sh all && ./run.sh docs
+
+bench-rgw: bench-images ## Add this checkout's Rust gateway to the latest benchmark results
+	cd bench && $(BENCH_IMAGES) GATEWAYS=rgw RUN=$$(ls results | tail -1) ./run.sh all && RUN=$$(ls results | tail -1) ./run.sh docs

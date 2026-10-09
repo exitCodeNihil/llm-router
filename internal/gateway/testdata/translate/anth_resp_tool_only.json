@@ -1,0 +1,73 @@
+{
+  "fn": "anth_resp_to_oai",
+  "model": "claude",
+  "req_id": "req123",
+  "in": {
+    "content": [
+      {
+        "type": "tool_use",
+        "id": "a",
+        "name": "noinput"
+      },
+      {
+        "type": "tool_use",
+        "id": "b",
+        "name": "withinput",
+        "input": {
+          "k": [
+            1,
+            "two"
+          ]
+        }
+      }
+    ],
+    "stop_reason": "tool_use",
+    "usage": {
+      "input_tokens": 1,
+      "output_tokens": 2
+    }
+  },
+  "out": {
+    "choices": [
+      {
+        "finish_reason": "tool_calls",
+        "index": 0,
+        "message": {
+          "content": null,
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "id": "a",
+              "type": "function",
+              "function": {
+                "name": "noinput",
+                "arguments": "{}"
+              }
+            },
+            {
+              "id": "b",
+              "type": "function",
+              "function": {
+                "name": "withinput",
+                "arguments": "{\n          \"k\": [\n            1,\n            \"two\"\n          ]\n        }"
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "id": "chatcmpl-req123",
+    "model": "claude",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 2,
+      "prompt_tokens": 1,
+      "total_tokens": 3
+    }
+  },
+  "usage": {
+    "prompt": 1,
+    "completion": 2,
+    "cached": 0
+  }
+}

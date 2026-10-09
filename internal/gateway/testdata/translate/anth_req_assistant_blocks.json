@@ -1,0 +1,134 @@
+{
+  "fn": "anth_req_to_oai",
+  "model": "up",
+  "in": {
+    "model": "m",
+    "max_tokens": 10,
+    "messages": [
+      {
+        "role": "user",
+        "content": "go"
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": "hmm",
+            "signature": "sig"
+          },
+          {
+            "type": "text",
+            "text": "a"
+          },
+          {
+            "type": "text",
+            "text": "b"
+          },
+          {
+            "type": "tool_use",
+            "id": "t1",
+            "name": "noinput"
+          },
+          {
+            "type": "tool_use",
+            "id": "t2",
+            "name": "nullinput",
+            "input": null
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "t3",
+            "name": "x",
+            "input": {}
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": ""
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "redacted_thinking",
+            "data": "xyz"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": "plain"
+      }
+    ]
+  },
+  "out": {
+    "max_tokens": 10,
+    "messages": [
+      {
+        "content": "go",
+        "role": "user"
+      },
+      {
+        "content": "ab",
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "id": "t1",
+            "type": "function",
+            "function": {
+              "name": "noinput",
+              "arguments": "{}"
+            }
+          },
+          {
+            "id": "t2",
+            "type": "function",
+            "function": {
+              "name": "nullinput",
+              "arguments": "null"
+            }
+          }
+        ]
+      },
+      {
+        "content": null,
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "id": "t3",
+            "type": "function",
+            "function": {
+              "name": "x",
+              "arguments": "{}"
+            }
+          }
+        ]
+      },
+      {
+        "content": "",
+        "role": "assistant"
+      },
+      {
+        "content": null,
+        "role": "assistant"
+      },
+      {
+        "content": "plain",
+        "role": "assistant"
+      }
+    ],
+    "model": "up"
+  }
+}

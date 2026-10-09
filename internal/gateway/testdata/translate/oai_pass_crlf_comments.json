@@ -1,0 +1,11 @@
+{
+  "fn": "oai_passthrough",
+  "drop_usage_chunk": true,
+  "in": ": keep-alive\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\r\n\r\ndata:{\"choices\":[],\"usage\":{\"prompt_tokens\":99,\"completion_tokens\":99}}\r\n\r\nid: 7\r\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\r\n\r\ndata: [DONE]\r\n\r\n",
+  "out": ": keep-alive\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata:{\"choices\":[],\"usage\":{\"prompt_tokens\":99,\"completion_tokens\":99}}\n\nid: 7\n\ndata: [DONE]\n\n",
+  "usage": {
+    "prompt": 3,
+    "completion": 2,
+    "cached": 0
+  }
+}

@@ -65,3 +65,21 @@ jobs:
           build-args: VERSION=${{ needs.release-please.outputs.tag_name }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+      # The Rust gateway, in lockstep with the control plane it joins. Its
+      # builder cross-compiles with zig, so arm64 needs no emulation.
+      - id: meta-gateway
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}-gateway
+          tags: |
+            type=raw,value=${{ needs.release-please.outputs.version }}
+            type=raw,value=latest,enable=${{ !contains(needs.release-please.outputs.version, '-') }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: gateway
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # the same version string as the control plane, so the console sees no skew
+          build-args: VERSION=${{ needs.release-please.outputs.tag_name }}
+          tags: ${{ steps.meta-gateway.outputs.tags }}
+          labels: ${{ steps.meta-gateway.outputs.labels }}

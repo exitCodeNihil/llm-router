@@ -1,0 +1,60 @@
+{
+  "fn": "anth_req_to_oai",
+  "model": "up",
+  "in": {
+    "model": "m",
+    "max_tokens": 10,
+    "tool_choice": {
+      "type": "any"
+    },
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "w",
+        "input_schema": {
+          "type": "object"
+        }
+      },
+      {
+        "name": "bare"
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "weather?"
+      }
+    ]
+  },
+  "out": {
+    "max_tokens": 10,
+    "messages": [
+      {
+        "content": "weather?",
+        "role": "user"
+      }
+    ],
+    "model": "up",
+    "tool_choice": "required",
+    "tools": [
+      {
+        "function": {
+          "description": "w",
+          "name": "get_weather",
+          "parameters": {
+            "type": "object"
+          }
+        },
+        "type": "function"
+      },
+      {
+        "function": {
+          "description": "",
+          "name": "bare",
+          "parameters": null
+        },
+        "type": "function"
+      }
+    ]
+  }
+}

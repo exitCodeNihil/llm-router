@@ -1,0 +1,12 @@
+{
+  "fn": "anth_to_oai_stream",
+  "model": "claude",
+  "req_id": "req123",
+  "in": "",
+  "out": "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"id\":\"chatcmpl-req123\",\"model\":\"claude\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"id\":\"chatcmpl-req123\",\"model\":\"claude\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[],\"id\":\"chatcmpl-req123\",\"model\":\"claude\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":0,\"total_tokens\":0}}\n\ndata: [DONE]\n\n",
+  "usage": {
+    "prompt": 0,
+    "completion": 0,
+    "cached": 0
+  }
+}

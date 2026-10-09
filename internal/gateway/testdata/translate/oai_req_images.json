@@ -1,0 +1,149 @@
+{
+  "fn": "oai_req_to_anth",
+  "model": "claude-x",
+  "in": {
+    "model": "claude",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "look"
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "data:image/jpeg;base64,/9j/4AAQ",
+              "detail": "high"
+            }
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "https://example.com/x.png"
+            }
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "data:text/plain,hello"
+            }
+          },
+          {
+            "type": "input_audio",
+            "input_audio": {
+              "data": "x",
+              "format": "wav"
+            }
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": "ok"
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "https://only.remote/x.png"
+            }
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": "ok2"
+      },
+      {
+        "role": "user",
+        "content": null
+      },
+      {
+        "role": "user",
+        "content": 5
+      },
+      {
+        "role": "user"
+      }
+    ]
+  },
+  "out": {
+    "max_tokens": 4096,
+    "messages": [
+      {
+        "content": [
+          {
+            "text": "look",
+            "type": "text"
+          },
+          {
+            "source": {
+              "data": "/9j/4AAQ",
+              "media_type": "image/jpeg",
+              "type": "base64"
+            },
+            "type": "image"
+          },
+          {
+            "source": {
+              "data": "hello",
+              "media_type": "text/plain",
+              "type": "base64"
+            },
+            "type": "image"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "ok",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "text": "",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "ok2",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "text": "",
+            "type": "text"
+          },
+          {
+            "text": "",
+            "type": "text"
+          },
+          {
+            "text": "",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "claude-x"
+  }
+}

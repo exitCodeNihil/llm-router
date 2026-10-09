@@ -1,0 +1,20 @@
+{
+  "fn": "anth_req_to_oai",
+  "model": "up",
+  "in": {
+    "model": "m",
+    "max_tokens": 1,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": 5
+          }
+        ]
+      }
+    ]
+  },
+  "error": "json: cannot unmarshal number into Go struct field .0.text of type string"
+}

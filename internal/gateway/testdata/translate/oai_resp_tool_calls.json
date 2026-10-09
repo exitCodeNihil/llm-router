@@ -1,0 +1,102 @@
+{
+  "fn": "oai_resp_to_anth",
+  "model": "m",
+  "req_id": "req123",
+  "in": {
+    "choices": [
+      {
+        "message": {
+          "content": "let me check",
+          "tool_calls": [
+            {
+              "id": "c1",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Dubai\"}"
+              }
+            },
+            {
+              "id": "c2",
+              "type": "function",
+              "function": {
+                "name": "empty",
+                "arguments": ""
+              }
+            },
+            {
+              "id": "c3",
+              "type": "function",
+              "function": {
+                "name": "bad",
+                "arguments": "nope"
+              }
+            },
+            {
+              "id": "c4",
+              "type": "function",
+              "function": {
+                "name": "nul",
+                "arguments": "null"
+              }
+            }
+          ]
+        },
+        "finish_reason": "tool_calls"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 5,
+      "completion_tokens": 3
+    }
+  },
+  "out": {
+    "content": [
+      {
+        "text": "let me check",
+        "type": "text"
+      },
+      {
+        "id": "c1",
+        "input": {
+          "city": "Dubai"
+        },
+        "name": "get_weather",
+        "type": "tool_use"
+      },
+      {
+        "id": "c2",
+        "input": {},
+        "name": "empty",
+        "type": "tool_use"
+      },
+      {
+        "id": "c3",
+        "input": {},
+        "name": "bad",
+        "type": "tool_use"
+      },
+      {
+        "id": "c4",
+        "input": null,
+        "name": "nul",
+        "type": "tool_use"
+      }
+    ],
+    "id": "msg_req123",
+    "model": "m",
+    "role": "assistant",
+    "stop_reason": "tool_use",
+    "stop_sequence": null,
+    "type": "message",
+    "usage": {
+      "input_tokens": 5,
+      "output_tokens": 3
+    }
+  },
+  "usage": {
+    "prompt": 5,
+    "completion": 3,
+    "cached": 0
+  }
+}

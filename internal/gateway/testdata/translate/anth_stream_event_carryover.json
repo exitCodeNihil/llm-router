@@ -1,0 +1,12 @@
+{
+  "fn": "anth_to_oai_stream",
+  "model": "claude",
+  "req_id": "req123",
+  "in": "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"before any event\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"one\"}}\n\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"carried over\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"two data lines, \"}}\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"each handled\"}}\n\nevent: message_delta\ndata: not json\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null},\"usage\":null}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+  "out": "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"id\":\"chatcmpl-req123\",\"model\":\"claude\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"one\"},\"finish_reason\":null,\"index\":0}],\"id\":\"chatcmpl-req123\",\"model\":\"claude\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"carried over\"},\"finish_reason\":null,\"index\":0}],\"id\":\"chatcmpl-req123\",\"model\":\"claude\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"two data lines, \"},\"finish_reason\":null,\"index\":0}],\"id\":\"chatcmpl-req123\",\"model\":\"claude\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"each handled\"},\"finish_reason\":null,\"index\":0}],\"id\":\"chatcmpl-req123\",\"model\":\"claude\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"id\":\"chatcmpl-req123\",\"model\":\"claude\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[],\"id\":\"chatcmpl-req123\",\"model\":\"claude\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":0,\"prompt_tokens\":0,\"total_tokens\":0}}\n\ndata: [DONE]\n\n",
+  "usage": {
+    "prompt": 0,
+    "completion": 0,
+    "cached": 0
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "fn": "anth_json_usage",
+  "in": {
+    "content": [],
+    "stop_reason": 5,
+    "usage": {
+      "input_tokens": 8,
+      "output_tokens": 4
+    }
+  },
+  "usage": {
+    "prompt": 8,
+    "completion": 4,
+    "cached": 0
+  }
+}

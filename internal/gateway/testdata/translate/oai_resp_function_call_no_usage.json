@@ -1,0 +1,39 @@
+{
+  "fn": "oai_resp_to_anth",
+  "model": "m",
+  "req_id": "req123",
+  "in": {
+    "choices": [
+      {
+        "message": {
+          "content": null
+        },
+        "finish_reason": "function_call"
+      },
+      {
+        "message": {
+          "content": "second choice ignored"
+        },
+        "finish_reason": "stop"
+      }
+    ]
+  },
+  "out": {
+    "content": [],
+    "id": "msg_req123",
+    "model": "m",
+    "role": "assistant",
+    "stop_reason": "tool_use",
+    "stop_sequence": null,
+    "type": "message",
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0
+    }
+  },
+  "usage": {
+    "prompt": 0,
+    "completion": 0,
+    "cached": 0
+  }
+}

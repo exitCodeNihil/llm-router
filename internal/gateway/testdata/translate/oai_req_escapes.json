@@ -1,0 +1,41 @@
+{
+  "fn": "oai_req_to_anth",
+  "model": "claude-x",
+  "in": "{\"model\":\"claude\",\"messages\":[{\"role\":\"system\",\"content\":\"line1\\nline2\"},{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"<sys>&\"}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"\\u00e9 \\\"q\\\" \\\\\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image\\/png;base64,ab\\/cd\"}}]},{\"role\":\"\\u0061ssistant\",\"content\":\"escaped role\"}],\"stop\":\"\\u0045ND\"}",
+  "out": {
+    "max_tokens": 4096,
+    "messages": [
+      {
+        "content": [
+          {
+            "text": "é \"q\" \\",
+            "type": "text"
+          },
+          {
+            "source": {
+              "data": "ab/cd",
+              "media_type": "image/png",
+              "type": "base64"
+            },
+            "type": "image"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "escaped role",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      }
+    ],
+    "model": "claude-x",
+    "stop_sequences": [
+      "END"
+    ],
+    "system": "line1\nline2\n\n\u003csys\u003e\u0026"
+  }
+}

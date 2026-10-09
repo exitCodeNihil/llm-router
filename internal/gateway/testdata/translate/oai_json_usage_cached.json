@@ -1,0 +1,24 @@
+{
+  "fn": "oai_json_usage",
+  "in": {
+    "choices": [
+      {
+        "message": {
+          "content": "x"
+        }
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 1000,
+      "completion_tokens": 500,
+      "prompt_tokens_details": {
+        "cached_tokens": 400
+      }
+    }
+  },
+  "usage": {
+    "prompt": 1000,
+    "completion": 500,
+    "cached": 400
+  }
+}

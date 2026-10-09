@@ -1,0 +1,72 @@
+{
+  "fn": "anth_resp_to_oai",
+  "model": "claude",
+  "req_id": "req123",
+  "in": {
+    "id": "msg_up",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-x",
+    "content": [
+      {
+        "type": "text",
+        "text": "the weather is"
+      },
+      {
+        "type": "tool_use",
+        "id": "tu9",
+        "name": "get_weather",
+        "input": {
+          "city": "Dubai"
+        }
+      }
+    ],
+    "stop_reason": "tool_use",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 20,
+      "output_tokens": 8,
+      "cache_read_input_tokens": 100,
+      "cache_creation_input_tokens": 30,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 30
+      },
+      "service_tier": "standard"
+    }
+  },
+  "out": {
+    "choices": [
+      {
+        "finish_reason": "tool_calls",
+        "index": 0,
+        "message": {
+          "content": "the weather is",
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "id": "tu9",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\n          \"city\": \"Dubai\"\n        }"
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "id": "chatcmpl-req123",
+    "model": "claude",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 8,
+      "prompt_tokens": 150,
+      "total_tokens": 158
+    }
+  },
+  "usage": {
+    "prompt": 150,
+    "completion": 8,
+    "cached": 100
+  }
+}

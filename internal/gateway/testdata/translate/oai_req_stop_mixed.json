@@ -1,0 +1,42 @@
+{
+  "fn": "oai_req_to_anth",
+  "model": "claude-x",
+  "in": {
+    "model": "claude",
+    "stop": [
+      1,
+      "a",
+      {
+        "x": 1
+      },
+      null
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      }
+    ]
+  },
+  "out": {
+    "max_tokens": 4096,
+    "messages": [
+      {
+        "content": [
+          {
+            "text": "hi",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "claude-x",
+    "stop_sequences": [
+      "",
+      "a",
+      "",
+      ""
+    ]
+  }
+}

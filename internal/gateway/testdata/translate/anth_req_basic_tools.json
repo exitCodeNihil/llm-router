@@ -1,0 +1,106 @@
+{
+  "fn": "anth_req_to_oai",
+  "model": "up",
+  "in": {
+    "model": "m",
+    "max_tokens": 100,
+    "system": "be terse",
+    "messages": [
+      {
+        "role": "user",
+        "content": "hello"
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "checking"
+          },
+          {
+            "type": "tool_use",
+            "id": "tu1",
+            "name": "ls",
+            "input": {
+              "path": "/tmp"
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "tu1",
+            "content": "file1\nfile2"
+          }
+        ]
+      }
+    ],
+    "tools": [
+      {
+        "name": "ls",
+        "description": "list files",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    ]
+  },
+  "out": {
+    "max_tokens": 100,
+    "messages": [
+      {
+        "content": "be terse",
+        "role": "system"
+      },
+      {
+        "content": "hello",
+        "role": "user"
+      },
+      {
+        "content": "checking",
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "id": "tu1",
+            "type": "function",
+            "function": {
+              "name": "ls",
+              "arguments": "{\n              \"path\": \"/tmp\"\n            }"
+            }
+          }
+        ]
+      },
+      {
+        "content": "file1\nfile2",
+        "role": "tool",
+        "tool_call_id": "tu1"
+      }
+    ],
+    "model": "up",
+    "tools": [
+      {
+        "function": {
+          "description": "list files",
+          "name": "ls",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "type": "function"
+      }
+    ]
+  }
+}

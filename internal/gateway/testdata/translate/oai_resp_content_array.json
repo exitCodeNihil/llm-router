@@ -1,0 +1,36 @@
+{
+  "fn": "oai_resp_to_anth",
+  "model": "m",
+  "req_id": "req123",
+  "in": {
+    "choices": [
+      {
+        "message": {
+          "content": [
+            {
+              "type": "text",
+              "text": "x"
+            }
+          ]
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 5,
+      "completion_tokens": 3
+    }
+  },
+  "out": {
+    "error": {
+      "message": "unparseable upstream response",
+      "type": "api_error"
+    },
+    "type": "error"
+  },
+  "usage": {
+    "prompt": 0,
+    "completion": 0,
+    "cached": 0
+  }
+}

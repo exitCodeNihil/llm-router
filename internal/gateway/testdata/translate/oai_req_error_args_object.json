@@ -1,0 +1,25 @@
+{
+  "fn": "oai_req_to_anth",
+  "model": "claude-x",
+  "in": {
+    "model": "claude",
+    "messages": [
+      {
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "id": "t",
+            "type": "function",
+            "function": {
+              "name": "f",
+              "arguments": {
+                "a": 1
+              }
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "error": "unparseable request: json: cannot unmarshal object into Go struct field .messages.0.tool_calls.0.function.arguments of type string"
+}

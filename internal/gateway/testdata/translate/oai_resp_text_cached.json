@@ -1,0 +1,54 @@
+{
+  "fn": "oai_resp_to_anth",
+  "model": "m",
+  "req_id": "req123",
+  "in": {
+    "id": "chatcmpl-up",
+    "object": "chat.completion",
+    "created": 1700000000,
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "hi there <b>",
+          "refusal": null
+        },
+        "finish_reason": "stop",
+        "logprobs": null
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 100,
+      "completion_tokens": 2,
+      "total_tokens": 102,
+      "prompt_tokens_details": {
+        "cached_tokens": 80,
+        "audio_tokens": 0
+      }
+    }
+  },
+  "out": {
+    "content": [
+      {
+        "text": "hi there \u003cb\u003e",
+        "type": "text"
+      }
+    ],
+    "id": "msg_req123",
+    "model": "m",
+    "role": "assistant",
+    "stop_reason": "end_turn",
+    "stop_sequence": null,
+    "type": "message",
+    "usage": {
+      "input_tokens": 100,
+      "output_tokens": 2
+    }
+  },
+  "usage": {
+    "prompt": 100,
+    "completion": 2,
+    "cached": 80
+  }
+}
