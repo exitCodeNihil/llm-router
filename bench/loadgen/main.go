@@ -115,8 +115,12 @@ func main() {
 		switch os.Args[1] {
 		case "report":
 			err = report(os.Args[2], os.Stdout)
-		case "summary":
-			err = summarizeDir(os.Args[2], os.Stdout)
+		case "summary": // summary DIR [DOC]: print the tables, or write them into DOC
+			if len(os.Args) > 3 {
+				err = spliceDoc(os.Args[2], os.Args[3])
+			} else {
+				err = summarizeDir(os.Args[2], os.Stdout)
+			}
 		default:
 			err = usageCmd(os.Args[2:])
 		}

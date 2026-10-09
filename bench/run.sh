@@ -6,13 +6,15 @@
 #   ./run.sh build-lrust       build LiteLLM's Rust gateway image from source (no published image)
 #   ./run.sh all               every scenario except real (hours: run it overnight)
 #   ./run.sh cal               check the CPU and memory sampler before trusting it
-#   ./run.sh s3 router otari   one scenario for some gateways (default: all four)
+#   ./run.sh s3 router otari   one scenario for some gateways (default: GATEWAYS)
 #   ./run.sh real              compatibility checks against real providers (needs .env)
 #   ./run.sh report            print every run as one table
+#   ./run.sh docs              write the summary tables into ../docs/benchmarks.md
 #
-# RUN names the results directory (default: today), REPEATS the headline repeats (3), SOAK_MIN
-# the soak length in minutes (30), QUICK=1 shrinks every run to seconds (to test the script).
-# Needs podman (with compose), Go, jq, curl and perl.
+# RUN names the results directory (default: today), GATEWAYS the gateways to run (default:
+# router litellm otari lrust), ROUTER_IMAGE the llm-router image (default: the pinned release),
+# REPEATS the headline repeats (3), SOAK_MIN the soak length in minutes (30), QUICK=1 shrinks
+# every run to seconds (to test the script). Needs podman (with compose), Go, jq, curl and perl.
 set -euo pipefail
 cd "$(dirname "$0")"
 SELF=$PWD/$(basename "$0")
@@ -21,7 +23,7 @@ export RUN=${RUN:-$(date +%F)}
 OUT=results/$RUN
 REPEATS=${REPEATS:-3}
 SOAK_MIN=${SOAK_MIN:-30}
-ALL=(router litellm otari lrust)
+read -ra ALL <<< "${GATEWAYS:-router litellm otari lrust}"
 # LiteLLM's Rust gateway, pinned: BerriAI/litellm main on the day of the run.
 LRUST_COMMIT=7b439d9138382e6e4b6b0498336c017157dee28e
 RATES=(10 25 50 100 200 300 500 750 1000 1500 2000 3000 5000 7500 10000 15000 20000 30000 40000 50000)
@@ -93,6 +95,7 @@ digest() {
 	img=$(dc --profile "$1" config --format json | jq -r ".services.$1.image")
 	podman image inspect --format '{{.Id}} {{.RepoDigests}}' "$img" > "$OUT/image-$1.txt"
 	[[ $1 == lrust ]] && echo "built from BerriAI/litellm@$LRUST_COMMIT" >> "$OUT/image-$1.txt"
+	[[ $1 != lrust && $img == localhost/* ]] && echo "built from $(git describe --always --dirty)" >> "$OUT/image-$1.txt"
 	true
 }
 
@@ -314,21 +317,24 @@ sample_start() {
 	# chain (subshell, podman, ssh) and not just the subshell.
 	set -m
 	vm bash -s > "$OUT/$SAMPLES" 2>/dev/null <<'EOF' &
-root=/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/user.slice
 i=0
 while :; do
-	(( i++ % 5 == 0 )) && names=$(podman ps --format '{{.ID}} {{.Names}}')
+	# every 5 s: each container's cgroup, wherever podman put it (rootless or rootful)
+	if (( i++ % 5 == 0 )); then
+		dirs=$(podman ps --format '{{.ID}} {{.Names}}' | while read -r id name; do
+			d=$(find /sys/fs/cgroup -maxdepth 8 -type d -name "libpod-$id*" -print -quit 2>/dev/null)
+			[[ -n $d ]] && echo "$name $d"
+		done)
+	fi
 	t=$(date +%s.%N)
-	while read -r id name; do
-		for d in "$root"/libpod-"$id"*.scope; do
-			[[ -d $d ]] && awk -v t="$t" -v n="$name" '
-				FNR == 1 { f++ }
-				f == 1 && $1 == "usage_usec" { u = $2 }  f == 1 && $1 == "throttled_usec" { tu = $2 }
-				f == 1 && $1 == "nr_throttled" { nt = $2 } f == 2 { m = $1 }
-				f == 3 && $1 == "anon" { a = $2 } f == 3 && $1 == "inactive_file" { fi = $2 } f == 3 && $1 == "sock" { s = $2 }
-				END { print t, n, u, tu, nt, m, a, fi, s }' "$d/cpu.stat" "$d/memory.current" "$d/memory.stat"
-		done
-	done <<< "$names"
+	while read -r name d; do
+		[[ -d $d ]] && awk -v t="$t" -v n="$name" '
+			FNR == 1 { f++ }
+			f == 1 && $1 == "usage_usec" { u = $2 }  f == 1 && $1 == "throttled_usec" { tu = $2 }
+			f == 1 && $1 == "nr_throttled" { nt = $2 } f == 2 { m = $1 }
+			f == 3 && $1 == "anon" { a = $2 } f == 3 && $1 == "inactive_file" { fi = $2 } f == 3 && $1 == "sock" { s = $2 }
+			END { print t, n, u, tu, nt, m, a, fi, s }' "$d/cpu.stat" "$d/memory.current" "$d/memory.stat"
+	done <<< "$dirs"
 	echo "$t vm $(head -1 /proc/stat | cut -d' ' -f3-)"
 	sleep 1
 done
@@ -353,6 +359,18 @@ failed() { jq -e '((.errors | add) // 0) > 0.01 * .sent or .achieved_rps < 0.95 
 
 # max GW [CPUS]: the gateway's sustainable rate from its ladder (at least 10).
 max() { local m; m=$(cat "$OUT/max-${2:-1}-$1" 2>/dev/null || echo 0); echo $((m > 10 ? m : 10)); }
+
+# slowest CPUS: the lowest sustainable rate among every gateway with a ladder in this run, so a
+# later run that adds one gateway to the results keeps the rates the others ran at.
+slowest() {
+	local f v m=0
+	for f in "$OUT/max-$1-"*; do
+		[[ -f $f && $f != *-direct ]] || continue
+		v=$(<"$f")
+		((m == 0 || v < m)) && m=$v
+	done
+	echo $((m > 10 ? m : 10))
+}
 
 # ladder GW: raise the rate until the gateway breaks, then bisect the sustainable maximum to
 # within 10%. Writes max-<cpus>-GW.
@@ -462,8 +480,7 @@ s2c() { # closed-loop concurrency sweep with tiny requests: the shape of an earl
 # common: a rate all three sustain at 1 vCPU with headroom (70% of the slowest), for the headline.
 common() {
 	local m
-	m=$(for gw in "${ALL[@]}"; do max "$gw"; done | sort -n | head -1)
-	m=$((m * 7 / 10 / 5 * 5))
+	m=$(($(slowest 1) * 7 / 10 / 5 * 5))
 	echo $((m > 10 ? m : 10))
 }
 
@@ -602,8 +619,7 @@ s9() { # what budgets, limits and request logging cost, and whether the limits h
 
 s8() { # soak and spike at 2 vCPU: same absolute load for all, 70% non-stream, 30% Anthropic streams
 	local gw r m seg bg
-	r=$(for gw in "${ALL[@]}"; do max "$gw" 2; done | sort -n | head -1)
-	r=$((r / 2))
+	r=$(($(slowest 2) / 2))
 	log "soak rate: $r rps for $SOAK_MIN min"
 	for gw in "$@"; do
 		fresh "$gw"
@@ -637,14 +653,34 @@ k6check() { # the same run through k6, to cross-check the load generator
 	down
 }
 
+# awake: on macOS, refuse to start on battery and keep the machine awake for the whole run. A
+# closed lid still sleeps it, so slept checks after every scenario and marks the run INVALID.
+awake() {
+	[[ $(uname) == Darwin ]] || return 0
+	if pmset -g batt | grep -q "'Battery Power'" && [[ -z ${ALLOW_BATTERY:-} ]]; then
+		echo "on battery: plug in first (or ALLOW_BATTERY=1); a long run drains it and the Mac sleeps" >&2
+		exit 1
+	fi
+	[[ -n ${CAFFEINATED:-} ]] || exec env CAFFEINATED=1 caffeinate -dims "$SELF" all
+	log "keep the lid open until it's done: caffeinate can't stop lid-close sleep (sudo pmset -a disablesleep 1 can)"
+}
+slept() { [[ $(uname) == Darwin ]] && pmset -g log | awk -v t="$1" '($1 " " $2) > t && /Entering Sleep/ { s = 1 } END { exit !s }'; }
+
 # all: every scenario, each in its own process so one failing doesn't stop the rest.
 all() {
-	local sc
-	log "run $RUN: $(podman machine inspect --format '{{.Resources.CPUs}} vCPU {{.Resources.Memory}} MiB' 2>/dev/null), $(pmset -g batt 2>/dev/null | head -1)"
+	local sc since
+	awake
+	since=$(date '+%Y-%m-%d %H:%M:%S')
+	log "run $RUN (${ALL[*]}): $(podman machine inspect --format '{{.Resources.CPUs}} vCPU {{.Resources.Memory}} MiB' 2>/dev/null || echo "$(nproc) CPUs, $(uname -r)"), $(pmset -g batt 2>/dev/null | head -1)"
 	build
+	[[ " ${ALL[*]} " != *" lrust "* ]] || podman image exists "localhost/litellm-gateway:${LRUST_COMMIT:0:8}" || build_lrust
 	for sc in cal s1 s2 k6check s2c headline s3 s2x s7 s9 s6 s8; do
 		log "== $sc"
 		"$SELF" "$sc" || log "!! $sc failed (exit $?)"
+		if [[ ! -f $OUT/INVALID ]] && slept "$since"; then
+			log "!! the machine slept during $sc: this run's results are invalid"
+			touch "$OUT/INVALID"
+		fi
 	done
 	down
 	log "done"
@@ -661,6 +697,10 @@ build-lrust) build_lrust ;;
 s1 | s2 | s2c | s2x | s3 | s6 | s7 | s8 | s9) "$cmd" "${@:-${ALL[@]}}" ;;
 real) "$PWD/real.sh" ;;
 report) go run ./loadgen report "$OUT" ;;
+docs)
+	[[ ! -f $OUT/INVALID || -n ${FORCE:-} ]] || { echo "$OUT is marked INVALID (the machine slept during it); FORCE=1 uses it anyway" >&2; exit 1; }
+	go run ./loadgen summary "$OUT" ../docs/benchmarks.md
+	;;
 call) "$@" ;; # any function, e.g. ./run.sh call fresh router
 *) sed -n '2,16p' "$SELF" && exit 2 ;;
 esac; exit # on the esac line: bash reads scripts as it runs them, so nothing after it is read

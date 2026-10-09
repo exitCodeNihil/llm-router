@@ -5,17 +5,28 @@ mock upstream. Results: [docs/benchmarks.md](../docs/benchmarks.md).
 
 ## Run it
 
-You need podman (with compose), Go, jq, curl and perl. About 9 hours, so overnight:
+You need podman (with compose), Go, jq, curl and perl. The full comparison takes about 9 hours:
 
 ```bash
-cd bench
-./run.sh build-lrust   # LiteLLM's Rust gateway has no published image yet
-./run.sh all           # results/<date>/
-./run.sh report        # every run as one table
+make bench             # builds this checkout, runs everything, rewrites the tables in docs/benchmarks.md
 ```
 
-Or one scenario: `./run.sh s3 router litellm`. `QUICK=1` shrinks every run to seconds, to check the
-script.
+On a Mac, plug in and keep the lid open. The run refuses to start on battery, and if the Mac sleeps
+anyway it marks the results `INVALID`, which `./run.sh docs` refuses to publish.
+
+Step by step, from `bench/`:
+
+```bash
+./run.sh all           # results/<date>/; builds LiteLLM's Rust gateway from source the first time
+./run.sh report        # every run as one table
+./run.sh docs          # the summary tables into ../docs/benchmarks.md (prose stays as written)
+```
+
+- `GATEWAYS="router lrust"` runs only those.
+- `ROUTER_IMAGE=localhost/llm-router:dev` benchmarks a local build instead of the pinned release.
+- `RUN=2026-10-07` writes into, or adds to, an existing results folder.
+- `./run.sh s3 router litellm` runs one scenario.
+- `QUICK=1` shrinks every run to seconds, to check the script.
 
 ## What's here
 

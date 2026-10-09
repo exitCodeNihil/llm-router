@@ -11,9 +11,10 @@ import (
 	"strings"
 )
 
-var gateways = []string{"router", "lrust", "litellm", "otari"}
+// gatewayOrder is the column order; a gateway gets a column only when the results have runs for it.
+var gatewayOrder = []string{"router", "rgw", "lrust", "litellm", "otari"}
 
-var gatewayNames = map[string]string{"router": "llm-router", "lrust": "LiteLLM Rust", "litellm": "LiteLLM", "otari": "Otari", "direct": "direct"}
+var gatewayNames = map[string]string{"router": "llm-router", "rgw": "llm-router Rust gateway", "lrust": "LiteLLM Rust", "litellm": "LiteLLM", "otari": "Otari", "direct": "direct"}
 
 // run is one loadgen summary plus what run.sh recorded beside it.
 type run struct {
@@ -149,6 +150,29 @@ func (r *results) file(name string) map[string]any {
 	return m
 }
 
+// gateways lists the gateways the results have runs for, in column order.
+func (r *results) gateways() []string {
+	var out []string
+	for _, x := range r.runs {
+		if gw := x.Tags["gw"]; gw != "" && gw != "direct" && !slices.Contains(out, gw) {
+			out = append(out, gw)
+		}
+	}
+	rank := func(gw string) int {
+		if i := slices.Index(gatewayOrder, gw); i >= 0 {
+			return i
+		}
+		return len(gatewayOrder)
+	}
+	slices.SortFunc(out, func(a, b string) int {
+		if c := rank(a) - rank(b); c != 0 {
+			return c
+		}
+		return strings.Compare(a, b)
+	})
+	return out
+}
+
 func (r *results) maxRate(gw, cpus string) string {
 	b, err := os.ReadFile(filepath.Join(r.dir, "max-"+cpus+"-"+gw))
 	if err != nil {
@@ -163,6 +187,7 @@ func summarizeDir(dir string, w io.Writer) error {
 	if err != nil {
 		return err
 	}
+	gateways := r.gateways()
 	row := func(label string, f func(gw string) string) {
 		fmt.Fprintf(w, "| %s |", label)
 		for _, gw := range gateways {
@@ -183,8 +208,8 @@ func summarizeDir(dir string, w io.Writer) error {
 		}
 	}
 
-	fmt.Fprintln(w, "| | llm-router | LiteLLM Rust | LiteLLM | Otari |")
-	fmt.Fprintln(w, "|---|---|---|---|---|")
+	fmt.Fprintln(w, "| | "+strings.Join(names(gateways)[1:], " | ")+" |")
+	fmt.Fprintln(w, "|---|"+strings.Repeat("---|", len(gateways)))
 	row("Image, download size", func(gw string) string {
 		m := r.file("s1-" + gw + ".json")
 		if m == nil {
@@ -407,7 +432,7 @@ func summarizeDir(dir string, w io.Writer) error {
 
 	// Detail: the 1-vCPU ladder.
 	fmt.Fprint(w, "\n### Non-streaming ladder, 1 vCPU (added latency p50 / p99 ms)\n\n")
-	fmt.Fprintln(w, "| req/s | "+strings.Join(names(), " | ")+" |")
+	fmt.Fprintln(w, "| req/s | "+strings.Join(names(gateways), " | ")+" |")
 	fmt.Fprintln(w, "|---|"+strings.Repeat("---|", len(gateways)+1))
 	var rates []int
 	for name := range r.runs {
@@ -438,7 +463,7 @@ func summarizeDir(dir string, w io.Writer) error {
 
 	// Detail: fixed concurrency, the shape of an earlier independent study.
 	fmt.Fprint(w, "\n### Fixed concurrency (added latency p50 / p99 ms, req/s)\n\n")
-	fmt.Fprintln(w, "| test | "+strings.Join(names(), " | ")+" |")
+	fmt.Fprintln(w, "| test | "+strings.Join(names(gateways), " | ")+" |")
 	fmt.Fprintln(w, "|---|"+strings.Repeat("---|", len(gateways)+1))
 	for _, t := range []string{"fast-1", "fast-10", "fast-50", "fast-100", "tok10-1", "tok10-10", "tok10-50", "tok0-1", "tok0-10", "tok0-50"} {
 		fmt.Fprintf(w, "| %s |", t)
@@ -460,10 +485,33 @@ func summarizeDir(dir string, w io.Writer) error {
 	return nil
 }
 
-func names() []string {
+func names(gateways []string) []string {
 	out := []string{"direct"}
 	for _, gw := range gateways {
 		out = append(out, gatewayNames[gw])
 	}
 	return out
+}
+
+// spliceDoc writes the summary of dir into doc, between its "<!-- generated: ... -->" and
+// "<!-- end generated -->" lines, leaving the rest of the document alone.
+func spliceDoc(dir, doc string) error {
+	b, err := os.ReadFile(doc)
+	if err != nil {
+		return err
+	}
+	text := string(b)
+	start := strings.Index(text, "<!-- generated:")
+	end := strings.Index(text, "<!-- end generated -->")
+	if start < 0 || end < start {
+		return fmt.Errorf("%s has no <!-- generated: ... --> ... <!-- end generated --> block", doc)
+	}
+	var out strings.Builder
+	out.WriteString(text[:start])
+	fmt.Fprintf(&out, "<!-- generated: go run ./loadgen summary results/%s (in bench/) -->\n", filepath.Base(dir))
+	if err := summarizeDir(dir, &out); err != nil {
+		return err
+	}
+	out.WriteString(text[end:])
+	return os.WriteFile(doc, []byte(out.String()), 0o644)
 }

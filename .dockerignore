@@ -6,3 +6,6 @@ docs
 *.md
 .github
 .playwright-mcp
+bench
+tmp
+/llmrouter
