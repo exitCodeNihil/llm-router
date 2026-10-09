@@ -1,0 +1,6 @@
+{
+  "fn": "anth_req_to_oai",
+  "model": "up",
+  "in": "{\"model\":\"m\",\"messages\":[",
+  "error": "invalid JSON: unexpected end of JSON input"
+}

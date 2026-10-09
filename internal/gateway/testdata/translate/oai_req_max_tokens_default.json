@@ -1,0 +1,33 @@
+{
+  "fn": "oai_req_to_anth",
+  "model": "claude-x",
+  "in": {
+    "model": "claude",
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      }
+    ]
+  },
+  "out": {
+    "max_tokens": 4096,
+    "messages": [
+      {
+        "content": [
+          {
+            "text": "hi",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "claude-x",
+    "stream": true
+  }
+}

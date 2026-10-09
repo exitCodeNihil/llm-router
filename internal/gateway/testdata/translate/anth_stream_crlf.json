@@ -1,0 +1,12 @@
+{
+  "fn": "anth_to_oai_stream",
+  "model": "claude",
+  "req_id": "req123",
+  "in": "event: message_start\r\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\r\n\r\nevent: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"crlf\"}}\r\n\r\nevent: message_delta\r\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\r\n\r\n",
+  "out": "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"id\":\"chatcmpl-req123\",\"model\":\"claude\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"crlf\"},\"finish_reason\":null,\"index\":0}],\"id\":\"chatcmpl-req123\",\"model\":\"claude\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"id\":\"chatcmpl-req123\",\"model\":\"claude\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[],\"id\":\"chatcmpl-req123\",\"model\":\"claude\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":1,\"prompt_tokens\":2,\"total_tokens\":3}}\n\ndata: [DONE]\n\n",
+  "usage": {
+    "prompt": 2,
+    "completion": 1,
+    "cached": 0
+  }
+}

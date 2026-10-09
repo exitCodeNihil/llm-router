@@ -1,0 +1,54 @@
+{
+  "fn": "oai_req_to_anth",
+  "model": "claude-x",
+  "in": {
+    "model": "claude",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "w",
+          "parameters": {
+            "type": "object"
+          }
+        }
+      }
+    ],
+    "tool_choice": "required",
+    "parallel_tool_calls": false,
+    "messages": [
+      {
+        "role": "user",
+        "content": "weather?"
+      }
+    ]
+  },
+  "out": {
+    "max_tokens": 4096,
+    "messages": [
+      {
+        "content": [
+          {
+            "text": "weather?",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "claude-x",
+    "tool_choice": {
+      "type": "any"
+    },
+    "tools": [
+      {
+        "description": "w",
+        "input_schema": {
+          "type": "object"
+        },
+        "name": "get_weather"
+      }
+    ]
+  }
+}

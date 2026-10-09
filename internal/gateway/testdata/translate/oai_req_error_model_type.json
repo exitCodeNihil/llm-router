@@ -1,0 +1,9 @@
+{
+  "fn": "oai_req_to_anth",
+  "model": "claude-x",
+  "in": {
+    "model": 5,
+    "messages": []
+  },
+  "error": "invalid model field: json: cannot unmarshal number into Go value of type string"
+}

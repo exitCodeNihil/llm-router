@@ -1,0 +1,45 @@
+{
+  "fn": "anth_resp_to_oai",
+  "model": "claude",
+  "req_id": "req123",
+  "in": {
+    "content": [
+      {
+        "type": "text",
+        "text": "until"
+      }
+    ],
+    "stop_reason": "stop_sequence",
+    "stop_sequence": "END",
+    "usage": {
+      "input_tokens": 1,
+      "output_tokens": 2,
+      "cache_read_input_tokens": null
+    }
+  },
+  "out": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "content": "until",
+          "role": "assistant"
+        }
+      }
+    ],
+    "id": "chatcmpl-req123",
+    "model": "claude",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 2,
+      "prompt_tokens": 1,
+      "total_tokens": 3
+    }
+  },
+  "usage": {
+    "prompt": 1,
+    "completion": 2,
+    "cached": 0
+  }
+}

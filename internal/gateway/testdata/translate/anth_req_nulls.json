@@ -1,0 +1,54 @@
+{
+  "fn": "anth_req_to_oai",
+  "model": "up",
+  "in": {
+    "model": "m",
+    "max_tokens": null,
+    "system": null,
+    "messages": [
+      {
+        "role": "user",
+        "content": null
+      },
+      {
+        "role": "assistant",
+        "content": null
+      },
+      {
+        "role": "user",
+        "content": "hi"
+      },
+      {
+        "role": "user"
+      }
+    ],
+    "tools": null,
+    "tool_choice": null,
+    "temperature": null,
+    "top_p": null,
+    "stop_sequences": null,
+    "stream": null
+  },
+  "out": {
+    "max_tokens": 0,
+    "messages": [
+      {
+        "content": "",
+        "role": "system"
+      },
+      {
+        "content": null,
+        "role": "assistant"
+      },
+      {
+        "content": "hi",
+        "role": "user"
+      },
+      {
+        "content": "",
+        "role": "user"
+      }
+    ],
+    "model": "up"
+  }
+}

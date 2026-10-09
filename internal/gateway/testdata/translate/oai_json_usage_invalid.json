@@ -1,0 +1,9 @@
+{
+  "fn": "oai_json_usage",
+  "in": "{\"usage\":",
+  "usage": {
+    "prompt": 0,
+    "completion": 0,
+    "cached": 0
+  }
+}

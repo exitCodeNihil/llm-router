@@ -1,0 +1,25 @@
+{
+  "fn": "anth_json_usage",
+  "in": {
+    "id": "msg_1",
+    "type": "message",
+    "content": [
+      {
+        "type": "text",
+        "text": "hi"
+      }
+    ],
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 8,
+      "cache_creation_input_tokens": 1096,
+      "cache_read_input_tokens": 40,
+      "output_tokens": 4
+    }
+  },
+  "usage": {
+    "prompt": 1144,
+    "completion": 4,
+    "cached": 40
+  }
+}

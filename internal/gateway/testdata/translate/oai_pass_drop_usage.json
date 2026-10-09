@@ -1,0 +1,11 @@
+{
+  "fn": "oai_passthrough",
+  "drop_usage_chunk": true,
+  "in": "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"id\":\"c1\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n",
+  "out": "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\ndata: [DONE]\n\n",
+  "usage": {
+    "prompt": 10,
+    "completion": 5,
+    "cached": 0
+  }
+}

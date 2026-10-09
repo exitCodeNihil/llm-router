@@ -1,0 +1,35 @@
+{
+  "fn": "oai_json_usage",
+  "in": {
+    "choices": [
+      {
+        "message": {
+          "content": null,
+          "tool_calls": [
+            {
+              "function": {
+                "arguments": {
+                  "not": "a string"
+                }
+              }
+            }
+          ]
+        },
+        "finish_reason": 7
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 10,
+      "completion_tokens": 5,
+      "prompt_tokens_details": null,
+      "completion_tokens_details": {
+        "reasoning_tokens": 3
+      }
+    }
+  },
+  "usage": {
+    "prompt": 10,
+    "completion": 5,
+    "cached": 0
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "fn": "anth_resp_to_oai",
+  "model": "claude",
+  "req_id": "req123",
+  "in": {},
+  "out": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "content": "",
+          "role": "assistant"
+        }
+      }
+    ],
+    "id": "chatcmpl-req123",
+    "model": "claude",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 0,
+      "prompt_tokens": 0,
+      "total_tokens": 0
+    }
+  },
+  "usage": {
+    "prompt": 0,
+    "completion": 0,
+    "cached": 0
+  }
+}

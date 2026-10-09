@@ -1,0 +1,100 @@
+{
+  "fn": "oai_req_to_anth",
+  "model": "claude-x",
+  "in": {
+    "model": "claude",
+    "messages": [
+      {
+        "role": "system",
+        "content": "be terse"
+      },
+      {
+        "role": "user",
+        "content": "weather in dubai?"
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "tc1",
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"q\":1}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "tc1",
+        "content": "sunny"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "w",
+          "parameters": {
+            "type": "object"
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  },
+  "out": {
+    "max_tokens": 4096,
+    "messages": [
+      {
+        "content": [
+          {
+            "text": "weather in dubai?",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "id": "tc1",
+            "input": {
+              "q": 1
+            },
+            "name": "lookup",
+            "type": "tool_use"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "content": "sunny",
+            "tool_use_id": "tc1",
+            "type": "tool_result"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "claude-x",
+    "system": "be terse",
+    "tool_choice": {
+      "type": "auto"
+    },
+    "tools": [
+      {
+        "description": "w",
+        "input_schema": {
+          "type": "object"
+        },
+        "name": "get_weather"
+      }
+    ]
+  }
+}

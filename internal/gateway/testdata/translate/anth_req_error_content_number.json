@@ -1,0 +1,15 @@
+{
+  "fn": "anth_req_to_oai",
+  "model": "up",
+  "in": {
+    "model": "m",
+    "max_tokens": 1,
+    "messages": [
+      {
+        "role": "user",
+        "content": 42
+      }
+    ]
+  },
+  "error": "json: cannot unmarshal number into Go value of type []gateway.anthBlock"
+}

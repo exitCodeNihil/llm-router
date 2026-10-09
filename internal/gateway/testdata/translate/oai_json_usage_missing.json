@@ -1,0 +1,11 @@
+{
+  "fn": "oai_json_usage",
+  "in": {
+    "choices": []
+  },
+  "usage": {
+    "prompt": 0,
+    "completion": 0,
+    "cached": 0
+  }
+}

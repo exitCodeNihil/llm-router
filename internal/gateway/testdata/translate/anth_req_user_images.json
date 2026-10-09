@@ -1,0 +1,66 @@
+{
+  "fn": "anth_req_to_oai",
+  "model": "up",
+  "in": {
+    "model": "m",
+    "max_tokens": 10,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "what is this?"
+          },
+          {
+            "type": "image",
+            "source": {
+              "type": "base64",
+              "media_type": "image/png",
+              "data": "iVBORw0KGgo="
+            }
+          },
+          {
+            "type": "image",
+            "source": {
+              "type": "url",
+              "url": "https://example.com/a.png"
+            }
+          },
+          {
+            "type": "image"
+          },
+          {
+            "type": "document",
+            "source": {
+              "type": "text",
+              "media_type": "text/plain",
+              "data": "doc"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "out": {
+    "max_tokens": 10,
+    "messages": [
+      {
+        "content": [
+          {
+            "text": "what is this?",
+            "type": "text"
+          },
+          {
+            "image_url": {
+              "url": "data:image/png;base64,iVBORw0KGgo="
+            },
+            "type": "image_url"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "up"
+  }
+}

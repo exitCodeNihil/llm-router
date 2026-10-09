@@ -1,0 +1,137 @@
+{
+  "fn": "anth_req_to_oai",
+  "model": "up",
+  "in": {
+    "model": "m",
+    "max_tokens": 10,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "before"
+          },
+          {
+            "type": "tool_result",
+            "tool_use_id": "a",
+            "content": [
+              {
+                "type": "text",
+                "text": "line1\n"
+              },
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": "iVBORw0KGgo="
+                }
+              },
+              {
+                "type": "text",
+                "text": "line2"
+              }
+            ]
+          },
+          {
+            "type": "tool_result",
+            "tool_use_id": "b",
+            "is_error": true,
+            "content": "boom"
+          },
+          {
+            "type": "tool_result",
+            "tool_use_id": "c"
+          },
+          {
+            "type": "tool_result",
+            "tool_use_id": "d",
+            "content": 42
+          },
+          {
+            "type": "tool_result",
+            "tool_use_id": "e",
+            "content": [
+              1,
+              2
+            ]
+          },
+          {
+            "type": "tool_result",
+            "tool_use_id": "f",
+            "content": null
+          },
+          {
+            "type": "text",
+            "text": "after"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "g",
+            "content": "only a result"
+          }
+        ]
+      }
+    ]
+  },
+  "out": {
+    "max_tokens": 10,
+    "messages": [
+      {
+        "content": "line1\nline2",
+        "role": "tool",
+        "tool_call_id": "a"
+      },
+      {
+        "content": "boom",
+        "role": "tool",
+        "tool_call_id": "b"
+      },
+      {
+        "content": "",
+        "role": "tool",
+        "tool_call_id": "c"
+      },
+      {
+        "content": "42",
+        "role": "tool",
+        "tool_call_id": "d"
+      },
+      {
+        "content": "[\n              1,\n              2\n            ]",
+        "role": "tool",
+        "tool_call_id": "e"
+      },
+      {
+        "content": "",
+        "role": "tool",
+        "tool_call_id": "f"
+      },
+      {
+        "content": [
+          {
+            "text": "before",
+            "type": "text"
+          },
+          {
+            "text": "after",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": "only a result",
+        "role": "tool",
+        "tool_call_id": "g"
+      }
+    ],
+    "model": "up"
+  }
+}

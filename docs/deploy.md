@@ -59,25 +59,72 @@ helm install llm-router ./deploy/helm/llm-router --set existingSecret=llm-router
   --set ingress.enabled=true,ingress.host=router.example.com,ingress.className=nginx
 ```
 
-Add `ingress.tls` for HTTPS. Keep one control-plane replica and scale with edge nodes. For
+Add `ingress.tls` for HTTPS. Keep one control-plane replica and scale with [gateways](#gateways). For
 [workspaces](workspaces.md#kubernetes) add `--set workspaces.enabled=true,workspaces.ideOrigin=https://ide.example.com`.
 
-## Edge nodes
+## Gateways
 
-Stateless gateways near your callers. They sync config from the control plane, check keys and
-budgets locally, keep serving if the control plane goes down, and ship usage back in batches. In
-the console open **Edge nodes**, register a node, and copy its one-time token, then:
+Gateways serve your traffic where it is: behind a load balancer for throughput, in another region,
+or dedicated to one team. They take everything else from the control plane: keys, models,
+providers, prices and limits. A gateway is a small Rust binary,
+`ghcr.io/exitcodenihil/llm-router-gateway`.
+
+In the console open **Gateways**, create a group and copy its join token. Then start as many
+gateways as you need with it:
+
+```bash
+docker run -p 8080:8080 \
+  -e LLMR_CONTROL_PLANE_URL=https://router.example.com \
+  -e LLMR_JOIN_TOKEN=llmrg_… \
+  ghcr.io/exitcodenihil/llm-router-gateway
+```
+
+Each gateway joins the group as its own instance and shows up on the Gateways page. Clients use it
+exactly like the control plane's own `/v1`. A group can:
+
+- **serve only some teams.** Their keys, and their members' own keys, work; others get a 401. A
+  team's gateways receive only the providers their models need.
+- **prefer a region.** Deployments with the same region label are tried first, then the rest in
+  the usual order.
+- **limit telemetry.** Never capture prompts and responses, or never export at all.
+
+Limits and budgets stay on keys, users and teams, and hold across every gateway. Each gateway syncs
+its usage and counts with the control plane every 2 seconds, so a key can exceed a limit by at most
+what all gateways admit in that time.
+
+Config changes reach gateways within about a second. A gateway needs the control plane to start.
+After that it keeps serving on its last config if the control plane goes away, and uploads the
+usage it held (up to 200,000 events) when it's back.
+
+A new join token stops further gateways joining with the old one; running ones carry on. Deleting a
+group stops its gateways getting config at once, and they stop serving within 15 minutes.
+
+The Rust gateway doesn't yet serve Google Vertex AI or Azure Entra providers, sign-in with identity
+tokens, or prompt capture for telemetry. The control plane's own `/v1` serves all of them.
+
+| Variable | Meaning |
+|---|---|
+| `LLMR_CONTROL_PLANE_URL` | The control plane. Use https unless both are on a private network |
+| `LLMR_JOIN_TOKEN` | The group's join token |
+| `LLMR_LISTEN` | Listen address, default `0.0.0.0:8080` |
+| `LLMR_WORKERS` | Worker threads; default: the container's CPU allowance |
+| `LLMR_MAX_IN_FLIGHT` | Above this many requests in flight, answer 503 with `Retry-After` (default 10000) |
+| `LLMR_SHUTDOWN_TIMEOUT` | Seconds to finish requests on SIGTERM before exiting (default 30) |
+| `LLMR_GATEWAY_NAME` | Name on the Gateways page (default: the hostname) |
+
+`/healthz` answers 200 once the gateway has its config and has synced, and 503 while it starts or
+drains. `/metrics` is in Prometheus format.
+
+### Edge nodes (legacy)
+
+Edge nodes, the control plane's binary run with `--mode=gateway`, are replaced by gateway groups and
+will be removed in a later release. Each one needs its own token, and their limits are counted per
+node. An existing setup keeps working:
 
 ```bash
 LLMR_CONTROL_PLANE_URL=https://router.example.com LLMR_NODE_TOKEN=llmrn_… \
   llmrouter --mode=gateway --listen :8080
-# or: helm install edge ./deploy/helm/llm-router \
-#       --set mode=gateway,controlPlaneUrl=https://router.example.com,nodeToken=llmrn_…
 ```
-
-Config changes reach nodes in about 2 seconds. Budgets and rate limits are enforced per node, so
-with N nodes a budget can overshoot by about N times the spend per sync. Edge nodes can't create
-users: a first-time user has to reach the control plane once.
 
 ## Configuration
 
@@ -88,7 +135,7 @@ users: a first-time user has to reach the control plane once.
 | `LLMR_ADMIN_TOKEN` | control plane | Bootstrap admin token, 12+ characters (optional) |
 | `LLMR_LISTEN` | all | Listen address, default `:8080` |
 | `LLMR_MODE` | all | `all` (default) or `gateway` |
-| `LLMR_CONTROL_PLANE_URL`, `LLMR_NODE_TOKEN` | edge | Where to sync from and how to authenticate |
+| `LLMR_CONTROL_PLANE_URL`, `LLMR_NODE_TOKEN` | edge (legacy) | Where to sync from and how to authenticate |
 | `LLMR_SNAPSHOT_CACHE` | edge | Config cache path (default `/var/lib/llmrouter/snapshot.json`) |
 | `LLMR_SEED_CLAUDE_SUBSCRIPTION` | control plane | `1` adds the [subscription pass-through](clients.md#on-your-claudeai-subscription) provider and models |
 | `LLMR_IDE_LISTEN`, `LLMR_IDE_ORIGIN`, `LLMR_COOKIE_DOMAIN` | control plane | [Workspace IDE](workspaces.md) listener, its public origin, and the session cookie domain when it is another hostname |
