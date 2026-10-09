@@ -1,0 +1,50 @@
+{
+  "tags": {
+    "cpus": "1",
+    "gw": "otari",
+    "samples": "samples-s7-otari.txt"
+  },
+  "url": "http://otari:8000/api/v1/messages",
+  "api": "anthropic",
+  "model": "mock_anth:long",
+  "stream": true,
+  "rate": 20,
+  "window_start_ms": 1791386084591,
+  "window_end_ms": 1791386094591,
+  "warmup_ms": 0,
+  "body_bytes": 2158,
+  "sent": 200,
+  "ok": 0,
+  "ok_all": 0,
+  "cancelled": 200,
+  "errors": {},
+  "achieved_rps": 20,
+  "latency_ms": null,
+  "service_ms": null,
+  "ttfb_ms": null,
+  "lag_ms": {
+    "max": 4.944955,
+    "mean": 1.56432256,
+    "min": 0.058688,
+    "n": 200,
+    "p50": 1.093957,
+    "p90": 3.544151,
+    "p95": 4.121098,
+    "p99": 4.935117,
+    "p999": 4.944955
+  },
+  "mock": {
+    "cancelled": 0,
+    "completed": 0,
+    "completion_tokens": 0,
+    "conns": 200,
+    "failed": 0,
+    "in_flight": 200,
+    "last_not_found": "",
+    "max_in_flight": 200,
+    "not_found": 0,
+    "prompt_tokens": 0,
+    "requests": 200,
+    "usage_requested": 0
+  }
+}

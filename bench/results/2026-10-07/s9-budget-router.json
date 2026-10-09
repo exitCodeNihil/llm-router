@@ -1,0 +1,94 @@
+{
+  "tags": {
+    "cpus": "1",
+    "gw": "router",
+    "samples": "samples-s9-router.txt"
+  },
+  "url": "http://router:8080/v1/chat/completions",
+  "api": "openai",
+  "model": "fast",
+  "stream": false,
+  "rate": 10,
+  "window_start_ms": 1791386743808,
+  "window_end_ms": 1791386773808,
+  "warmup_ms": 0,
+  "body_bytes": 2134,
+  "sent": 300,
+  "ok": 18,
+  "ok_all": 18,
+  "cancelled": 0,
+  "errors": {
+    "status_429": 282
+  },
+  "achieved_rps": 10,
+  "latency_ms": {
+    "max": 6.543443,
+    "mean": 3.3326344999999997,
+    "min": 0.837797,
+    "n": 18,
+    "p50": 2.854986,
+    "p90": 6.153427,
+    "p95": 6.543443,
+    "p99": 6.543443,
+    "p999": 6.543443
+  },
+  "service_ms": {
+    "max": 1.799042,
+    "mean": 1.2737340555555556,
+    "min": 0.575125,
+    "n": 18,
+    "p50": 1.310458,
+    "p90": 1.749417,
+    "p95": 1.799042,
+    "p99": 1.799042,
+    "p999": 1.799042
+  },
+  "ttfb_ms": {
+    "max": 1.775417,
+    "mean": 1.2496877222222222,
+    "min": 0.566875,
+    "n": 18,
+    "p50": 1.292708,
+    "p90": 1.665333,
+    "p95": 1.775417,
+    "p99": 1.775417,
+    "p999": 1.775417
+  },
+  "lag_ms": {
+    "max": 5.410086,
+    "mean": 2.0209834699999996,
+    "min": 0.082738,
+    "n": 300,
+    "p50": 1.342163,
+    "p90": 4.721038,
+    "p95": 5.044395,
+    "p99": 5.219221,
+    "p999": 5.410086
+  },
+  "overhead_ms": {
+    "max": 1.6745,
+    "mean": 1.1818242777777779,
+    "min": 0.535625,
+    "n": 18,
+    "p50": 1.190958,
+    "p90": 1.630167,
+    "p95": 1.6745,
+    "p99": 1.6745,
+    "p999": 1.6745
+  },
+  "joined": 18,
+  "mock": {
+    "cancelled": 0,
+    "completed": 18,
+    "completion_tokens": 360,
+    "conns": 0,
+    "failed": 0,
+    "in_flight": 0,
+    "last_not_found": "",
+    "max_in_flight": 1,
+    "not_found": 0,
+    "prompt_tokens": 9594,
+    "requests": 18,
+    "usage_requested": 0
+  }
+}

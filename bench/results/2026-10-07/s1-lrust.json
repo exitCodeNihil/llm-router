@@ -1,0 +1,13 @@
+{
+  "image": "localhost/litellm-gateway:7b439d91",
+  "image_bytes": 132606351,
+  "compressed_bytes": null,
+  "restart_ms": [
+    153,
+    157,
+    141
+  ],
+  "samples": "samples-s1-lrust.txt",
+  "idle_from_ms": 1791372396135,
+  "idle_to_ms": 1791372451135
+}

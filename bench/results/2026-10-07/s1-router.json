@@ -1,0 +1,13 @@
+{
+  "image": "ghcr.io/exitcodenihil/llm-router:0.1.2",
+  "image_bytes": 18528051,
+  "compressed_bytes": 6102130,
+  "restart_ms": [
+    704,
+    698,
+    696
+  ],
+  "samples": "samples-s1-router.txt",
+  "idle_from_ms": 1791372110539,
+  "idle_to_ms": 1791372165539
+}

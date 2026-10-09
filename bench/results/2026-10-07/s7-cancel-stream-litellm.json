@@ -1,0 +1,50 @@
+{
+  "tags": {
+    "cpus": "1",
+    "gw": "litellm",
+    "samples": "samples-s7-litellm.txt"
+  },
+  "url": "http://litellm:4000/v1/messages",
+  "api": "anthropic",
+  "model": "a-long",
+  "stream": true,
+  "rate": 20,
+  "window_start_ms": 1791385042048,
+  "window_end_ms": 1791385052048,
+  "warmup_ms": 0,
+  "body_bytes": 2150,
+  "sent": 200,
+  "ok": 0,
+  "ok_all": 0,
+  "cancelled": 200,
+  "errors": {},
+  "achieved_rps": 20,
+  "latency_ms": null,
+  "service_ms": null,
+  "ttfb_ms": null,
+  "lag_ms": {
+    "max": 10.140352,
+    "mean": 4.338664819999998,
+    "min": 0.098293,
+    "n": 200,
+    "p50": 3.39503,
+    "p90": 9.363488,
+    "p95": 9.702673,
+    "p99": 10.030417,
+    "p999": 10.140352
+  },
+  "mock": {
+    "cancelled": 199,
+    "completed": 0,
+    "completion_tokens": 0,
+    "conns": 200,
+    "failed": 0,
+    "in_flight": 1,
+    "last_not_found": "",
+    "max_in_flight": 67,
+    "not_found": 0,
+    "prompt_tokens": 0,
+    "requests": 200,
+    "usage_requested": 0
+  }
+}

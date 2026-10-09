@@ -1,0 +1,50 @@
+{
+  "tags": {
+    "cpus": "1",
+    "gw": "router",
+    "samples": "samples-s7-router.txt"
+  },
+  "url": "http://router:8080/v1/chat/completions",
+  "api": "openai",
+  "model": "slow",
+  "stream": false,
+  "rate": 20,
+  "window_start_ms": 1791384756685,
+  "window_end_ms": 1791384766685,
+  "warmup_ms": 0,
+  "body_bytes": 2134,
+  "sent": 200,
+  "ok": 0,
+  "ok_all": 0,
+  "cancelled": 200,
+  "errors": {},
+  "achieved_rps": 20,
+  "latency_ms": null,
+  "service_ms": null,
+  "ttfb_ms": null,
+  "lag_ms": {
+    "max": 10.250938,
+    "mean": 4.831213040000001,
+    "min": 0.071954,
+    "n": 200,
+    "p50": 4.125909,
+    "p90": 9.398957,
+    "p95": 9.638521,
+    "p99": 10.053887,
+    "p999": 10.250938
+  },
+  "mock": {
+    "cancelled": 200,
+    "completed": 0,
+    "completion_tokens": 0,
+    "conns": 200,
+    "failed": 0,
+    "in_flight": 0,
+    "last_not_found": "",
+    "max_in_flight": 41,
+    "not_found": 0,
+    "prompt_tokens": 0,
+    "requests": 200,
+    "usage_requested": 0
+  }
+}

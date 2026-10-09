@@ -1,0 +1,16 @@
+HTTP/1.1 429 Too Many Requests
+date: Wed, 07 Oct 2026 15:02:47 GMT
+llm_provider-content-type: application/json
+llm_provider-retry-after: 7
+llm_provider-date: Wed, 07 Oct 2026 15:12:16 GMT
+llm_provider-content-length: 94
+x-litellm-call-id: 2f7a2053-4a70-4127-b220-c13742711eb6
+x-litellm-response-cost: 0
+x-litellm-key-spend: 1.2865029999999917
+x-litellm-timeout: 600
+content-length: 494
+content-type: application/json
+x-frame-options: DENY
+content-security-policy: frame-ancestors 'none'
+x-content-type-options: nosniff
+

@@ -1,0 +1,13 @@
+{
+  "image": "docker.io/mzdotai/otari:0.15.0",
+  "image_bytes": 697569935,
+  "compressed_bytes": 212846260,
+  "restart_ms": [
+    3136,
+    3089,
+    3096
+  ],
+  "samples": "samples-s1-otari.txt",
+  "idle_from_ms": 1791372318203,
+  "idle_to_ms": 1791372373203
+}

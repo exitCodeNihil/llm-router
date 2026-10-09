@@ -1,0 +1,52 @@
+{
+  "tags": {
+    "cpus": "1",
+    "gw": "otari",
+    "samples": "samples-s2-otari.txt"
+  },
+  "url": "http://otari:8000/api/v1/chat/completions",
+  "api": "openai",
+  "model": "mock_oai:fast",
+  "stream": false,
+  "rate": 150,
+  "window_start_ms": 1791374072832,
+  "window_end_ms": 1791374092832,
+  "warmup_ms": 5000,
+  "body_bytes": 2144,
+  "sent": 3000,
+  "ok": 0,
+  "ok_all": 0,
+  "cancelled": 0,
+  "errors": {
+    "timeout": 3000
+  },
+  "achieved_rps": 150,
+  "latency_ms": null,
+  "service_ms": null,
+  "ttfb_ms": null,
+  "lag_ms": {
+    "max": 2.720353,
+    "mean": 0.7434637516666666,
+    "min": 0.012722,
+    "n": 3000,
+    "p50": 0.802199,
+    "p90": 1.200645,
+    "p95": 1.28123,
+    "p99": 1.500419,
+    "p999": 1.91228
+  },
+  "mock": {
+    "cancelled": 0,
+    "completed": 3007,
+    "completion_tokens": 60140,
+    "conns": 3007,
+    "failed": 0,
+    "in_flight": 0,
+    "last_not_found": "",
+    "max_in_flight": 2,
+    "not_found": 0,
+    "prompt_tokens": 1611744,
+    "requests": 3007,
+    "usage_requested": 0
+  }
+}

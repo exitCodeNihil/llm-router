@@ -1,0 +1,8 @@
+{
+  "xacts": 191,
+  "tuples": 5309,
+  "wal_bytes": 7970486,
+  "rows": 1750,
+  "prompt_tokens": 25095750,
+  "completion_tokens": 175000
+}
