@@ -19,8 +19,12 @@ var gatewayNames = map[string]string{"router": "llm-router", "lrust": "LiteLLM R
 type run struct {
 	summary
 	Unsupported bool `json:"unsupported"`
-	db          *struct{ Rows, Xacts, WALBytes int }
-	after       map[string]any
+	db          *struct {
+		Rows             int `json:"rows"`
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	}
+	after map[string]any
 }
 
 type results struct {
@@ -48,14 +52,7 @@ func load(dir string) (*results, error) {
 			continue
 		}
 		if b, err := os.ReadFile(filepath.Join(dir, name+".db.json")); err == nil {
-			x.db = &struct{ Rows, Xacts, WALBytes int }{}
-			var d struct {
-				Rows     int `json:"rows"`
-				Xacts    int `json:"xacts"`
-				WALBytes int `json:"wal_bytes"`
-			}
-			json.Unmarshal(b, &d)
-			*x.db = struct{ Rows, Xacts, WALBytes int }{d.Rows, d.Xacts, d.WALBytes}
+			json.Unmarshal(b, &x.db)
 		}
 		if b, err := os.ReadFile(filepath.Join(dir, name+".after.json")); err == nil {
 			json.Unmarshal(b, &x.after)
@@ -263,21 +260,30 @@ func summarizeDir(dir string, w io.Writer) error {
 		}
 		return fmt.Sprintf("%.0f MiB", u.MemPeakMiB)
 	})
-	row("Usage rows recorded / requests served", func(gw string) string {
+	// Only runs where the client got every response: an overloaded gateway still finishes and logs
+	// requests the client gave up on, and the cancel tests log the cancelled streams.
+	row("Usage rows and tokens match the upstream's own counts", func(gw string) string {
 		if gw == "lrust" {
 			return "n/a (no usage logging)"
 		}
-		var rows, ok int
+		n, exact := 0, 0
 		for _, x := range r.runs {
-			if x.db != nil && x.Tags["gw"] == gw {
-				rows += x.db.Rows
-				ok += x.OKAll
+			if x.db == nil || x.Tags["gw"] != gw || x.OKAll == 0 || len(x.Errors) > 0 || x.Mock["requests"] == nil {
+				continue
+			}
+			n++
+			m := func(k string) int { v, _ := x.Mock[k].(float64); return int(v) }
+			if x.db.Rows == m("requests") && x.db.PromptTokens == m("prompt_tokens") && x.db.CompletionTokens == m("completion_tokens") {
+				exact++
 			}
 		}
-		if ok == 0 {
+		if n == 0 {
 			return "–"
 		}
-		return fmt.Sprintf("%.2f%%", 100*float64(rows)/float64(ok))
+		if exact == n {
+			return fmt.Sprintf("yes, exactly, in all %d runs", n)
+		}
+		return fmt.Sprintf("**%d of %d runs** exact", exact, n)
 	})
 	stopped := func(test string) func(string) string {
 		return func(gw string) string {
@@ -344,6 +350,59 @@ func summarizeDir(dir string, w io.Writer) error {
 			return "–"
 		}
 		return fmt.Sprintf("%d of %d ok", x.OKAll, x.OKAll+errs(x))
+	})
+	// The soak: s8-fast-GW-N and s8-chat-GW-N run side by side, then a spike and 10 s recovery slices.
+	soak := func(gw string) (segs []*run) {
+		for i := 1; ; i++ {
+			f, c := r.runs[fmt.Sprintf("s8-fast-%s-%d", gw, i)], r.runs[fmt.Sprintf("s8-chat-%s-%d", gw, i)]
+			if f == nil || c == nil {
+				return segs
+			}
+			segs = append(segs, f, c)
+		}
+	}
+	row("Soak, 2 vCPU, 70% plain + 30% streamed: requests ok", func(gw string) string {
+		var ok, all int
+		for _, x := range soak(gw) {
+			ok, all = ok+x.OKAll, all+x.OKAll+errs(x)
+		}
+		if all == 0 {
+			return "–"
+		}
+		return fmt.Sprintf("%d of %d", ok, all)
+	})
+	row("Soak: memory, first minute → last minute", func(gw string) string {
+		segs := soak(gw)
+		if len(segs) == 0 || segs[0].Tags["samples"] == "" {
+			return "–"
+		}
+		path := filepath.Join(dir, segs[0].Tags["samples"])
+		from, to := float64(segs[0].WindowStartMS)/1000, float64(segs[len(segs)-1].WindowEndMS)/1000
+		a, err1 := usageIn(path, gw, from, from+60)
+		b, err2 := usageIn(path, gw, to-60, to)
+		if err1 != nil || err2 != nil {
+			return "–"
+		}
+		return fmt.Sprintf("%.0f → %.0f MiB", a.MemAvgMiB, b.MemAvgMiB)
+	})
+	row("Spike to twice its own 2 vCPU maximum, 30 s: requests ok", func(gw string) string {
+		x := r.runs["s8-spike-"+gw]
+		if x == nil {
+			return "–"
+		}
+		return fmt.Sprintf("%.0f%%", 100*float64(x.OKAll)/float64(max(1, x.OKAll+errs(x))))
+	})
+	row("Back to normal after the spike", func(gw string) string {
+		if r.runs["s8-spike-"+gw] == nil {
+			return "–"
+		}
+		for i := 1; i <= 18; i++ {
+			x := r.runs[fmt.Sprintf("s8-post-%s-%02d", gw, i)]
+			if x != nil && errs(x) == 0 && x.Latency["p99"] <= 50 {
+				return fmt.Sprintf("within %d s", 10*i)
+			}
+		}
+		return "**not within 3 min**"
 	})
 
 	// Detail: the 1-vCPU ladder.
