@@ -1,0 +1,50 @@
+{
+  "tags": {
+    "cpus": "1",
+    "gw": "lrust",
+    "samples": "samples-s7-lrust.txt"
+  },
+  "url": "http://lrust:4000/v1/messages",
+  "api": "anthropic",
+  "model": "a-long",
+  "stream": true,
+  "rate": 20,
+  "window_start_ms": 1791386337668,
+  "window_end_ms": 1791386347668,
+  "warmup_ms": 0,
+  "body_bytes": 2150,
+  "sent": 200,
+  "ok": 0,
+  "ok_all": 0,
+  "cancelled": 200,
+  "errors": {},
+  "achieved_rps": 20,
+  "latency_ms": null,
+  "service_ms": null,
+  "ttfb_ms": null,
+  "lag_ms": {
+    "max": 5.354121,
+    "mean": 2.37843361,
+    "min": 0.088479,
+    "n": 200,
+    "p50": 1.893331,
+    "p90": 4.673355,
+    "p95": 4.968606,
+    "p99": 5.169513,
+    "p999": 5.354121
+  },
+  "mock": {
+    "cancelled": 200,
+    "completed": 0,
+    "completion_tokens": 0,
+    "conns": 199,
+    "failed": 0,
+    "in_flight": 0,
+    "last_not_found": "",
+    "max_in_flight": 67,
+    "not_found": 0,
+    "prompt_tokens": 0,
+    "requests": 200,
+    "usage_requested": 0
+  }
+}

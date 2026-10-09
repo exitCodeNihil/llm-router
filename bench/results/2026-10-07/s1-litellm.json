@@ -1,0 +1,13 @@
+{
+  "image": "ghcr.io/berriai/litellm:v1.104.0",
+  "image_bytes": 1253968305,
+  "compressed_bytes": 409059268,
+  "restart_ms": [
+    4715,
+    4821,
+    4714
+  ],
+  "samples": "samples-s1-litellm.txt",
+  "idle_from_ms": 1791372217054,
+  "idle_to_ms": 1791372272054
+}

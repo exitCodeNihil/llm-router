@@ -12,8 +12,8 @@ OpenAI-compatible server.
 - Cheapest-first routing with failover across backends that share a model name.
 - Runs Claude Code on your claude.ai subscription and records it without holding a credential.
 - Optional per-user dev workspaces (VS Code and a coding agent) and edge nodes for multi-region.
-- Go, one static binary, no database on the hot path: about 52,000 req/s on a laptop against a stub
-  upstream ([`scripts/anthropic-stub.py`](scripts/anthropic-stub.py)); your numbers will vary.
+- Go, one static binary, no database on the hot path: 15,000 req/s on one vCPU and 0.12 ms added
+  per request, against 125 req/s and 4.2 ms for LiteLLM ([benchmarks](docs/benchmarks.md)).
 
 ## Quick start
 

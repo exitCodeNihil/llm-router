@@ -1,0 +1,13 @@
+HTTP/1.1 429 Too Many Requests
+date: Wed, 07 Oct 2026 15:18:10 GMT
+server: uvicorn
+otari-error-code: upstream_rate_limited
+retry-after: 7
+content-length: 164
+content-type: application/json
+x-content-type-options: nosniff
+x-frame-options: DENY
+referrer-policy: strict-origin-when-cross-origin
+cache-control: private, no-store, no-cache
+vary: Authorization
+

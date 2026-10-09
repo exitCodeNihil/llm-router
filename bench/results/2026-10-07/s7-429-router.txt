@@ -1,0 +1,10 @@
+HTTP/1.1 429 Too Many Requests
+Access-Control-Expose-Headers: X-Request-Id, X-Llmr-Provider, X-Llmr-Upstream, X-Llmr-Attempts
+Content-Type: application/json
+X-Llmr-Attempts: 1
+X-Llmr-Provider: mock-oai
+X-Llmr-Upstream: err429
+X-Request-Id: req_1aecf63059c73024
+Date: Wed, 07 Oct 2026 14:54:56 GMT
+Content-Length: 94
+
