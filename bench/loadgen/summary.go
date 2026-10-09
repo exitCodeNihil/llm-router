@@ -262,6 +262,21 @@ func summarizeDir(dir string, w io.Writer) error {
 		}
 		return cell(r.repeats("s2-fixed-100-"+gw), cpuPerReq("pg"), "%.2f ms")
 	})
+	// Rows only the Rust gateway has: its control plane takes every request's
+	// usage, and its limits must hold across instances.
+	rgwRow := func(label string, f func() string) {
+		if slices.Contains(gateways, "rgw") {
+			row(label, func(gw string) string {
+				if gw != "rgw" {
+					return "n/a"
+				}
+				return f()
+			})
+		}
+	}
+	rgwRow("Control plane CPU per request, 100 req/s", func() string {
+		return cell(r.repeats("s2-fixed-100-rgw"), cpuPerReq("cp"), "%.2f ms")
+	})
 	row("Streaming: added time to first token, 10 streams/s", func(gw string) string {
 		return cell(r.repeats("s3-chat-10-"+gw), ttft("p50"), "%.2f ms")
 	})
@@ -368,6 +383,35 @@ func summarizeDir(dir string, w io.Writer) error {
 		default:
 			return "no"
 		}
+	})
+	letThrough := func(names ...string) string {
+		ok, all := 0, 0
+		for _, n := range names {
+			x := r.runs[n]
+			if x == nil {
+				return "–"
+			}
+			ok, all = ok+x.OKAll, all+x.OKAll+errs(x)
+		}
+		return fmt.Sprintf("%d of %d", ok, all)
+	}
+	row("600/min limit, 1,200 sent in a minute: let through", func(gw string) string {
+		if gw == "lrust" {
+			return "n/a (no limits)"
+		}
+		return letThrough("s9-rpm-" + gw)
+	})
+	row("$0.01 budget (about 14 requests' worth): let through", func(gw string) string {
+		if gw == "lrust" {
+			return "n/a (no budgets)"
+		}
+		return letThrough("s9-budget-" + gw)
+	})
+	rgwRow("Same limit, 1,200 sent through two instances: let through", func() string {
+		return letThrough("s10-rpm-a", "s10-rpm-b")
+	})
+	rgwRow("Same budget, through two instances: let through", func() string {
+		return letThrough("s10-budget-a", "s10-budget-b")
 	})
 	row("6,000 requests waiting 30 s on a slow upstream", func(gw string) string {
 		x := r.runs["s7-slow-"+gw]
