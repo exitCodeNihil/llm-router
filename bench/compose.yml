@@ -26,7 +26,7 @@ services:
   pg:
     <<: *common
     image: docker.io/library/postgres:17
-    profiles: [router, litellm, otari]
+    profiles: [router, litellm, otari, rgw]
     environment: { POSTGRES_USER: bench, POSTGRES_PASSWORD: bench, POSTGRES_DB: bench }
     cpus: ${PG_CPUS:-2}
     mem_limit: 2g
@@ -47,6 +47,42 @@ services:
     cpus: ${GW_CPUS:-1}
     mem_limit: 8g
     ports: ["127.0.0.1:18080:8080"]
+
+  # llm-router as the control plane of the Rust gateway: outside the gateway's CPU quota, and
+  # measured on its own, like Postgres. It needs a build with gateway groups (ROUTER_IMAGE).
+  cp:
+    <<: *common
+    image: ${ROUTER_IMAGE:-ghcr.io/exitcodenihil/llm-router:0.1.2}
+    profiles: [rgw]
+    depends_on: { pg: { condition: service_healthy } }
+    environment:
+      LLMR_DATABASE_URL: postgres://bench:bench@pg:5432/bench
+      LLMR_ADMIN_TOKEN: bench-admin-token
+      LLMR_ENCRYPTION_KEY: bench-encryption-key-0123456789
+      SSL_CERT_FILE: /tls/bundle.pem
+    volumes: ["./bin/tls:/tls:ro"]
+    cpus: ${CP_CPUS:-2}
+    mem_limit: 8g
+    ports: ["127.0.0.1:18090:8080"]
+
+  rgw: &rgw
+    <<: *common
+    image: ${RGW_IMAGE:-localhost/llm-router-gateway:dev}
+    profiles: [rgw]
+    environment:
+      LLMR_CONTROL_PLANE_URL: http://cp:8080
+      LLMR_JOIN_TOKEN: ${RGW_JOIN_TOKEN:-}
+      SSL_CERT_FILE: /tls/bundle.pem
+    volumes: ["./bin/tls:/tls:ro"]
+    cpus: ${GW_CPUS:-1}
+    mem_limit: 8g
+    ports: ["127.0.0.1:18081:8080"]
+
+  # A second instance in the same group, for the limits-across-instances test.
+  rgw2:
+    <<: *rgw
+    profiles: [rgw2]
+    ports: ["127.0.0.1:18082:8080"]
 
   litellm:
     <<: *common

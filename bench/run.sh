@@ -54,8 +54,8 @@ build() {
 
 # ---- gateways -------------------------------------------------------------------------------
 
-port() { case $1 in router) echo 18080 ;; litellm) echo 14000 ;; otari) echo 18000 ;; lrust) echo 14001 ;; esac }
-health() { case $1 in router) echo /healthz ;; litellm) echo /health/liveliness ;; otari) echo /api/v1/health ;; lrust) echo /v1/models ;; esac }
+port() { case $1 in router) echo 18080 ;; litellm) echo 14000 ;; otari) echo 18000 ;; lrust) echo 14001 ;; rgw) echo 18081 ;; rgw2) echo 18082 ;; cp) echo 18090 ;; esac }
+health() { case $1 in router | rgw | rgw2 | cp) echo /healthz ;; litellm) echo /health/liveliness ;; otari) echo /api/v1/health ;; lrust) echo /v1/models ;; esac }
 # nodb GW: no database behind it (the direct path, and LiteLLM's Rust gateway, which keeps no state).
 nodb() { [[ $1 == direct || $1 == lrust ]]; }
 
@@ -74,21 +74,32 @@ start() {
 	export GW_CPUS=$2
 	local svc=(mock pg "$1")
 	nodb "$1" && svc=(mock "$1")
+	if [[ $1 == rgw ]]; then
+		svc=(mock pg cp rgw)
+		RGW_JOIN_TOKEN=$(<"$OUT/.rgw-join")
+		export RGW_JOIN_TOKEN
+	fi
 	dc --profile "$1" up -d --quiet-pull "${svc[@]}" >/dev/null
 	if [[ $1 == lrust ]]; then wait_key lrust; else wait_http "http://127.0.0.1:$(port "$1")$(health "$1")"; fi
 }
 
-# fresh GW: a gateway on 1 vCPU with an empty database, set up and with its keys in $OUT.
+# fresh GW: a gateway on 1 vCPU with an empty database, set up and with its keys in $OUT. The
+# Rust gateway is set up through its control plane first, and joins with the group's token.
 fresh() {
 	down
 	log "starting $1"
 	[[ $1 == lrust ]] && setup_lrust
+	if [[ $1 == rgw ]]; then
+		dc --profile rgw up -d --quiet-pull mock pg cp >/dev/null
+		wait_http "http://127.0.0.1:$(port cp)/healthz"
+		setup_rgw
+	fi
 	start "$1" 1
-	[[ $1 == lrust ]] || "setup_$1"
+	case $1 in lrust) ;; rgw) wait_key rgw ;; *) "setup_$1" ;; esac
 	digest "$1"
 }
 
-down() { dc --profile router --profile litellm --profile otari --profile lrust down -v --remove-orphans >/dev/null 2>&1 || true; }
+down() { dc --profile router --profile litellm --profile otari --profile lrust --profile rgw --profile rgw2 down -v --remove-orphans >/dev/null 2>&1 || true; }
 
 digest() {
 	local img
@@ -96,17 +107,21 @@ digest() {
 	podman image inspect --format '{{.Id}} {{.RepoDigests}}' "$img" > "$OUT/image-$1.txt"
 	[[ $1 == lrust ]] && echo "built from BerriAI/litellm@$LRUST_COMMIT" >> "$OUT/image-$1.txt"
 	[[ $1 != lrust && $img == localhost/* ]] && echo "built from $(git describe --always --dirty)" >> "$OUT/image-$1.txt"
+	[[ $1 == rgw ]] && echo "control plane: $(dc --profile rgw config --format json | jq -r .services.cp.image)" >> "$OUT/image-$1.txt"
 	true
 }
 
 # Each setup writes the keys the scenarios use: .key-GW (plain), .key-GW-limits (huge budget and
 # rate limits, to measure the cost of checking them), .key-GW-rpm (600 rpm) and .key-GW-budget ($0.01).
+# setup_router [GW]: configure llm-router (or, for rgw, its control plane) through its API.
 setup_router() {
-	local r=http://127.0.0.1:18080 oai anth tls fo bk uid p
+	local gw=${1:-router} r oai anth tls fo bk uid p
+	r=http://127.0.0.1:$(port "$([[ $gw == rgw ]] && echo cp || echo "$gw")")
 	api() { curl -fsS -H 'Authorization: Bearer bench-admin-token' -H 'Content-Type: application/json' "$@"; }
 	provider() { api -d "{\"name\":\"$1\",\"type\":\"openai_compatible\",\"base_url\":\"$2\",\"auth_mode\":\"none\"}" $r/api/providers | jq -r .id; }
+	# deploy PROVIDER MODEL UPSTREAM [FLAVOR] [PRIORITY] [EXTRA_JSON]
 	deploy() {
-		api -d "{\"provider_id\":\"$1\",\"model_name\":\"$2\",\"upstream_name\":\"$3\",\"api_flavor\":\"${4:-openai}\",\"priority\":${5:-0},\"input_per_1m\":1,\"output_per_1m\":2}" \
+		api -d "{\"provider_id\":\"$1\",\"model_name\":\"$2\",\"upstream_name\":\"$3\",\"api_flavor\":\"${4:-openai}\",\"priority\":${5:-0},\"input_per_1m\":1,\"output_per_1m\":2${6:+,$6}}" \
 			$r/api/deployments >/dev/null
 	}
 	oai=$(provider mock-oai http://mock:9000/v1)
@@ -118,17 +133,25 @@ setup_router() {
 	for p in fast chat long; do deploy "$anth" a-$p $p anthropic; done
 	deploy "$tls" tls-chat chat
 	# Failover: two deployments under one model name, the failing one first.
+	# A hung upstream fails over only with a timeout, as in LiteLLM's and Otari's configs (5 s).
 	for p in 500:err500 429:err429 flaky:flaky hang:hang; do
-		deploy "$fo" "fo${p%%:*}" "${p#*:}.fo" openai 0
+		deploy "$fo" "fo${p%%:*}" "${p#*:}.fo" openai 0 "$([[ $p == hang:* ]] && echo '"timeout_ms":5000')"
 		deploy "$bk" "fo${p%%:*}" "fast.fo${p%%:*}" openai 1
 	done
 	uid=$(api -d '{"email":"bench@example.com"}' $r/api/users | jq -r .id)
 	key() { api -d "{\"user_id\":\"$uid\",$1}" $r/api/keys | jq -r .key; }
-	key '"name":"bench"' > "$OUT/.key-router"
-	key '"name":"limits","budget_usd":1000000,"budget_period":"monthly","rpm_limit":100000000,"tpm_limit":2000000000' > "$OUT/.key-router-limits"
-	key '"name":"rpm","rpm_limit":600' > "$OUT/.key-router-rpm"
-	key '"name":"budget","budget_usd":0.01,"budget_period":"monthly"' > "$OUT/.key-router-budget"
-	wait_key router
+	key '"name":"bench"' > "$OUT/.key-$gw"
+	key '"name":"limits","budget_usd":1000000,"budget_period":"monthly","rpm_limit":100000000,"tpm_limit":2000000000' > "$OUT/.key-$gw-limits"
+	key '"name":"rpm","rpm_limit":600' > "$OUT/.key-$gw-rpm"
+	key '"name":"budget","budget_usd":0.01,"budget_period":"monthly"' > "$OUT/.key-$gw-budget"
+	[[ $gw != router ]] || wait_key router
+}
+
+# setup_rgw: the control plane's config, plus a gateway group whose token the gateway joins with.
+setup_rgw() {
+	setup_router rgw
+	curl -fsS -H 'Authorization: Bearer bench-admin-token' -H 'Content-Type: application/json' -d '{"name":"bench"}' \
+		"http://127.0.0.1:$(port cp)/api/gateway-groups" | jq -r .join_token > "$OUT/.rgw-join"
 }
 
 setup_litellm() {
@@ -217,6 +240,8 @@ url() {
 	case $1 in
 	direct) [[ $3 == tls ]] && base=https://mock:9443 || base=http://mock:9000 ;;
 	router) base=http://router:8080 ;;
+	rgw) base=http://rgw:8080 ;;
+	rgw2) base=http://rgw2:8080 ;;
 	litellm) base=http://litellm:4000 ;;
 	lrust) base=http://lrust:4000 ;;
 	otari) base=http://otari:8000/api ;;
@@ -254,7 +279,8 @@ lg() {
 	fi
 	[[ $gw == direct ]] || extra+=(-H "Authorization: Bearer $(cat "$OUT/.key-${KEY:-$gw}")")
 	[[ -n ${NOMOCK:-} ]] || extra+=(-mock http://mock:9000)
-	dc run --rm --no-deps -T loadgen -url "$(url "$gw" "$api" "$up")" -api "$api" -model "$(model "$gw" "$up" "$prof")" \
+	# URL_GW sends the load to another instance of the same gateway (rgw2), recorded as $gw.
+	dc run --rm --no-deps -T loadgen -url "$(url "${URL_GW:-$gw}" "$api" "$up")" -api "$api" -model "$(model "$gw" "$up" "$prof")" \
 		-out "/results/$RUN/$name.json" -tag gw="$gw" -tag cpus="$GW_CPUS" -tag samples="${SAMPLES:-}" \
 		"${extra[@]}" "$@" 2>&1 | tail -1 | sed "s/^/$name /" | tee -a "$OUT/run.log" >&2
 }
@@ -267,7 +293,7 @@ dbstat() { psql_ "select xact_commit+xact_rollback, tup_inserted+tup_updated+tup
 usage() {
 	local t="to_timestamp($2/1000.0)"
 	case $1 in
-	router) psql_ "select count(*), coalesce(sum(prompt_tokens),0), coalesce(sum(completion_tokens),0) from usage_events where ts >= $t and status_code = 200" ;;
+	router | rgw) psql_ "select count(*), coalesce(sum(prompt_tokens),0), coalesce(sum(completion_tokens),0) from usage_events where ts >= $t and status_code = 200" ;;
 	litellm) psql_ "select count(*), coalesce(sum(prompt_tokens),0), coalesce(sum(completion_tokens),0) from \"LiteLLM_SpendLogs\" where \"startTime\" >= $t at time zone 'UTC' and coalesce(status, 'success') = 'success'" ;;
 	otari) psql_ "select count(*), coalesce(sum(prompt_tokens),0), coalesce(sum(completion_tokens),0) from usage_logs where timestamp >= $t and status = 'success'" ;;
 	esac
@@ -642,8 +668,27 @@ s8() { # soak and spike at 2 vCPU: same absolute load for all, 70% non-stream, 3
 	down
 }
 
+s10() { # limits across two instances of the Rust gateway: one 600 rpm key, 10 rps through each for a minute
+	local bg
+	[[ " $* " == *" rgw "* ]] || return 0
+	fresh rgw
+	dc --profile rgw2 up -d rgw2 >/dev/null
+	wait_http "http://127.0.0.1:$(port rgw2)/healthz"
+	NOMOCK=1 KEY=rgw-rpm lg s10-rpm-a rgw openai oai fast -rate 10 -duration 60s -warmup 0s &
+	bg=$!
+	NOMOCK=1 KEY=rgw-rpm URL_GW=rgw2 lg s10-rpm-b rgw openai oai fast -rate 10 -duration 60s -warmup 0s
+	wait "$bg"
+	# and a $0.01 budget, about 14 requests' worth, 5 rps through each
+	NOMOCK=1 KEY=rgw-budget lg s10-budget-a rgw openai oai fast -rate 5 -duration 30s -warmup 0s &
+	bg=$!
+	NOMOCK=1 KEY=rgw-budget URL_GW=rgw2 lg s10-budget-b rgw openai oai fast -rate 5 -duration 30s -warmup 0s
+	wait "$bg"
+	down
+}
+
 k6check() { # the same run through k6, to cross-check the load generator
 	local gw=router
+	[[ " ${ALL[*]} " == *" router "* ]] || return 0
 	fresh "$gw"
 	lg "k6x-loadgen-$gw" "$gw" openai oai fast -rate 1000 -duration 30s
 	dc run --rm --no-deps -T k6 run -q -e URL="$(url $gw openai oai)" -e KEY="$(cat "$OUT/.key-$gw")" -e MODEL=fast -e RATE=1000 \
@@ -672,9 +717,13 @@ all() {
 	awake
 	since=$(date '+%Y-%m-%d %H:%M:%S')
 	log "run $RUN (${ALL[*]}): $(podman machine inspect --format '{{.Resources.CPUs}} vCPU {{.Resources.Memory}} MiB' 2>/dev/null || echo "$(nproc) CPUs, $(uname -r)"), $(pmset -g batt 2>/dev/null | head -1)"
+	if [[ " ${ALL[*]} " == *" rgw "* && -z ${ROUTER_IMAGE:-} ]]; then
+		echo "rgw needs a control plane with gateway groups: set ROUTER_IMAGE to such a build (make bench does)" >&2
+		exit 1
+	fi
 	build
 	[[ " ${ALL[*]} " != *" lrust "* ]] || podman image exists "localhost/litellm-gateway:${LRUST_COMMIT:0:8}" || build_lrust
-	for sc in cal s1 s2 k6check s2c headline s3 s2x s7 s9 s6 s8; do
+	for sc in cal s1 s2 k6check s2c headline s3 s2x s7 s9 s6 s8 s10; do
 		log "== $sc"
 		"$SELF" "$sc" || log "!! $sc failed (exit $?)"
 		if [[ ! -f $OUT/INVALID ]] && slept "$since"; then
@@ -694,7 +743,7 @@ shift || true
 case $cmd in
 build | all | cal | headline | k6check | down) "$cmd" ;;
 build-lrust) build_lrust ;;
-s1 | s2 | s2c | s2x | s3 | s6 | s7 | s8 | s9) "$cmd" "${@:-${ALL[@]}}" ;;
+s1 | s2 | s2c | s2x | s3 | s6 | s7 | s8 | s9 | s10) "$cmd" "${@:-${ALL[@]}}" ;;
 real) "$PWD/real.sh" ;;
 report) go run ./loadgen report "$OUT" ;;
 docs)

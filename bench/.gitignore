@@ -5,3 +5,4 @@ results/*/.key-*
 results/*/samples-*.txt
 results/*/*.min.yaml
 .lrust-src/
+results/*/.rgw-join
