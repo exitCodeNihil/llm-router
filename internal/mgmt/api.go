@@ -142,6 +142,13 @@ func (m *Server) Register(mux *http.ServeMux) {
 	mux.Handle("GET /api/edge-nodes", h(m.listEdgeNodes))
 	mux.Handle("POST /api/edge-nodes", h(m.createEdgeNode))
 	mux.Handle("DELETE /api/edge-nodes/{id}", h(m.deleteRow("edge_nodes")))
+	mux.Handle("GET /api/gateway-groups", h(m.listGatewayGroups))
+	mux.Handle("POST /api/gateway-groups", h(m.createGatewayGroup))
+	mux.Handle("PATCH /api/gateway-groups/{id}", h(m.patchRow("gateway_groups", gatewayGroupPatchCols)))
+	mux.Handle("POST /api/gateway-groups/{id}/rotate-token", h(m.rotateGatewayToken))
+	mux.Handle("DELETE /api/gateway-groups/{id}", h(m.deleteGatewayGroup))
+	mux.Handle("GET /api/gateway-instances", h(m.listGatewayInstances))
+	mux.Handle("DELETE /api/gateway-instances/{id}", h(m.deleteRow("gateway_instances")))
 
 	mux.Handle("GET /api/token-issuers", h(m.listTokenIssuers))
 	mux.Handle("POST /api/token-issuers", h(m.createTokenIssuer))
@@ -876,7 +883,8 @@ func (m *Server) syncPrices(w http.ResponseWriter, r *http.Request) {
 
 func (m *Server) listDeployments(w http.ResponseWriter, r *http.Request) {
 	m.list(w, r, `SELECT d.id, d.provider_id, p.name AS provider_name, d.model_name, d.upstream_name, d.api_flavor,
-		d.priority, d.catalog_model_id, d.input_per_1m, d.output_per_1m, d.cached_input_per_1m, d.context_tokens, d.enabled, d.created_at
+		d.priority, d.catalog_model_id, d.input_per_1m, d.output_per_1m, d.cached_input_per_1m, d.context_tokens, d.region, d.timeout_ms,
+		d.enabled, d.created_at
 		FROM model_deployments d JOIN providers p ON p.id = d.provider_id ORDER BY d.model_name, d.priority`)
 }
 
@@ -892,6 +900,8 @@ func (m *Server) createDeployment(w http.ResponseWriter, r *http.Request) {
 		OutputPer1M      *float64 `json:"output_per_1m"`
 		CachedInputPer1M *float64 `json:"cached_input_per_1m"`
 		ContextTokens    *int     `json:"context_tokens"`
+		Region           string   `json:"region"`
+		TimeoutMS        *int     `json:"timeout_ms"`
 	}](w, r)
 	if !ok {
 		return
@@ -910,9 +920,9 @@ func (m *Server) createDeployment(w http.ResponseWriter, r *http.Request) {
 	}
 	id := uuid.New()
 	_, err := m.Store.Pool.Exec(r.Context(), `
-		INSERT INTO model_deployments (id, provider_id, model_name, upstream_name, api_flavor, priority, catalog_model_id, input_per_1m, output_per_1m, cached_input_per_1m, context_tokens)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-		id, req.ProviderID, req.ModelName, req.UpstreamName, req.APIFlavor, req.Priority, req.CatalogModelID, req.InputPer1M, req.OutputPer1M, req.CachedInputPer1M, req.ContextTokens)
+		INSERT INTO model_deployments (id, provider_id, model_name, upstream_name, api_flavor, priority, catalog_model_id, input_per_1m, output_per_1m, cached_input_per_1m, context_tokens, region, timeout_ms)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+		id, req.ProviderID, req.ModelName, req.UpstreamName, req.APIFlavor, req.Priority, req.CatalogModelID, req.InputPer1M, req.OutputPer1M, req.CachedInputPer1M, req.ContextTokens, req.Region, req.TimeoutMS)
 	if err != nil {
 		httpError(w, http.StatusBadRequest, err.Error())
 		return

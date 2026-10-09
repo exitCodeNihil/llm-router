@@ -86,6 +86,19 @@ type Deployment struct {
 	InputPer1M       *float64 // custom price override
 	OutputPer1M      *float64
 	CachedInputPer1M *float64 // optional; unset bills cache reads at the input rate
+	Region           string   // gateways in a group with this region try it first
+	TimeoutMS        *int     // wait for response headers before failing over; nil = default
+}
+
+// GatewayGroup is a set of data-plane gateways sharing a join token. It
+// decides who may use them, which region they prefer and what telemetry may
+// leave them; limits and budgets stay on keys, users and teams.
+type GatewayGroup struct {
+	ID           string
+	Name         string
+	Region       string
+	AllowedTeams map[string]bool // nil = every team
+	DataRule     string          // inherit | no_content | no_export
 }
 
 type Price struct {
@@ -212,8 +225,9 @@ type Snapshot struct {
 	Prices             map[string]Price         // catalog model_id -> price
 	Issuers            []*Issuer
 	// Spend holds current-period spend keyed by "key:"+id / "user:"+id / "team:"+id.
-	Spend     map[string]Spend
-	Telemetry Telemetry
+	Spend         map[string]Spend
+	Telemetry     Telemetry
+	GatewayGroups map[string]*GatewayGroup
 }
 
 // Holder is the atomic snapshot pointer the hot path reads through.

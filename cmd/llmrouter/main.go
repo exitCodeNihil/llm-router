@@ -20,6 +20,7 @@ import (
 	"github.com/exitcodenihil/llm-router/internal/console"
 	"github.com/exitcodenihil/llm-router/internal/edge"
 	"github.com/exitcodenihil/llm-router/internal/gateway"
+	"github.com/exitcodenihil/llm-router/internal/gwsync"
 	"github.com/exitcodenihil/llm-router/internal/limits"
 	"github.com/exitcodenihil/llm-router/internal/metrics"
 	"github.com/exitcodenihil/llm-router/internal/mgmt"
@@ -72,7 +73,10 @@ func run() error {
 
 	holder := &snapshot.Holder{}
 	mux := http.NewServeMux()
-	gw := &gateway.Server{Snapshots: holder, Limits: limits.New()}
+	// One limiter for the process: in mode=all it also aggregates every
+	// gateway's counts, so limits hold across the control plane and them.
+	lim := limits.New()
+	gw := &gateway.Server{Snapshots: holder, Limits: lim}
 
 	switch cfg.Mode {
 	case "all":
@@ -154,6 +158,8 @@ func run() error {
 		}
 		(&console.Auth{Store: st, EncryptionKey: cfg.EncryptionKey, CookieDomain: cfg.CookieDomain}).Register(mux)
 		(&edge.Server{Store: st, Snapshots: holder, Usage: gw.Usage, Nodes: nodeStore}).Register(mux)
+		(&gwsync.Server{Store: st, Snapshots: holder, Limits: lim, Export: usage.MultiWriter{lf, live}, Nodes: nodeStore,
+			Key: auth.DeriveKey("llmr-gw-session", cfg.EncryptionKey)}).Register(mux)
 		mux.Handle("/", console.SPA())
 
 	case "gateway":

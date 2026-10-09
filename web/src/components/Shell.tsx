@@ -123,7 +123,7 @@ const SECTIONS: { title: string; adminOnly?: boolean; items: NavEntry[] }[] = [
     adminOnly: true,
     items: [
       { to: "/users", label: "Users", icon: IconUsers },
-      { to: "/edge-nodes", label: "Edge nodes", icon: IconEdge },
+      { to: "/gateways", label: "Gateways", icon: IconEdge },
       { to: "/observability", label: "Observability", icon: IconObservability },
       { to: "/settings", label: "Settings", icon: IconSettings },
     ],

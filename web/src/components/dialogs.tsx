@@ -121,12 +121,15 @@ export function SecretDialog({
   onClose,
   title = "API key created",
   noun = "key",
+  children,
 }: {
   secret: string;
   onClose: () => void;
   title?: string;
   /** What the secret is, for the copy ("key", "node token"). */
   noun?: string;
+  /** Shown under the secret, e.g. how to use it. */
+  children?: ReactNode;
 }) {
   const showToast = useToast();
   const [copied, setCopied] = useState(false);
@@ -157,6 +160,7 @@ export function SecretDialog({
           description={`The gateway stores only a hash. If you lose this value you must issue a new ${noun}.`}
         />
         <CodeBlock code={secret} language="plaintext" width="100%" isWrapped hasCopyButton={false} />
+        {children}
         <HStack gap={2} hAlign="end">
           <Button label={copied ? "Copied" : `Copy ${noun}`} variant="secondary" onClick={copy} />
           <Button label="Done" variant="primary" onClick={onClose} />

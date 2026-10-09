@@ -70,6 +70,10 @@ function DeploymentForm({
     editing?.upstream_name ?? "",
   );
   const [priority, setPriority] = useState<number>(editing?.priority ?? 0);
+  const [region, setRegion] = useState(editing?.region ?? "");
+  const [timeoutS, setTimeoutS] = useState<number | null>(
+    editing?.timeout_ms != null ? editing.timeout_ms / 1000 : null,
+  );
   const [pricingMode, setPricingMode] = useState<PricingMode>(
     editing && (editing.input_per_1m != null || editing.output_per_1m != null)
       ? "custom"
@@ -177,6 +181,8 @@ function DeploymentForm({
       model_name: modelName.trim(),
       upstream_name: upstreamName.trim(),
       priority,
+      region: region.trim(),
+      timeout_ms: timeoutS != null && timeoutS > 0 ? Math.round(timeoutS * 1000) : null,
       ...pricing,
     };
     try {
@@ -265,13 +271,29 @@ function DeploymentForm({
           />
         </Grid>
 
-        <NumberInput
-          label="Priority"
-          value={priority}
-          onChange={setPriority}
-          description="Lower routes first among backends sharing a model name"
-          min={0}
-        />
+        <Grid columns={{ minWidth: 160, repeat: "fit" }} gap={3}>
+          <NumberInput
+            label="Priority"
+            value={priority}
+            onChange={setPriority}
+            description="Lower routes first among backends sharing a model name"
+            min={0}
+          />
+          <TextInput
+            label="Region"
+            value={region}
+            onChange={setRegion}
+            placeholder="eu"
+            description="Gateways in this region try it first"
+          />
+          <NumberInput
+            label="Timeout (s)"
+            value={timeoutS}
+            onChange={setTimeoutS}
+            description="Fail over if no response starts in time; empty: 10 min"
+            min={0}
+          />
+        </Grid>
 
         <Section variant="muted" padding={3}>
           <VStack gap={3}>

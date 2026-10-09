@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -104,7 +105,7 @@ func (w *PGWriter) Write(e Event) {
 	}
 }
 
-// Run consumes events until ctx ends, flushing every 100 events or 1s.
+// Run consumes events until ctx ends, flushing every 1000 events or 1s.
 // It also pre-creates monthly partitions.
 func (w *PGWriter) Run(ctx context.Context) {
 	if err := w.EnsurePartitions(ctx); err != nil {
@@ -167,7 +168,34 @@ func (w *PGWriter) flush(ctx context.Context, events []Event) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := InsertEvents(ctx, tx, events); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
 
+// ScopeKeys lists the spend scopes an event counts against: its key, user and
+// team, and the member's share of the team pool. They match snapshot.Spend keys.
+func ScopeKeys(e Event) []string {
+	var out []string
+	if e.APIKeyID != "" {
+		out = append(out, "key:"+e.APIKeyID)
+	}
+	if e.UserID != "" {
+		out = append(out, "user:"+e.UserID)
+	}
+	if e.TeamID != "" {
+		out = append(out, "team:"+e.TeamID)
+		if e.UserID != "" {
+			out = append(out, "member:"+e.UserID+":"+e.TeamID)
+		}
+	}
+	return out
+}
+
+// InsertEvents writes events and their spend_counters in tx: one multi-row
+// batch plus one aggregated upsert per (scope, day).
+func InsertEvents(ctx context.Context, tx pgx.Tx, events []Event) error {
 	type counter struct {
 		scopeType, scopeID string
 		day                time.Time
@@ -192,14 +220,8 @@ func (w *PGWriter) flush(ctx context.Context, events []Event) error {
 
 		day := e.TS.UTC().Truncate(24 * time.Hour)
 		tokens := int64(e.PromptTokens + e.CompletionTokens)
-		scopes := map[string]string{"key": e.APIKeyID, "user": e.UserID, "team": e.TeamID}
-		if e.UserID != "" && e.TeamID != "" {
-			scopes["member"] = e.UserID + ":" + e.TeamID // a member's share of the team pool
-		}
-		for scopeType, scopeID := range scopes {
-			if scopeID == "" {
-				continue
-			}
+		for _, key := range ScopeKeys(e) {
+			scopeType, scopeID, _ := strings.Cut(key, ":")
 			k := counter{scopeType, scopeID, day}
 			c := agg[k]
 			if c == nil {
@@ -222,10 +244,7 @@ func (w *PGWriter) flush(ctx context.Context, events []Event) error {
 			              tokens = spend_counters.tokens + EXCLUDED.tokens`,
 			k.scopeType, k.scopeID, k.day, c.usd, c.tokens)
 	}
-	if err := tx.SendBatch(ctx, b).Close(); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+	return tx.SendBatch(ctx, b).Close()
 }
 
 // EnsurePartitions creates last, this and next month's usage_events

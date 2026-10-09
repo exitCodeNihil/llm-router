@@ -18,7 +18,7 @@ func SPA() http.Handler {
 	fileServer := http.FileServerFS(dist)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// unknown API-ish routes must 404, not serve the SPA shell
-		for _, prefix := range []string{"/api/", "/v1/", "/auth/", "/edge/"} {
+		for _, prefix := range []string{"/api/", "/v1/", "/auth/", "/edge/", "/gw/"} {
 			if strings.HasPrefix(r.URL.Path, prefix) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusNotFound)

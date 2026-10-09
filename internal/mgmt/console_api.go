@@ -19,7 +19,7 @@ var (
 	userPatchCols       = []string{"name", "role", "budget_usd", "budget_period", "rpm_limit", "tpm_limit", "disabled", "tags", "allowed_models"}
 	teamPatchCols       = []string{"name", "budget_usd", "budget_period", "rpm_limit", "tpm_limit", "tags", "allowed_models"}
 	keyPatchCols        = []string{"name", "allowed_models", "budget_usd", "budget_period", "rpm_limit", "tpm_limit", "expires_at", "disabled", "tags"}
-	deploymentPatchCols = []string{"provider_id", "model_name", "upstream_name", "api_flavor", "priority", "catalog_model_id", "input_per_1m", "output_per_1m", "cached_input_per_1m", "context_tokens", "enabled"}
+	deploymentPatchCols = []string{"provider_id", "model_name", "upstream_name", "api_flavor", "priority", "catalog_model_id", "input_per_1m", "output_per_1m", "cached_input_per_1m", "context_tokens", "region", "timeout_ms", "enabled"}
 	providerPatchCols   = []string{"name", "base_url", "auth_mode", "config"}
 )
 

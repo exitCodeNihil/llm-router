@@ -30,6 +30,7 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 		DeploymentsByModel: map[string][]*Deployment{},
 		Prices:             map[string]Price{},
 		Spend:              map[string]Spend{},
+		GatewayGroups:      map[string]*GatewayGroup{},
 	}
 
 	if err := b.Pool.QueryRow(ctx,
@@ -190,7 +191,8 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 	}
 
 	rows, err = b.Pool.Query(ctx, `
-		SELECT id, provider_id, model_name, upstream_name, api_flavor, priority, catalog_model_id, input_per_1m, output_per_1m, cached_input_per_1m
+		SELECT id, provider_id, model_name, upstream_name, api_flavor, priority, catalog_model_id, input_per_1m, output_per_1m, cached_input_per_1m,
+		       region, timeout_ms
 		FROM model_deployments WHERE enabled`)
 	if err != nil {
 		return nil, err
@@ -200,7 +202,7 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 		var providerID string
 		var catalogID *string
 		if err := rows.Scan(&d.ID, &providerID, &d.ModelName, &d.UpstreamName, &d.APIFlavor, &d.Priority,
-			&catalogID, &d.InputPer1M, &d.OutputPer1M, &d.CachedInputPer1M); err != nil {
+			&catalogID, &d.InputPer1M, &d.OutputPer1M, &d.CachedInputPer1M, &d.Region, &d.TimeoutMS); err != nil {
 			return nil, err
 		}
 		d.CatalogModelID = deref(catalogID)
@@ -253,6 +255,28 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 		if err := json.Unmarshal(telemetryRaw, &s.Telemetry); err != nil {
 			slog.Error("corrupt telemetry settings; exporter disabled", "err", err)
 		}
+	}
+
+	rows, err = b.Pool.Query(ctx, `SELECT id, name, region, allowed_teams, data_rule FROM gateway_groups`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		g := &GatewayGroup{}
+		var teams []string
+		if err := rows.Scan(&g.ID, &g.Name, &g.Region, &teams, &g.DataRule); err != nil {
+			return nil, err
+		}
+		if len(teams) > 0 {
+			g.AllowedTeams = map[string]bool{}
+			for _, t := range teams {
+				g.AllowedTeams[t] = true
+			}
+		}
+		s.GatewayGroups[g.ID] = g
+	}
+	if rows.Err() != nil {
+		return nil, rows.Err()
 	}
 
 	if err := b.loadSpend(ctx, s); err != nil {
