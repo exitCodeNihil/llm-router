@@ -2,7 +2,7 @@
 //! group's token, keep the session fresh, long-poll the group's config, and
 //! sync usage and limit counters every couple of seconds.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -279,23 +279,26 @@ impl ControlPlane {
             let events = usage::take(MAX_BATCH);
             let (rates, scopes) = limits::freeze();
             s.batch += 1;
-            let req = SyncRequest {
-                batch: s.batch,
-                cursor: &s.cursor,
-                events: &events,
-                rates: &rates,
-                stats: Stats {
-                    version: VERSION,
-                    uptime_s: self.started.elapsed().as_secs(),
-                    in_flight: metrics::IN_FLIGHT.load(Ordering::Relaxed),
-                    workers: metrics::WORKERS.load(Ordering::Relaxed),
-                },
+            let (batch, cursor) = (s.batch, s.cursor.clone());
+            let stats = Stats {
+                version: VERSION,
+                uptime_s: self.started.elapsed().as_secs(),
+                in_flight: metrics::IN_FLIGHT.load(Ordering::Relaxed),
+                workers: metrics::WORKERS.load(Ordering::Relaxed),
             };
-            let mut gz = flate2::write::GzEncoder::new(Vec::with_capacity(4096), flate2::Compression::fast());
-            if serde_json::to_writer(&mut gz, &req).is_err() {
-                return false;
-            }
-            let body = gz.finish().unwrap_or_default();
+            // Encoding a large batch takes milliseconds: keep it off the request
+            // threads. JSON first, then one gzip pass; serde's many small writes
+            // straight into the encoder cost ~50x more.
+            let body = tokio::task::spawn_blocking(move || {
+                let req = SyncRequest { batch, cursor: &cursor, events: &events, rates: &rates, stats };
+                let json = serde_json::to_vec(&req).map_err(std::io::Error::other)?;
+                let mut gz =
+                    flate2::write::GzEncoder::new(Vec::with_capacity(json.len() / 8), flate2::Compression::fast());
+                gz.write_all(&json)?;
+                gz.finish()
+            })
+            .await;
+            let Ok(Ok(body)) = body else { return false };
             s.pending = Some(Batch { body: body.into(), scopes });
         }
         let Some(batch) = &s.pending else { return false };
