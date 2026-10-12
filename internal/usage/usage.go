@@ -1,6 +1,6 @@
 // Package usage captures per-request usage events and writes them to Postgres
-// in batches. The Writer interface is the seam for the edge shipper and a
-// future ClickHouse writer.
+// in batches. The Writer interface is the seam for exporters and a future
+// ClickHouse writer.
 package usage
 
 import (
@@ -33,7 +33,7 @@ type Event struct {
 	LatencyMS        int       `json:"latency_ms"`
 	StatusCode       int       `json:"status_code"`
 	Stream           bool      `json:"stream"`
-	EdgeNodeID       string    `json:"edge_node_id,omitempty"`
+	GatewayID        string    `json:"gateway_id,omitempty"` // the gateway instance that served it; "" = the control plane
 
 	// Attempts is 1 when the first-choice deployment answered, higher after
 	// failover. ErrorCode is the gateway's own reason for a failure, which
@@ -51,7 +51,7 @@ type Event struct {
 	Tags []string `json:"tags,omitempty"`
 
 	// Telemetry export decision, computed once post-auth in the gateway and
-	// carried through (incl. over the edge wire). Honored by exporters; never
+	// carried through. Honored by exporters; never
 	// written to Postgres.
 	Export         bool   `json:"export,omitempty"`
 	CaptureContent bool   `json:"capture_content,omitempty"`
@@ -209,13 +209,13 @@ func InsertEvents(ctx context.Context, tx pgx.Tx, events []Event) error {
 	for _, e := range events {
 		b.Queue(`INSERT INTO usage_events
 			(ts, request_id, api_key_id, user_id, team_id, model_name, deployment_id, provider_id,
-			 prompt_tokens, completion_tokens, cached_tokens, cost_usd, unpriced, latency_ms, status_code, stream, edge_node_id,
+			 prompt_tokens, completion_tokens, cached_tokens, cost_usd, unpriced, latency_ms, status_code, stream, gateway_id,
 			 attempts, error_code, ttft_ms, notional_cost_usd)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
 			e.TS, e.RequestID, nilIfEmpty(e.APIKeyID), nilIfEmpty(e.UserID), nilIfEmpty(e.TeamID),
 			e.ModelName, nilIfEmpty(e.DeploymentID), nilIfEmpty(e.ProviderID),
 			e.PromptTokens, e.CompletionTokens, e.CachedTokens, e.CostUSD, e.Unpriced,
-			e.LatencyMS, e.StatusCode, e.Stream, nilIfEmpty(e.EdgeNodeID),
+			e.LatencyMS, e.StatusCode, e.Stream, nilIfEmpty(e.GatewayID),
 			zeroIfNil(e.Attempts), nilIfEmpty(e.ErrorCode), zeroIfNil(e.TTFTMs), zeroFloatIfNil(e.NotionalCostUSD))
 
 		day := e.TS.UTC().Truncate(24 * time.Hour)
@@ -250,7 +250,7 @@ func InsertEvents(ctx context.Context, tx pgx.Tx, events []Event) error {
 // EnsurePartitions creates last, this and next month's usage_events
 // partitions. Called once at startup, where a failure is fatal: without a
 // partition every usage row is silently dropped while the gateway reports
-// healthy. Last month is included so late-arriving edge batches still land.
+// healthy. Last month is included so late gateway batches still land.
 func (w *PGWriter) EnsurePartitions(ctx context.Context) error {
 	return w.ensurePartitions(ctx, time.Now().UTC())
 }

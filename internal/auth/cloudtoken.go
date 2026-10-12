@@ -23,8 +23,7 @@ import (
 // user. Callers on Azure use `az account get-access-token --resource <audience>`;
 // callers on GCP use `gcloud auth print-identity-token --audiences=<audience>`.
 type CloudValidator struct {
-	// Pool enables auto-provisioning of first-seen users (nil on edge nodes,
-	// where unknown users are rejected until the control plane knows them).
+	// Pool enables auto-provisioning of first-seen users; nil turns it off.
 	Pool *pgxpool.Pool
 
 	mu        sync.Mutex

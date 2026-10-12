@@ -229,14 +229,6 @@ export interface GatewayGroup {
   live_instances: number;
 }
 
-export interface EdgeNode {
-  id: string;
-  name: string;
-  last_seen_at: string | null;
-  last_seen_version: string | null;
-  created_at: string;
-}
-
 export type TelemetryMode = "everything" | "by_rule" | "off";
 export type RuleScope = "team" | "user" | "key" | "tag";
 export type Capture = "content" | "meta";
@@ -621,7 +613,7 @@ export type BreakdownDim =
   | "team"
   | "status"
   | "error_code"
-  | "edge_node";
+  | "gateway";
 
 export interface BreakdownRow {
   bucket: string;

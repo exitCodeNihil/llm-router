@@ -15,7 +15,6 @@ import type {
   ChatSummary,
   Deployment,
   DeploymentReq,
-  EdgeNode,
   GatewayGroup,
   ExportedEvent,
   FlowEdgeRow,
@@ -495,26 +494,6 @@ export const useDeleteTokenIssuer = () =>
     [["token-issuers"]],
   );
 
-// ── Edge nodes ──────────────────────────────────────────────────
-export function useEdgeNodes() {
-  return useQuery({
-    queryKey: ["edge-nodes"],
-    queryFn: () => api.get<EdgeNode[]>("/api/edge-nodes"),
-    refetchInterval: 30_000,
-  });
-}
-export const useCreateEdgeNode = () =>
-  useInvalidatingMutation(
-    (b: { name: string }) =>
-      api.post<{ id: string; token: string }>("/api/edge-nodes", b),
-    [["edge-nodes"]],
-  );
-export const useDeleteEdgeNode = () =>
-  useInvalidatingMutation(
-    (id: string) => api.del(`/api/edge-nodes/${id}`),
-    [["edge-nodes"]],
-  );
-
 // ── Gateway groups ──────────────────────────────────────────────
 export function useGatewayGroups() {
   return useQuery({
@@ -789,7 +768,7 @@ export function useUsageByDeployment(days = 1) {
   });
 }
 
-// ── Nodes ops (admin) — self + edges + cluster events ────────────
+// ── Nodes ops (admin) — control plane + gateways + cluster events ─
 export function useNodes() {
   return useQuery({
     queryKey: ["nodes"],

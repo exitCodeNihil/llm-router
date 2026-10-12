@@ -21,7 +21,7 @@ spec:
                 name: {{ .Release.Name }}-llm-router
                 port:
                   number: {{ .Values.service.port }}
-    {{- if and .Values.workspaces.enabled .Values.workspaces.ideHost (eq .Values.mode "all") }}
+    {{- if and .Values.workspaces.enabled .Values.workspaces.ideHost }}
     - host: {{ .Values.workspaces.ideHost | quote }}
       http:
         paths:

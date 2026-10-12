@@ -15,7 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Builder rebuilds snapshots from Postgres (mode=all).
+// Builder rebuilds snapshots from Postgres.
 type Builder struct {
 	Pool          *pgxpool.Pool
 	EncryptionKey string

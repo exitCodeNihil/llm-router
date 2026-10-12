@@ -172,7 +172,7 @@ await page.keyboard.press("Escape");
 for (const [route, marker] of [
   ["/settings", /OIDC provider/i],
   ["/observability", /Destination/i],
-  ["/edge-nodes", /Cluster/i],
+  ["/gateways", /Cluster/i],
 ]) {
   await page.goto(`${BASE}${route}`, { waitUntil: "networkidle" });
   await page.waitForTimeout(700);

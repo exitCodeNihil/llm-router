@@ -3,24 +3,15 @@ image:
   tag: ""            # defaults to appVersion
   pullPolicy: IfNotPresent
 
-# "all" runs the control plane + gateway (needs database).
-# "gateway" runs an edge node (needs controlPlaneUrl + nodeToken).
-mode: all
-
 replicas: 1
 
-# mode=all
 databaseUrl: ""      # postgres://user:pass@host:5432/db — or use existingSecret
 adminToken: ""
 encryptionKey: ""
 # name of an existing Secret with keys: database-url, admin-token, encryption-key
 existingSecret: ""
 
-# mode=gateway
-controlPlaneUrl: ""
-nodeToken: ""        # or key node-token in existingSecret
-
-# Workspaces (docs/workspaces.md), mode=all only. Adds RBAC for pods, exec, PVCs and secrets
+# Workspaces (docs/workspaces.md). Adds RBAC for pods, exec, PVCs and secrets
 # in this release's namespace, plus the IDE listener on 8081 served from its own origin.
 workspaces:
   enabled: false

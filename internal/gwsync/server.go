@@ -298,7 +298,7 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request, instance, group st
 		if se.TSMS > 0 {
 			e.TS = time.UnixMilli(se.TSMS).UTC()
 		}
-		e.EdgeNodeID = instance
+		e.GatewayID = instance
 		events = append(events, e)
 	}
 	if dropped > 0 {

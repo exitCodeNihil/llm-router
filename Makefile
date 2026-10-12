@@ -130,8 +130,8 @@ tidy: ## Tidy go.mod
 
 # ── Browser verification (needs a running gateway + console) ─────────────────
 
-# Colour mode for the audit: dark (default), light, or both. Passed inline —
-# never exported, and never named LLMR_MODE, which is the gateway's run mode.
+# Colour mode for the audit: dark (default), light, or both. Passed inline,
+# never exported.
 AUDIT_MODE ?= dark
 
 audit: $(NODE_DEPS) ## Console audit: every route x 3 viewports (AUDIT_MODE=both)

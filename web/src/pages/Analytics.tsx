@@ -54,7 +54,7 @@ const DIMS: { v: BreakdownDim; label: string }[] = [
   { v: "user", label: "User" },
   { v: "error_code", label: "Error reason" },
   { v: "status", label: "Status" },
-  { v: "edge_node", label: "Edge node" },
+  { v: "gateway", label: "Gateway" },
 ];
 
 const METRICS = [

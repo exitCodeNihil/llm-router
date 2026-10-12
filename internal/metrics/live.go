@@ -2,9 +2,9 @@
 // console dashboards. It implements usage.Writer, so every event updates it
 // from the same choke point that feeds Postgres — with zero DB load.
 //
-// ponytail: per-process aggregation only. Cluster-wide roll-up (summing across
-// control-plane + edges) is a later upgrade; today each process reports its own
-// window plus whatever edge events it ingests (which carry edge_node_id).
+// ponytail: per-process aggregation. With one control-plane replica that covers
+// every gateway too, since their events are ingested here (they carry
+// gateway_id); more replicas would need a shared roll-up.
 package metrics
 
 import (
@@ -110,7 +110,7 @@ type Live struct {
 	now       func() time.Time
 	providers map[string]*provStat
 	edges     map[edgeKey]*wcounter
-	nodes     map[string]*wcounter // edge_node_id ("" = local/control-plane) -> rps
+	nodes     map[string]*wcounter // gateway_id ("" = the control plane) -> rps
 	scopes    map[string]*wcounter // "key:id"|"user:id"|"team:id"|"tag:val" -> rule match rates
 	global    latring              // all-provider latency reservoir (node p50/p95)
 }
@@ -149,10 +149,10 @@ func (l *Live) Write(e usage.Event) {
 		}
 		l.edges[k].add(sec, isErr)
 	}
-	if l.nodes[e.EdgeNodeID] == nil {
-		l.nodes[e.EdgeNodeID] = &wcounter{}
+	if l.nodes[e.GatewayID] == nil {
+		l.nodes[e.GatewayID] = &wcounter{}
 	}
-	l.nodes[e.EdgeNodeID].add(sec, isErr)
+	l.nodes[e.GatewayID].add(sec, isErr)
 
 	for st, val := range map[string]string{"key": e.APIKeyID, "user": e.UserID, "team": e.TeamID} {
 		if val == "" {

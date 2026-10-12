@@ -10,7 +10,7 @@ spec:
   ports:
     - port: {{ .Values.service.port }}
       targetPort: 8080
-    {{- if and .Values.workspaces.enabled (eq .Values.mode "all") }}
+    {{- if .Values.workspaces.enabled }}
     - name: ide
       port: 8081
       targetPort: ide
