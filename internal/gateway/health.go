@@ -12,8 +12,8 @@ import (
 // deployment is skipped while others are available, and tried again once the
 // cooldown lapses. Without this a dead endpoint costs every request a connect
 // timeout before failover, and a 429 is hammered until its window resets.
-// ponytail: in-process only; edge nodes each learn independently, which is
-// fine — they see their own failures.
+// ponytail: in-process only; each gateway learns independently, which is
+// fine — each sees its own failures.
 const (
 	cooldownBase = 30 * time.Second
 	cooldownMax  = 5 * time.Minute

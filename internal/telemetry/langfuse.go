@@ -170,7 +170,7 @@ func (l *Langfuse) send(ctx context.Context, events []usage.Event) error {
 			"deployment_id": e.DeploymentID,
 			"status_code":   e.StatusCode,
 			"stream":        e.Stream,
-			"edge_node_id":  e.EdgeNodeID,
+			"gateway_id":    e.GatewayID,
 		}
 		tags := []string{"llm-router", e.ModelName}
 		batch = append(batch, item{

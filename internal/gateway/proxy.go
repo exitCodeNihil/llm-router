@@ -437,7 +437,6 @@ func (g *Server) emit(snap *snapshot.Snapshot, id *auth.Identity, d *snapshot.De
 		LatencyMS:        int(time.Since(start).Milliseconds()),
 		StatusCode:       status,
 		Stream:           body.Stream,
-		EdgeNodeID:       g.EdgeNodeID,
 		TTFTMs:           counts.TTFTMs,
 		Attempts:         extra.Attempts,
 		ErrorCode:        extra.ErrorCode,

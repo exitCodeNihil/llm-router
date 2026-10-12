@@ -96,7 +96,7 @@ func TestSyncAgainstPostgres(t *testing.T) {
 	batch := SyncRequest{Batch: 1, Events: []SyncEvent{ev(keyID, teamA), ev(uuid.NewString(), teamB)},
 		Rates: []RateDelta{{Scope: "key:" + keyID, Minute: 1, Requests: 3}}}
 	rows := func() (n int) {
-		st.Pool.QueryRow(ctx, `SELECT count(*) FROM usage_events WHERE edge_node_id=$1`, joined.InstanceID).Scan(&n)
+		st.Pool.QueryRow(ctx, `SELECT count(*) FROM usage_events WHERE gateway_id=$1`, joined.InstanceID).Scan(&n)
 		return n
 	}
 	for i := range 2 { // the second post is a resend of the same batch

@@ -71,7 +71,6 @@ export default function App() {
           {isAdmin && <Route path="/deployments" element={<Navigate to="/models" replace />} />}
           {isAdmin && <Route path="/pricing" element={<Pricing />} />}
           {isAdmin && <Route path="/gateways" element={<Gateways />} />}
-          {isAdmin && <Route path="/edge-nodes" element={<Navigate to="/gateways" replace />} />}
           {isAdmin && <Route path="/observability" element={<Observability />} />}
           {isAdmin && <Route path="/settings" element={<Settings />} />}
           <Route path="*" element={<Navigate to="/" replace />} />

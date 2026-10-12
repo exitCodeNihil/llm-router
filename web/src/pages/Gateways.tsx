@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { Card } from "@astryxdesign/core/Card";
 import { VisuallyHidden } from "@astryxdesign/core/VisuallyHidden";
-import { Grid } from "@astryxdesign/core/Grid";
 import { HStack, VStack } from "@astryxdesign/core/Stack";
 import { Heading, Text } from "@astryxdesign/core/Text";
 import { Button } from "@astryxdesign/core/Button";
@@ -21,13 +20,10 @@ import { CodeBlock } from "@astryxdesign/core/CodeBlock";
 import { Timestamp } from "@astryxdesign/core/Timestamp";
 import { useToast } from "@astryxdesign/core/Toast";
 
-import type { DataRule, EdgeNode, GatewayGroup, Node } from "../lib/types";
+import type { DataRule, GatewayGroup, Node } from "../lib/types";
 import {
-  useCreateEdgeNode,
   useCreateGatewayGroup,
-  useDeleteEdgeNode,
   useDeleteGatewayGroup,
-  useEdgeNodes,
   useGatewayGroups,
   useNodes,
   useRotateGatewayToken,
@@ -446,111 +442,9 @@ function GatewayGroups({ onNew }: { onNew: () => void }) {
   );
 }
 
-// ── Legacy edge nodes ───────────────────────────────────────────
-function RegisterForm({ onClose, onToken }: { onClose: () => void; onToken: (t: string) => void }) {
-  const create = useCreateEdgeNode();
-  const showToast = useToast();
-  const [name, setName] = useState("");
-
-  async function submit(e: React.FormEvent) {
-    e.preventDefault();
-    try {
-      const res = (await create.mutateAsync({ name: name.trim() })) as { token: string };
-      onToken(res.token);
-      onClose();
-    } catch (err) {
-      showToast({ body: err instanceof Error ? err.message : "Failed", type: "error" });
-    }
-  }
-
-  return (
-    <form onSubmit={submit} noValidate>
-      <VStack gap={4}>
-        <TextInput
-          label="Node name"
-          value={name}
-          onChange={setName}
-          placeholder="eu-west-gateway"
-          description="Used in dashboards and cluster events"
-          isRequired
-          hasAutoFocus
-        />
-        <FormActions
-          onCancel={onClose}
-          submitLabel="Register node"
-          isLoading={create.isPending}
-          isDisabled={!name.trim()}
-        />
-      </VStack>
-    </form>
-  );
-}
-
 export default function Gateways() {
-  const edges = useEdgeNodes();
-  const del = useDeleteEdgeNode();
-  const showToast = useToast();
-
-  const [showForm, setShowForm] = useState(false);
   const [showGroupForm, setShowGroupForm] = useState(false);
   const [joinToken, setJoinToken] = useState<string | null>(null);
-  const [nodeToken, setNodeToken] = useState<string | null>(null);
-  const [deleting, setDeleting] = useState<EdgeNode | null>(null);
-
-  const columns: TableColumn<EdgeNode & Record<string, unknown>>[] = [
-    {
-      key: "name",
-      header: "Name",
-      width: proportional(1.4),
-      renderCell: (n) => (
-        <Text type="body" weight="medium" maxLines={1}>
-          {n.name}
-        </Text>
-      ),
-    },
-    {
-      key: "last_seen_at",
-      header: "Last seen",
-      width: pixel(140),
-      renderCell: (n) =>
-        n.last_seen_at ? (
-          <Timestamp value={n.last_seen_at} format="relative" isLive />
-        ) : (
-          <Badge variant="warning" label="never" />
-        ),
-    },
-    {
-      key: "last_seen_version",
-      header: "Version",
-      width: pixel(130),
-      renderCell: (n) => (n.last_seen_version ? <Code>{n.last_seen_version}</Code> : "—"),
-    },
-    {
-      key: "created_at",
-      header: "Registered",
-      width: pixel(120),
-      renderCell: (n) => <Timestamp value={n.created_at} format="date" />,
-    },
-    {
-      key: "actions",
-      header: <VisuallyHidden>Actions</VisuallyHidden>,
-      width: pixel(64),
-      align: "end",
-      renderCell: (n) => (
-        <IconButton
-          label={`Revoke ${n.name}`}
-          variant="ghost"
-          size="sm"
-          icon={<Icon icon={IconTrash} size="sm" />}
-          onClick={() => setDeleting(n)}
-        />
-      ),
-    },
-  ];
-
-  const addButton = (
-    <Button label="Register node" variant="secondary" size="sm" onClick={() => setShowForm(true)} />
-  );
   const newGroup = () => setShowGroupForm(true);
 
   return (
@@ -563,42 +457,7 @@ export default function Gateways() {
       <VStack gap={4}>
         <ClusterTable />
         <GatewayGroups onNew={newGroup} />
-
-        <Grid columns={{ minWidth: 320, repeat: "fit" }} gap={4}>
-          <Card padding={0}>
-            <VStack gap={0}>
-              <HStack padding={4} hAlign="between" vAlign="center">
-                <VStack gap={0}>
-                  <Heading level={4}>Edge nodes</Heading>
-                  <Text type="supporting" color="secondary">
-                    Legacy: replaced by gateway groups
-                  </Text>
-                </VStack>
-                {addButton}
-              </HStack>
-              <Divider />
-              {edges.isLoading ? (
-                <Loading />
-              ) : edges.error ? (
-                <ErrorState error={edges.error} onRetry={() => edges.refetch()} />
-              ) : (edges.data?.length ?? 0) === 0 ? (
-                <Empty title="No edge nodes" description="New deployments should use gateway groups." />
-              ) : (
-                <Table
-                  data={(edges.data ?? []) as Array<EdgeNode & Record<string, unknown>>}
-                  columns={columns}
-                  idKey="id"
-                  density="balanced"
-                  dividers="rows"
-                  hasHover
-                  textOverflow="truncate"
-                />
-              )}
-            </VStack>
-          </Card>
-
-          <ClusterEvents />
-        </Grid>
+        <ClusterEvents />
       </VStack>
 
       {showGroupForm && (
@@ -607,35 +466,6 @@ export default function Gateways() {
         </FormDialog>
       )}
       {joinToken && <JoinTokenDialog token={joinToken} onClose={() => setJoinToken(null)} />}
-
-      {showForm && (
-        <FormDialog isOpen onClose={() => setShowForm(false)} title="Register edge node">
-          <RegisterForm onClose={() => setShowForm(false)} onToken={setNodeToken} />
-        </FormDialog>
-      )}
-
-      {nodeToken && (
-        <SecretDialog secret={nodeToken} onClose={() => setNodeToken(null)} title="Edge node registered" noun="node token" />
-      )}
-
-      <Confirm
-        target={deleting}
-        title="Revoke edge node"
-        description={`Revoke "${deleting?.name}"? It will stop receiving config snapshots on its next sync.`}
-        actionLabel="Revoke"
-        isLoading={del.isPending}
-        onCancel={() => setDeleting(null)}
-        onConfirm={async () => {
-          if (!deleting) return;
-          try {
-            await del.mutateAsync(deleting.id);
-            showToast({ body: "Edge node revoked" });
-          } catch (err) {
-            showToast({ body: err instanceof Error ? err.message : "Failed", type: "error" });
-          }
-          setDeleting(null);
-        }}
-      />
     </Page>
   );
 }

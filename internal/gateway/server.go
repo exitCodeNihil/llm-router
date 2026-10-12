@@ -34,11 +34,10 @@ type LimitChecker interface {
 type CloudTokenValidator func(ctx context.Context, s *snapshot.Snapshot, token string) (*auth.Identity, error)
 
 type Server struct {
-	Snapshots  *snapshot.Holder
-	Usage      usage.Writer
-	Limits     LimitChecker
-	CloudAuth  CloudTokenValidator
-	EdgeNodeID string // set in mode=gateway, stamped on events
+	Snapshots *snapshot.Holder
+	Usage     usage.Writer
+	Limits    LimitChecker
+	CloudAuth CloudTokenValidator
 }
 
 type ctxKey int

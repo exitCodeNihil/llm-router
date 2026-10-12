@@ -19,10 +19,10 @@ export work. Container tooling prefers podman and falls back to docker (`ENGINE=
 
 ## Conventions
 
-- **Architecture**: one binary. `--mode=all` is the control plane (management API, console) plus
-  gateway on Postgres; `--mode=gateway` is a stateless edge node that syncs a signed config snapshot.
-  The hot path never touches the database: config lives in an atomically swapped in-memory
-  snapshot. Keep it that way.
+- **Architecture**: `llmrouter` (Go) is the control plane (management API, console) plus its own
+  `/v1` gateway on Postgres. `gateway/` (Rust) is the data-plane gateway that joins it through a
+  gateway group (`internal/gwsync`). The hot path never touches the database: config lives in an
+  atomically swapped in-memory snapshot. Keep it that way.
 - **Migrations are forward-only.** Add `internal/store/migrations/NNNN_name.sql`; never edit one
   that has shipped. The gateway applies them at startup but doesn't create the database itself.
   `make db-reset` drops the schema so the next start replays everything.

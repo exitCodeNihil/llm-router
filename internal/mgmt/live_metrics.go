@@ -68,7 +68,7 @@ func (m *Server) metricsLive(w http.ResponseWriter, r *http.Request) {
 			"provider_id": e.ProviderID, "provider_name": provName[e.ProviderID], "volume": e.Volume,
 		})
 	}
-	nodeNames := m.edgeNodeNames(r)
+	nodeNames := m.gatewayNames(r)
 	nodes := []map[string]any{}
 	for _, n := range m.Live.Nodes() {
 		name := nodeNames[n.ID]
@@ -88,10 +88,11 @@ func (m *Server) metricsLive(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// edgeNodeNames maps edge_nodes id→name (best-effort).
-func (m *Server) edgeNodeNames(r *http.Request) map[string]string {
+// gatewayNames maps gateway instance ids to "group / instance" (best-effort).
+func (m *Server) gatewayNames(r *http.Request) map[string]string {
 	out := map[string]string{}
-	rows, err := listRows(r.Context(), m.Store.Pool, `SELECT id, name FROM edge_nodes`)
+	rows, err := listRows(r.Context(), m.Store.Pool,
+		`SELECT i.id, g.name || ' / ' || i.name AS name FROM gateway_instances i JOIN gateway_groups g ON g.id = i.group_id`)
 	if err != nil {
 		return out
 	}
@@ -105,8 +106,8 @@ func (m *Server) edgeNodeNames(r *http.Request) map[string]string {
 
 const p50SLOms = 2000 // upstream p50 above this raises a cluster event
 
-// listNodes returns the control-plane node + edges with ops metrics, plus the
-// cluster-events ring.
+// listNodes returns the control plane and the gateway instances with their ops
+// metrics, plus the cluster-events ring.
 func (m *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 	selfVer := m.Version
 	if selfVer == "" {
@@ -133,42 +134,9 @@ func (m *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 		"p50_ms": p50, "last_seen": time.Now().UTC(), "status": "ok",
 	}}
 
-	rows, _ := listRows(r.Context(), m.Store.Pool,
-		`SELECT id, name, last_seen_at, last_seen_version FROM edge_nodes ORDER BY created_at`)
 	now := time.Now()
-	for _, row := range rows {
-		id, _ := row["id"].(string)
-		name, _ := row["name"].(string)
-		lastSeen, _ := row["last_seen_at"].(time.Time)
-		var ver string
-		var uptime int64
-		var cpu, mem float64
-		if m.NodeStore != nil {
-			if nm, ok := m.NodeStore.Get(id); ok {
-				ver, uptime, cpu, mem = nm.Version, nm.UptimeS, nm.CPUPct, nm.MemPct
-			}
-		}
-		skew := ver != "" && ver != selfVer
-		status := "ok"
-		switch {
-		case lastSeen.IsZero() || now.Sub(lastSeen) > 2*time.Minute:
-			status = "err"
-		case now.Sub(lastSeen) > 45*time.Second || skew:
-			status = "warn"
-		}
-		if skew && m.Events != nil {
-			m.Events.AddDedup("warn", name+" version skew ("+ver+" vs "+selfVer+")")
-		}
-		nodes = append(nodes, map[string]any{
-			"id": id, "name": name, "addr": "", "role": "",
-			"version": ver, "version_skew": skew, "uptime_s": uptime,
-			"cpu_pct": round1(cpu), "mem_pct": round1(mem), "rps": round1(m.liveRPS(id)),
-			"p50_ms": 0, "last_seen": row["last_seen_at"], "status": status, // ponytail: per-edge p50 not tracked
-		})
-	}
-
 	// Gateway instances sync every 2 s, so a few missed syncs already mean trouble.
-	rows, _ = listRows(r.Context(), m.Store.Pool,
+	rows, _ := listRows(r.Context(), m.Store.Pool,
 		`SELECT i.id, i.name, g.name AS group_name, g.region, i.last_seen_at
 		FROM gateway_instances i JOIN gateway_groups g ON g.id = i.group_id
 		WHERE i.last_seen_at > now() - interval '10 minutes' ORDER BY g.name, i.joined_at`)

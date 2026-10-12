@@ -30,8 +30,9 @@ A request must pass every list that applies. `/v1/models` on a key returns what 
 
 Each takes **Budget (USD)** with a **Period** (daily, monthly or total), **Requests / min** and
 **Tokens / min**. A request must fit every limit that applies. The first one to fail returns `429`
-with `budget_exceeded` or `rate_limit_exceeded`. Members can't change their own limits. Rate limits
-are counted per gateway node, and tokens after the response, so a burst can overshoot.
+with `budget_exceeded` or `rate_limit_exceeded`. Members can't change their own limits. Limits hold
+across llm-router and every [gateway](deploy.md#gateways): gateways sync their counts every 2 seconds,
+and tokens are counted after the response, so a burst can overshoot a little.
 
 ## Sign-in and SSO
 

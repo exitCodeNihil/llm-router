@@ -7,7 +7,7 @@ import (
 
 // Config is the workspace connector (settings key 'workspaces'). It is a
 // control-plane concern only, so it deliberately does not ride in the routing
-// snapshot the gateway and edge nodes read.
+// snapshot the gateways read.
 type Config struct {
 	Enabled bool `json:"enabled"`
 	// Runtime selects the backend: "docker" (podman serves the same API) or

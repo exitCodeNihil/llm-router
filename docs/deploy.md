@@ -45,9 +45,8 @@ With workspaces on, add `-f deploy/docker-compose.workspaces.yml`.
 
 ## Kubernetes
 
-The Helm chart in `deploy/helm/llm-router` runs the control plane (`mode=all`) or an edge node
-(`mode=gateway`). Bring your own Postgres and point at an existing empty database; the gateway
-creates its schema on start.
+The Helm chart in `deploy/helm/llm-router` runs llm-router. Bring your own Postgres and point at an
+existing empty database; llm-router creates its schema on start.
 
 ```bash
 kubectl create secret generic llm-router \
@@ -115,31 +114,19 @@ tokens, or prompt capture for telemetry. The control plane's own `/v1` serves al
 `/healthz` answers 200 once the gateway has its config and has synced, and 503 while it starts or
 drains. `/metrics` is in Prometheus format.
 
-### Edge nodes (legacy)
-
-Edge nodes, the control plane's binary run with `--mode=gateway`, are replaced by gateway groups and
-will be removed in a later release. Each one needs its own token, and their limits are counted per
-node. An existing setup keeps working:
-
-```bash
-LLMR_CONTROL_PLANE_URL=https://router.example.com LLMR_NODE_TOKEN=llmrn_… \
-  llmrouter --mode=gateway --listen :8080
-```
-
 ## Configuration
 
-| Variable | Used by | Meaning |
-|---|---|---|
-| `LLMR_DATABASE_URL` | control plane | Postgres URL (required) |
-| `LLMR_ENCRYPTION_KEY` | control plane | Encrypts provider keys and signs sessions; 16+ characters, required |
-| `LLMR_ADMIN_TOKEN` | control plane | Bootstrap admin token, 12+ characters (optional) |
-| `LLMR_LISTEN` | all | Listen address, default `:8080` |
-| `LLMR_MODE` | all | `all` (default) or `gateway` |
-| `LLMR_CONTROL_PLANE_URL`, `LLMR_NODE_TOKEN` | edge (legacy) | Where to sync from and how to authenticate |
-| `LLMR_SNAPSHOT_CACHE` | edge | Config cache path (default `/var/lib/llmrouter/snapshot.json`) |
-| `LLMR_SEED_CLAUDE_SUBSCRIPTION` | control plane | `1` adds the [subscription pass-through](clients.md#on-your-claudeai-subscription) provider and models |
-| `LLMR_IDE_LISTEN`, `LLMR_IDE_ORIGIN`, `LLMR_COOKIE_DOMAIN` | control plane | [Workspace IDE](workspaces.md) listener, its public origin, and the session cookie domain when it is another hostname |
-| `LLMR_WORKSPACE_NETWORK` | control plane | Docker network shared with workspaces, so a containerised gateway reaches each IDE by name (set by `docker-compose.workspaces.yml`). Unset, the IDE is published on the host's loopback |
+For llm-router itself (the gateways have [their own](#gateways)):
+
+| Variable | Meaning |
+|---|---|
+| `LLMR_DATABASE_URL` | Postgres URL (required) |
+| `LLMR_ENCRYPTION_KEY` | Encrypts provider keys and signs sessions; 16+ characters, required |
+| `LLMR_ADMIN_TOKEN` | Bootstrap admin token, 12+ characters (optional) |
+| `LLMR_LISTEN` | Listen address, default `:8080` |
+| `LLMR_SEED_CLAUDE_SUBSCRIPTION` | `1` adds the [subscription pass-through](clients.md#on-your-claudeai-subscription) provider and models |
+| `LLMR_IDE_LISTEN`, `LLMR_IDE_ORIGIN`, `LLMR_COOKIE_DOMAIN` | [Workspace IDE](workspaces.md) listener, its public origin, and the session cookie domain when it is another hostname |
+| `LLMR_WORKSPACE_NETWORK` | Docker network shared with workspaces, so a containerised llm-router reaches each IDE by name (set by `docker-compose.workspaces.yml`). Unset, the IDE is published on the host's loopback |
 
 Placeholder secrets such as `change-me` are refused. Generate them with `openssl rand -hex 16`.
 

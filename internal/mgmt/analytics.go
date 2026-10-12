@@ -30,7 +30,7 @@ type usageFilter struct {
 
 // uuidParams are the filters that compare against uuid columns; anything
 // else there makes the driver fail the query. request_id is text (req_…).
-var uuidParams = map[string]bool{"key_id": true, "user_id": true, "team_id": true, "provider_id": true, "deployment_id": true, "edge_node_id": true}
+var uuidParams = map[string]bool{"key_id": true, "user_id": true, "team_id": true, "provider_id": true, "deployment_id": true, "gateway_id": true}
 
 // newUsageFilter reads the query string and the caller's visibility scope.
 func newUsageFilter(r *http.Request, c *Caller) *usageFilter {
@@ -57,7 +57,7 @@ func newUsageFilter(r *http.Request, c *Caller) *usageFilter {
 		"provider_id":   "e.provider_id",
 		"deployment_id": "e.deployment_id",
 		"error_code":    "e.error_code",
-		"edge_node_id":  "e.edge_node_id",
+		"gateway_id":    "e.gateway_id",
 		"request_id":    "e.request_id",
 	} {
 		if v := q.Get(param); v != "" {
@@ -150,7 +150,7 @@ var breakdownDims = map[string]struct{ expr, label string }{
 	"team":       {"e.team_id::text", "coalesce(t.name, '(none)')"},
 	"status":     {"e.status_code::text", "e.status_code::text"},
 	"error_code": {"coalesce(e.error_code, '')", "coalesce(nullif(e.error_code, ''), '(none)')"},
-	"edge_node":  {"e.edge_node_id::text", "coalesce(e.edge_node_id::text, '(control plane)')"},
+	"gateway":    {"e.gateway_id::text", "coalesce(gg.name || ' / ' || gi.name, e.gateway_id::text, '(control plane)')"},
 }
 
 // usageBreakdown aggregates the filtered rows by one dimension. This is the
@@ -190,6 +190,8 @@ func (m *Server) usageBreakdown(w http.ResponseWriter, r *http.Request) {
 		LEFT JOIN model_deployments d ON d.id = e.deployment_id
 		LEFT JOIN users u ON u.id = e.user_id
 		LEFT JOIN teams t ON t.id = e.team_id
+		LEFT JOIN gateway_instances gi ON gi.id = e.gateway_id
+		LEFT JOIN gateway_groups gg ON gg.id = gi.group_id
 		WHERE %s
 		GROUP BY 1, 2
 		ORDER BY cost_usd DESC, requests DESC

@@ -1,4 +1,4 @@
-{{- if and .Values.workspaces.enabled (eq .Values.mode "all") }}
+{{- if .Values.workspaces.enabled }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:

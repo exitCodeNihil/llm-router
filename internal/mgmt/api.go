@@ -33,7 +33,7 @@ type Server struct {
 	AdminToken    string
 	EncryptionKey string
 
-	// Live console surfaces (mode=all). All optional; nil-safe handlers.
+	// Live console surfaces. All optional; nil-safe handlers.
 	Snapshots *snapshot.Holder
 	// IDEOrigin is the public origin of the separate IDE listener ("" = the
 	// IDE is served from this mux, which shares the console's origin).
@@ -139,9 +139,6 @@ func (m *Server) Register(mux *http.ServeMux) {
 	}
 
 	mux.Handle("GET /api/routing/health", h(m.routingHealth))
-	mux.Handle("GET /api/edge-nodes", h(m.listEdgeNodes))
-	mux.Handle("POST /api/edge-nodes", h(m.createEdgeNode))
-	mux.Handle("DELETE /api/edge-nodes/{id}", h(m.deleteRow("edge_nodes")))
 	mux.Handle("GET /api/gateway-groups", h(m.listGatewayGroups))
 	mux.Handle("POST /api/gateway-groups", h(m.createGatewayGroup))
 	mux.Handle("PATCH /api/gateway-groups/{id}", h(m.patchRow("gateway_groups", gatewayGroupPatchCols)))

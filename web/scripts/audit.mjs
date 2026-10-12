@@ -28,7 +28,7 @@ const ROUTES = [
   ["/providers", "providers"],
   ["/deployments", "deployments"],
   ["/pricing", "pricing"],
-  ["/edge-nodes", "edge-nodes"],
+  ["/gateways", "gateways"],
   ["/observability", "observability"],
   ["/settings", "settings"],
   ["/account", "account"],
