@@ -11,5 +11,5 @@
       }
     ]
   },
-  "error": "json: cannot unmarshal number into Go value of type []gateway.anthBlock"
+  "error": "json: …"
 }

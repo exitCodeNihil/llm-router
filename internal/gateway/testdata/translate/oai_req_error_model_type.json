@@ -5,5 +5,5 @@
     "model": 5,
     "messages": []
   },
-  "error": "invalid model field: json: cannot unmarshal number into Go value of type string"
+  "error": "invalid model field: json: …"
 }
