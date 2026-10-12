@@ -6,5 +6,5 @@
     "max_tokens": "100",
     "messages": []
   },
-  "error": "invalid JSON: json: cannot unmarshal string into Go struct field anthRequest.max_tokens of type int"
+  "error": "invalid JSON: json: …"
 }

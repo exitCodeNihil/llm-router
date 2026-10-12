@@ -87,11 +87,11 @@ func runGolden(t *testing.T, g golden) (json.RawMessage, *goldenUsage, string) {
 	case "anth_req_to_oai":
 		var areq anthRequest
 		if err := json.Unmarshal(in, &areq); err != nil {
-			return nil, nil, "invalid JSON: " + err.Error()
+			return nil, nil, "invalid JSON: " + goldenError(err)
 		}
 		m, err := anthToOpenAI(&areq)
 		if err != nil {
-			return nil, nil, err.Error()
+			return nil, nil, goldenError(err)
 		}
 		m["model"] = g.Model
 		out, _ := json.Marshal(m)
@@ -99,11 +99,11 @@ func runGolden(t *testing.T, g golden) (json.RawMessage, *goldenUsage, string) {
 	case "oai_req_to_anth":
 		body, err := parseBody(in)
 		if err != nil {
-			return nil, nil, err.Error()
+			return nil, nil, goldenError(err)
 		}
 		out, err := oaiToAnthBody(body, g.Model)
 		if err != nil {
-			return nil, nil, err.Error()
+			return nil, nil, goldenError(err)
 		}
 		return out, nil, ""
 	case "oai_resp_to_anth":
@@ -130,6 +130,16 @@ func runGolden(t *testing.T, g golden) (json.RawMessage, *goldenUsage, string) {
 		t.Fatalf("unknown fn %q", g.Fn)
 	}
 	return jsonString(t, rec.Body.String()), usageOf(c), ""
+}
+
+// goldenError drops encoding/json's own wording, which changes between Go
+// releases; the fixture keeps which step refused the input.
+func goldenError(err error) string {
+	s := err.Error()
+	if i := strings.Index(s, "json: "); i >= 0 {
+		return s[:i] + "json: …"
+	}
+	return s
 }
 
 func usageOf(c usageCounts) *goldenUsage {

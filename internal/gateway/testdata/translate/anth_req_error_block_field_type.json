@@ -16,5 +16,5 @@
       }
     ]
   },
-  "error": "json: cannot unmarshal number into Go struct field .0.text of type string"
+  "error": "json: …"
 }

@@ -2,5 +2,5 @@
   "fn": "oai_req_to_anth",
   "model": "claude-x",
   "in": "[1,2]",
-  "error": "invalid JSON body: json: cannot unmarshal array into Go value of type map[string]jsontext.Value"
+  "error": "invalid JSON body: json: …"
 }
