@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.2.0](https://github.com/exitCodeNihil/llm-router/compare/v0.1.2...v0.2.0) (2026-10-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* remove edge nodes and the --mode flag
+
+### Features
+
+* add a Rust data-plane gateway that joins gateway groups ([17ab06d](https://github.com/exitCodeNihil/llm-router/commit/17ab06df18d52106fe2cfc4fbafc6635d357c1bf))
+* add gateway groups and a sync protocol for data-plane gateways ([3eee415](https://github.com/exitCodeNihil/llm-router/commit/3eee415d6516d4ba5840a77989575d868382aff5))
+
+
+### Performance Improvements
+
+* encode gateway usage batches off the request threads ([a9f1472](https://github.com/exitCodeNihil/llm-router/commit/a9f14725843f8f7a5e4c8ed6f63fdb0a1848a393))
+
+
+### Code Refactoring
+
+* remove edge nodes and the --mode flag ([a902c36](https://github.com/exitCodeNihil/llm-router/commit/a902c36d428a7424ca1c9ee4534086ff6bbe2108))
+
 ## [0.1.2](https://github.com/exitCodeNihil/llm-router/compare/v0.1.1...v0.1.2) (2026-10-07)
 
 
