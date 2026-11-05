@@ -31,13 +31,13 @@ func (m *Server) usageByTeam(w http.ResponseWriter, r *http.Request) {
 	teamScope := "TRUE"
 	if !c.IsAdmin {
 		args = append(args, c.UserID)
-		teamScope = `sc.scope_id = ANY(SELECT team_id FROM team_members WHERE user_id = $2)`
+		teamScope = `sc.scope_id = ANY(SELECT team_id::text FROM team_members WHERE user_id = $2)`
 	}
 	m.list(w, r, `
 		SELECT sc.scope_id AS team_id, t.name AS team_name,
 		       coalesce(sum(sc.usd), 0) AS usd,
 		       coalesce(sum(sc.tokens), 0) AS tokens
-		FROM spend_counters sc JOIN teams t ON t.id = sc.scope_id
+		FROM spend_counters sc JOIN teams t ON t.id::text = sc.scope_id
 		WHERE sc.scope_type = 'team' AND sc.period_start >= $1 AND `+teamScope+`
 		GROUP BY 1, 2 ORDER BY usd DESC`, args...)
 }
