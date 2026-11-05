@@ -175,18 +175,7 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 			}
 			p.APIKey = key
 		}
-		if v, ok := cfg["api_version"].(string); ok {
-			p.APIVersion = v
-		}
-		if v, ok := cfg["project"].(string); ok {
-			p.Project = v
-		}
-		if v, ok := cfg["location"].(string); ok {
-			p.Location = v
-		}
-		if p.AuthMode == "anthropic_wif" {
-			p.WIF = AnthropicWIFFromConfig(cfg)
-		}
+		p.ApplyConfig(cfg)
 		providers[p.ID] = p
 	}
 	if rows.Err() != nil {
@@ -212,6 +201,9 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 		d.Provider = providers[providerID]
 		if d.Provider == nil {
 			continue
+		}
+		if d.Provider.Type == "anthropic" {
+			d.APIFlavor = "anthropic" // whatever the model is called
 		}
 		s.DeploymentsByModel[d.ModelName] = append(s.DeploymentsByModel[d.ModelName], d)
 	}

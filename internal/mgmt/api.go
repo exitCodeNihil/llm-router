@@ -709,7 +709,7 @@ func (m *Server) createProvider(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "base_url must start with http:// or https://")
 		return
 	}
-	if req.BaseURL == "" && req.Type != "gcp_vertex" && req.Type != "openrouter" {
+	if req.BaseURL == "" && req.Type != "gcp_vertex" && req.Type != "openrouter" && req.Type != "anthropic" {
 		httpError(w, http.StatusBadRequest, "base_url is required")
 		return
 	}
@@ -779,12 +779,7 @@ func (m *Server) providerModels(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusNotFound, "provider not found")
 		return
 	}
-	if v, ok := cfg["project"].(string); ok {
-		p.Project = v
-	}
-	if v, ok := cfg["location"].(string); ok {
-		p.Location = v
-	}
+	p.ApplyConfig(cfg)
 	if len(enc) > 0 && snapshot.ProviderHasSecret(p.AuthMode) {
 		if p.APIKey, err = snapshot.Decrypt(m.EncryptionKey, enc); err != nil {
 			httpError(w, http.StatusInternalServerError,

@@ -113,7 +113,7 @@ func anthropicWIFToken(ctx context.Context, p *snapshot.Provider) (string, error
 }
 
 func exchangeWIF(ctx context.Context, p *snapshot.Provider) (*wifToken, error) {
-	endpoint, err := wifEndpoint(p.BaseURL)
+	endpoint, err := wifEndpoint(BaseURL(p))
 	if err != nil {
 		return nil, err
 	}

@@ -30,9 +30,14 @@ const AUTH_MODES: Record<ProviderType, { value: string; label: string; needsKey:
     { value: "entra", label: "Entra ID (managed identity)", needsKey: false },
     { value: "api_key", label: "API key", needsKey: true },
   ],
+  anthropic: [
+    { value: "anthropic_wif", label: "Workload identity (no key)", needsKey: false },
+    { value: "api_key", label: "API key", needsKey: true },
+    { value: "oauth_passthrough", label: "Caller's own login (Claude subscription)", needsKey: false },
+    { value: "bearer", label: "Bearer token", needsKey: true },
+  ],
   openai_compatible: [
     { value: "bearer", label: "Bearer token", needsKey: true },
-    { value: "anthropic_wif", label: "Anthropic workload identity (no key)", needsKey: false },
     { value: "oauth_passthrough", label: "Forward the caller's token", needsKey: false },
     { value: "none", label: "No auth", needsKey: false },
   ],
@@ -44,8 +49,10 @@ const AUTH_MODES: Record<ProviderType, { value: string; label: string; needsKey:
 };
 
 const OPENROUTER_URL = "https://openrouter.ai/api/v1";
+const ANTHROPIC_URL = "https://api.anthropic.com";
 
 const TYPE_LABELS: Record<ProviderType, string> = {
+  anthropic: "Anthropic",
   azure: "Azure",
   openai_compatible: "OpenAI-compatible",
   gcp_vertex: "Google Vertex AI",
@@ -64,9 +71,9 @@ function ProviderForm({ editing, onClose }: { editing: Provider | null; onClose:
   const showToast = useToast();
 
   const [name, setName] = useState(editing?.name ?? "");
-  const [type, setType] = useState<ProviderType>(editing?.type ?? "azure");
-  const [baseUrl, setBaseUrl] = useState(editing?.base_url ?? "");
-  const [authMode, setAuthMode] = useState(editing?.auth_mode ?? "entra");
+  const [type, setType] = useState<ProviderType>(editing?.type ?? "anthropic");
+  const [baseUrl, setBaseUrl] = useState(editing?.base_url ?? ANTHROPIC_URL);
+  const [authMode, setAuthMode] = useState(editing?.auth_mode ?? "anthropic_wif");
   const [apiKey, setApiKey] = useState("");
   const [apiVersion, setApiVersion] = useState((editing?.config?.api_version as string) ?? "");
   const [project, setProject] = useState((editing?.config?.project as string) ?? "");
@@ -94,6 +101,8 @@ function ProviderForm({ editing, onClose }: { editing: Provider | null; onClose:
     // and taken away again if the type changes, so it never lands on Azure.
     if (t === "openrouter" && !baseUrl.trim()) setBaseUrl(OPENROUTER_URL);
     if (t !== "openrouter" && baseUrl.trim() === OPENROUTER_URL) setBaseUrl("");
+    if (t === "anthropic" && !baseUrl.trim()) setBaseUrl(ANTHROPIC_URL);
+    if (t !== "anthropic" && baseUrl.trim() === ANTHROPIC_URL) setBaseUrl("");
   }
 
   async function submit(e: React.FormEvent) {
@@ -145,7 +154,9 @@ function ProviderForm({ editing, onClose }: { editing: Provider | null; onClose:
         ? `Leave blank to use ${vertexHost(location)}; set only for a private endpoint`
         : type === "openrouter"
           ? "OpenRouter's API; change only to route through a proxy"
-          : "Include the /v1 suffix, e.g. http://vllm:8000/v1";
+          : type === "anthropic"
+            ? "Anthropic's API; change only to route through a proxy"
+            : "Include the /v1 suffix, e.g. http://vllm:8000/v1";
   const isVertex = type === "gcp_vertex";
 
   return (
@@ -156,7 +167,7 @@ function ProviderForm({ editing, onClose }: { editing: Provider | null; onClose:
           value={name}
           onChange={setName}
           placeholder={
-            type === "azure" ? "e.g. azure-eastus" : type === "gcp_vertex" ? "e.g. vertex-prod" : type === "openrouter" ? "e.g. openrouter" : "e.g. vllm-lab"
+            type === "azure" ? "e.g. azure-eastus" : type === "gcp_vertex" ? "e.g. vertex-prod" : type === "openrouter" ? "e.g. openrouter" : type === "anthropic" ? "e.g. anthropic" : "e.g. vllm-lab"
           }
           isRequired
           hasAutoFocus
@@ -170,6 +181,7 @@ function ProviderForm({ editing, onClose }: { editing: Provider | null; onClose:
             isDisabled={!!editing}
             disabledMessage="Provider type cannot change after creation"
             options={[
+              { value: "anthropic", label: "Anthropic" },
               { value: "azure", label: "Azure OpenAI / AI Foundry" },
               { value: "gcp_vertex", label: "Google Vertex AI" },
               { value: "openrouter", label: "OpenRouter" },
@@ -181,9 +193,7 @@ function ProviderForm({ editing, onClose }: { editing: Provider | null; onClose:
             value={authMode}
             onChange={setAuthMode}
             description={
-              authMode === "anthropic_wif"
-                ? "No key to store or leak: each gateway exchanges its own identity token for a short-lived Anthropic token. Set up the rule in the Claude Console under Settings, Workload identity."
-                : authMode === "oauth_passthrough"
+              authMode === "oauth_passthrough"
                 ? "The caller's Authorization header travels upstream. Clients send their gateway key as X-Llmr-Key instead."
                 : authMode === "gcp_adc"
                   ? "The attached service account, workload identity, or `gcloud auth application-default login` on the gateway host."
@@ -198,6 +208,14 @@ function ProviderForm({ editing, onClose }: { editing: Provider | null; onClose:
             status="warning"
             title="Not available in the Playground or workspaces"
             description="Models on this provider only work for clients that send their own login, such as Claude Code. The Playground and workspace agents have none to forward."
+          />
+        )}
+
+        {authMode === "anthropic_wif" && (
+          <Banner
+            status="info"
+            title="No key to store or leak"
+            description="Each gateway swaps its own identity token for short-lived Anthropic tokens. Create the issuer, service account and rule in the Claude Console at platform.claude.com/settings/workload-identity-federation, then copy the IDs here."
           />
         )}
 
@@ -276,8 +294,8 @@ function ProviderForm({ editing, onClose }: { editing: Provider | null; onClose:
                   : "http://vllm:8000/v1"
           }
           description={urlHint}
-          isRequired={!isVertex}
-          isOptional={isVertex}
+          isRequired={!isVertex && type !== "anthropic"}
+          isOptional={isVertex || type === "anthropic"}
         />
 
         {needsKey && authMode === "gcp_sa" ? (
@@ -323,7 +341,7 @@ function ProviderForm({ editing, onClose }: { editing: Provider | null; onClose:
           isLoading={busy}
           isDisabled={
             !name.trim() ||
-            (isVertex ? !project.trim() : type !== "openrouter" && !baseUrl.trim()) ||
+            (isVertex ? !project.trim() : type !== "openrouter" && type !== "anthropic" && !baseUrl.trim()) ||
             (needsKey && !hasKey && !apiKey)
           }
         />
@@ -361,7 +379,9 @@ export default function Providers() {
       renderCell: (p) => (
         <Badge
           variant={
-            p.type === "azure"
+            p.type === "anthropic"
+              ? "orange"
+              : p.type === "azure"
               ? "blue"
               : p.type === "gcp_vertex"
                 ? "green"
@@ -389,10 +409,10 @@ export default function Providers() {
       key: "auth_mode",
       header: "Auth",
       sortable: true,
-      width: pixel(150),
+      width: pixel(240),
       renderCell: (p) => (
         <HStack gap={1.5} vAlign="center">
-          <Text type="supporting">{p.auth_mode}</Text>
+          <Text type="supporting">{AUTH_MODES[p.type]?.find((m) => m.value === p.auth_mode)?.label ?? p.auth_mode}</Text>
           {p.has_api_key && <Badge variant="success" label="key set" />}
         </HStack>
       ),
@@ -454,7 +474,7 @@ export default function Providers() {
     <Page
       eyebrow="Routing"
       title="Providers"
-      description="Upstream backends: Azure OpenAI / AI Foundry, Google Vertex AI, OpenRouter, or any OpenAI-compatible server."
+      description="Upstream backends: Anthropic, Azure OpenAI / AI Foundry, Google Vertex AI, OpenRouter, or any OpenAI-compatible server."
       action={
         <HStack gap={2} vAlign="center">
           <SearchBox value={tools.query} onChange={tools.setQuery} placeholder="Search providers…" />

@@ -215,3 +215,27 @@ func TestValidateAnthropicWIF(t *testing.T) {
 		}
 	}
 }
+
+func TestAnthropicTypeDefaultsItsAddress(t *testing.T) {
+	d := &snapshot.Deployment{Provider: &snapshot.Provider{Type: "anthropic", AuthMode: "api_key", APIKey: "k"}, APIFlavor: "anthropic", UpstreamName: "claude-x"}
+	req, err := NewRequest(context.Background(), d, "/chat/completions", []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := req.URL.String(); got != "https://api.anthropic.com/v1/messages" {
+		t.Errorf("url = %s", got)
+	}
+	if got := req.Header.Get("x-api-key"); got != "k" {
+		t.Errorf("x-api-key = %q", got)
+	}
+}
+
+// Discovery builds its Provider from a row rather than from the snapshot; every
+// path has to end up with the federation IDs or the exchange goes out empty.
+func TestApplyConfigLoadsFederationIDs(t *testing.T) {
+	p := &snapshot.Provider{AuthMode: "anthropic_wif"}
+	p.ApplyConfig(map[string]any{"federation_rule_id": "fdrl_1", "organization_id": "o", "service_account_id": "svac_1"})
+	if err := ValidateAnthropicWIF(p.WIF); err != nil {
+		t.Fatal(err)
+	}
+}

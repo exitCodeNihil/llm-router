@@ -47,6 +47,7 @@ type PricingMode = "catalog" | "custom";
 
 // Providers whose discovery reports the underlying model, keyed to the price catalog.
 const CATALOG_PREFIX: Partial<Record<ProviderType, string>> = {
+  anthropic: "anthropic",
   azure: "azure",
   gcp_vertex: "gcp",
   openrouter: "openrouter",
