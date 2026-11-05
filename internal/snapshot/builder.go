@@ -184,6 +184,9 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 		if v, ok := cfg["location"].(string); ok {
 			p.Location = v
 		}
+		if p.AuthMode == "anthropic_wif" {
+			p.WIF = AnthropicWIFFromConfig(cfg)
+		}
 		providers[p.ID] = p
 	}
 	if rows.Err() != nil {

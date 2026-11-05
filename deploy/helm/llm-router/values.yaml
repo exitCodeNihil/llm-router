@@ -19,6 +19,12 @@ workspaces:
   ideHost: ""        # with ingress.enabled: adds this host, routed to the IDE listener
   cookieDomain: ""   # only when the console and IDE hosts need a shared session cookie
 
+# Extra env and volumes for the llm-router container, such as the projected token
+# for Anthropic workload identity federation (docs/providers.md).
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []
+
 service:
   type: ClusterIP
   port: 8080

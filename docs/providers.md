@@ -14,6 +14,7 @@ mapped to an upstream name on a provider.
 | Gemini or Claude on Vertex AI | Google Vertex AI | blank | Application Default Credentials, or Service account key (JSON) |
 | OpenRouter | OpenRouter | prefilled | API key |
 | vLLM, LM Studio, Ollama, OpenAI | OpenAI-compatible | `http://host:8000/v1` (include `/v1`) | Bearer token, or No auth |
+| Anthropic, no stored key | OpenAI-compatible | `https://api.anthropic.com` | Anthropic workload identity ([below](#anthropic-without-a-key)) |
 
 Vertex also asks for **Project ID** and **Location** (`global` by default; use a region such as
 `us-east5` if your Claude model is only served there). Stored keys are encrypted with
@@ -67,3 +68,41 @@ The response headers `X-Llmr-Provider` and `X-Llmr-Upstream` show which backend 
   `LLMR_ENCRYPTION_KEY` makes stored keys unreadable and those providers drop out of routing.
 - A direct Anthropic API key can't be added in the console. Use Claude on Vertex or Foundry,
   OpenRouter, or the [subscription pass-through](clients.md#on-your-claudeai-subscription).
+
+## Anthropic without a key
+
+[Workload identity federation](https://platform.claude.com/docs/en/manage-claude/workload-identity-federation)
+replaces the `sk-ant-…` key: each gateway presents a short-lived identity token from its own platform
+and gets a short-lived Anthropic token back. The provider stores no secret, and the control plane sends
+Rust gateways only the IDs below.
+
+1. In the Claude Console, **Settings → Workload identity → Connect workload**, for your platform. Note
+   the rule (`fdrl_…`) and service account (`svac_…`) IDs. Use the `workspace:inference` scope.
+2. **Providers → Add provider**: type *OpenAI-compatible*, Base URL `https://api.anthropic.com`, Auth mode
+   *Anthropic workload identity*, then those IDs and your organization ID.
+3. Add models with `anthropic` flavor and a catalog price (`anthropic/claude-opus-5-5`, for example).
+4. Give every process that serves requests, control plane and gateways, its own identity token: the
+   provider's token file path, or `ANTHROPIC_IDENTITY_TOKEN_FILE`, or `ANTHROPIC_IDENTITY_TOKEN`.
+
+On Kubernetes, a projected token through the chart's `extraVolumes` and `extraVolumeMounts`:
+
+```yaml
+extraVolumes:
+  - name: anthropic-token
+    projected:
+      sources:
+        - serviceAccountToken: {path: token, audience: https://api.anthropic.com, expirationSeconds: 600}
+extraVolumeMounts:
+  - {name: anthropic-token, mountPath: /var/run/secrets/anthropic.com, readOnly: true}
+```
+
+- Tokens are cached and refreshed two minutes before expiry; if that fails the current one keeps serving
+  until 30 seconds before expiry, then requests on that deployment fail over.
+- **Identity tokens with a `jti` claim are single use**, and Kubernetes tokens have one. A restarted
+  process can't reuse the token its predecessor exchanged, so it fails until the file rotates: with
+  `expirationSeconds: 600` that is at most about 8 minutes. To avoid that window, turn off `check_jti` on
+  the issuer, which removes replay protection for every rule on it.
+- A failed exchange answers `Authentication failed` whatever the cause. The reason is in the Console's
+  authentication history.
+- The token source is a file or an environment variable. On AWS outside EKS, Google Cloud metadata or
+  Azure IMDS, have a sidecar write the file.

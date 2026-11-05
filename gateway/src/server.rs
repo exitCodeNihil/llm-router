@@ -81,7 +81,7 @@ thread_local! {
     static UPSTREAM: RefCell<Option<HttpsClient>> = const { RefCell::new(None) };
 }
 
-fn upstream_client() -> HttpsClient {
+pub(crate) fn upstream_client() -> HttpsClient {
     UPSTREAM.with(|c| c.borrow_mut().get_or_insert_with(|| https_client(4096)).clone())
 }
 
@@ -666,13 +666,24 @@ async fn try_deployments(
         attempts += 1;
         // Before the body: an /embeddings body isn't a chat request, so translating
         // it could fail and hide the actual reason.
-        let (url, headers) = match upstream::request_parts(d, path, inbound) {
+        let (url, mut headers) = match upstream::request_parts(d, path, inbound) {
             Ok(v) => v,
             Err(e) => {
                 last_build = Some(e);
                 continue;
             }
         };
+        if let Some(wif) = &d.provider.wif {
+            match wif.bearer().await {
+                Ok(v) => {
+                    headers.insert(header::AUTHORIZATION, v);
+                }
+                Err(e) => {
+                    last_build = Some(BuildError::Unsupported(e));
+                    continue;
+                }
+            }
+        }
         let body = match build(d) {
             Ok(b) => b,
             Err(BadRequest(m)) => return Outcome::BadBody(m),

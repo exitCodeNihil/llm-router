@@ -12,6 +12,7 @@ pub mod server;
 pub mod translate;
 pub mod upstream;
 pub mod usage;
+pub mod wif;
 
 /// Wall-clock milliseconds since the Unix epoch.
 pub fn now_ms() -> i64 {

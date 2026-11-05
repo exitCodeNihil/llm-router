@@ -78,6 +78,8 @@ type Provider struct {
 	APIVersion string `json:"api_version,omitempty"`
 	Project    string `json:"project,omitempty"`
 	Location   string `json:"location,omitempty"`
+	// Each gateway exchanges its own identity token; no credential is sent.
+	WIF *snapshot.AnthropicWIF `json:"wif,omitempty"`
 }
 
 type Deployment struct {
@@ -199,8 +201,13 @@ func buildConfig(s *snapshot.Snapshot, g *snapshot.GatewayGroup) built {
 		}
 	}
 	for _, p := range providers {
-		c.Providers = append(c.Providers, Provider{ID: p.ID, Name: p.Name, Type: p.Type, BaseURL: p.BaseURL,
-			AuthMode: p.AuthMode, APIKey: p.APIKey, APIVersion: p.APIVersion, Project: p.Project, Location: p.Location})
+		wp := Provider{ID: p.ID, Name: p.Name, Type: p.Type, BaseURL: p.BaseURL,
+			AuthMode: p.AuthMode, APIKey: p.APIKey, APIVersion: p.APIVersion, Project: p.Project, Location: p.Location}
+		if p.AuthMode == "anthropic_wif" {
+			wif := p.WIF
+			wp.WIF = &wif
+		}
+		c.Providers = append(c.Providers, wp)
 	}
 	c.Prices = make(map[string]Price, len(s.Prices))
 	for id, p := range s.Prices {

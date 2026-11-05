@@ -103,6 +103,8 @@ pub struct WireProvider {
     pub project: String,
     #[serde(default)]
     pub location: String,
+    #[serde(default)]
+    pub wif: Option<crate::wif::WifConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,6 +230,8 @@ pub enum AuthMode {
     Bearer,
     ApiKey,
     OAuthPassthrough,
+    /// Exchanges this gateway's identity token for short-lived Anthropic tokens.
+    AnthropicWif,
     /// Needs a cloud token the gateway can't mint yet (Entra, GCP).
     Unsupported,
 }
@@ -241,6 +245,7 @@ pub struct Provider {
     pub api_version: String,
     /// The credential header, built once: (name, value).
     pub auth_header: Option<(http::HeaderName, HeaderValue)>,
+    pub wif: Option<Arc<crate::wif::Wif>>,
 }
 
 pub struct Deployment {
@@ -466,6 +471,7 @@ fn provider(p: WireProvider) -> Provider {
         "bearer" => AuthMode::Bearer,
         "api_key" => AuthMode::ApiKey,
         "oauth_passthrough" => AuthMode::OAuthPassthrough,
+        "anthropic_wif" if p.wif.is_some() => AuthMode::AnthropicWif,
         _ => AuthMode::Unsupported,
     };
     let auth_header = match auth_mode {
@@ -482,7 +488,8 @@ fn provider(p: WireProvider) -> Provider {
     } else {
         p.base_url.trim_end_matches('/').to_string()
     };
-    Provider { id: p.id, name: p.name, kind, base_url, auth_mode, api_version: p.api_version, auth_header }
+    let wif = p.wif.filter(|_| auth_mode == AuthMode::AnthropicWif).map(|w| crate::wif::state(&p.id, &base_url, w));
+    Provider { id: p.id, name: p.name, kind, base_url, auth_mode, api_version: p.api_version, auth_header, wif }
 }
 
 fn unhex32(s: &str) -> Option<[u8; 32]> {
