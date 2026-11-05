@@ -78,7 +78,9 @@ docker run -p 8080:8080 \
   ghcr.io/exitcodenihil/llm-router-gateway
 ```
 
-Each gateway joins the group as its own instance and shows up on the Gateways page. Clients use it
+On Kubernetes, add `--set gateway.enabled=true,gateway.joinToken=llmrg_…` to the chart, which runs two
+replicas behind their own service. Each gateway joins the group as its own instance and shows up on the
+Gateways page. Clients use it
 exactly like the control plane's own `/v1`. A group can:
 
 - **serve only some teams.** Their keys, and their members' own keys, work; others get a 401. A
