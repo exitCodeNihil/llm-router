@@ -1,9 +1,4 @@
 {{- if .Values.workspaces.enabled }}
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: {{ .Release.Name }}-llm-router
----
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -32,5 +27,5 @@ roleRef:
   name: {{ .Release.Name }}-llm-router-workspaces
 subjects:
   - kind: ServiceAccount
-    name: {{ .Release.Name }}-llm-router
+    name: {{ include "llm-router.serviceAccountName" . }}
 {{- end }}

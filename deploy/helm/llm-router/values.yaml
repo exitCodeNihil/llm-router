@@ -19,8 +19,49 @@ workspaces:
   ideHost: ""        # with ingress.enabled: adds this host, routed to the IDE listener
   cookieDomain: ""   # only when the console and IDE hosts need a shared session cookie
 
-# Extra env and volumes for the llm-router container, such as the projected token
-# for Anthropic workload identity federation (docs/providers.md).
+# The identity llm-router runs as. Its own account by default, so federation rules
+# can name it. With create: false, name an existing one (default: the namespace's).
+serviceAccount:
+  create: true
+  name: ""           # default: <release>-llm-router
+  annotations: {}
+
+# Anthropic workload identity federation with no key (beta): mounts the pod's service
+# account token and points llm-router and gateways at it. Add the federation IDs to the
+# provider and a rule in the Claude Console (docs/providers.md#on-gke-eks-and-aks-beta).
+anthropicIdentity:
+  enabled: false
+  audience: https://api.anthropic.com
+  expirationSeconds: 600   # 600 to 3600
+
+# Rust gateways (docs/deploy.md#gateways). Create a group on the console's Gateways page
+# and pass its join token here or in existingSecret (key: join-token).
+gateway:
+  enabled: false
+  image:
+    repository: ghcr.io/exitcodenihil/llm-router-gateway
+    tag: ""          # defaults to appVersion
+    pullPolicy: IfNotPresent
+  replicas: 2
+  joinToken: ""
+  existingSecret: ""
+  controlPlaneUrl: ""  # default: this release's llm-router service
+  serviceAccount:
+    create: true
+    name: ""         # default: <release>-llm-router-gateway
+    annotations: {}
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
+  service:
+    type: ClusterIP
+    port: 8080
+  resources:
+    requests:
+      cpu: 250m
+      memory: 128Mi
+
+# Extra env and volumes for the llm-router container.
 extraEnv: []
 extraVolumes: []
 extraVolumeMounts: []
