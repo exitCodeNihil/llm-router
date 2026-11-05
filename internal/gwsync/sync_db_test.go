@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -91,7 +92,7 @@ func TestSyncAgainstPostgres(t *testing.T) {
 
 	ev := func(key, team string) SyncEvent {
 		return SyncEvent{Event: usage.Event{RequestID: uuid.NewString(), APIKeyID: key, TeamID: team, ModelName: "m",
-			CostUSD: 0.25, StatusCode: 200}, TSMS: 1_790_000_000_000}
+			CostUSD: 0.25, StatusCode: 200}, TSMS: time.Now().UnixMilli()}
 	}
 	batch := SyncRequest{Batch: 1, Events: []SyncEvent{ev(keyID, teamA), ev(uuid.NewString(), teamB)},
 		Rates: []RateDelta{{Scope: "key:" + keyID, Minute: 1, Requests: 3}}}

@@ -731,6 +731,12 @@ func (m *Server) createProvider(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.AuthMode == "anthropic_wif" {
+		if err := provider.ValidateAnthropicWIF(snapshot.AnthropicWIFFromConfig(req.Config)); err != nil {
+			httpError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 	id := uuid.New()
 	_, err := m.Store.Pool.Exec(r.Context(), `
 		INSERT INTO providers (id, name, type, base_url, auth_mode, api_key_enc, config)

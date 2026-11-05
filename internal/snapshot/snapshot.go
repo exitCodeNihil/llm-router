@@ -68,11 +68,29 @@ type Provider struct {
 	Name       string
 	Type       string // azure | openai_compatible | gcp_vertex
 	BaseURL    string
-	AuthMode   string // entra | api_key | bearer | none | oauth_passthrough | gcp_adc | gcp_sa
+	AuthMode   string // entra | api_key | bearer | none | oauth_passthrough | gcp_adc | gcp_sa | anthropic_wif
 	APIKey     string // decrypted; the service account JSON for gcp_sa
 	APIVersion string // azure only
 	Project    string // gcp_vertex only
 	Location   string // gcp_vertex only, e.g. us-east5 or global
+	WIF        AnthropicWIF
+}
+
+// AnthropicWIF identifies a federation rule in the Claude Console. None of it is
+// secret; the credential is the identity token on the machine serving the request.
+type AnthropicWIF struct {
+	FederationRuleID  string `json:"federation_rule_id"`
+	OrganizationID    string `json:"organization_id"`
+	ServiceAccountID  string `json:"service_account_id"`
+	WorkspaceID       string `json:"workspace_id,omitempty"`
+	IdentityTokenFile string `json:"identity_token_file,omitempty"`
+}
+
+// AnthropicWIFFromConfig reads the settings from a provider's config column.
+func AnthropicWIFFromConfig(cfg map[string]any) AnthropicWIF {
+	s := func(k string) string { v, _ := cfg[k].(string); return v }
+	return AnthropicWIF{FederationRuleID: s("federation_rule_id"), OrganizationID: s("organization_id"),
+		ServiceAccountID: s("service_account_id"), WorkspaceID: s("workspace_id"), IdentityTokenFile: s("identity_token_file")}
 }
 
 type Deployment struct {

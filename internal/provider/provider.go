@@ -269,6 +269,12 @@ func applyAuth(ctx context.Context, req *http.Request, p *snapshot.Provider, ant
 		}
 	case "bearer":
 		req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	case "anthropic_wif":
+		tok, err := anthropicWIFToken(ctx, p)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
 	case "oauth_passthrough":
 		// The caller brings its own upstream credential — Claude Code sends the
 		// subscription OAuth token it already holds — so forward it untouched and

@@ -78,7 +78,8 @@ pub fn request_parts(d: &Deployment, path: &str, inbound: &Inbound) -> Result<(S
         }
     }
     match p.auth_mode {
-        AuthMode::None => {}
+        // The caller adds it: getting one can mean waiting on an exchange.
+        AuthMode::None | AuthMode::AnthropicWif => {}
         AuthMode::Bearer => {
             if let Some((name, value)) = &p.auth_header {
                 h.insert(name.clone(), value.clone());

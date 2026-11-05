@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/exitcodenihil/llm-router/internal/console"
+	"github.com/exitcodenihil/llm-router/internal/provider"
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
 )
 
@@ -235,8 +236,8 @@ func (m *Server) patchProvider(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// vertexPatchValid checks the row a patch would produce, so a Vertex provider
-// cannot be edited into one the gateway answers 500 for on every request.
+// vertexPatchValid checks the row a patch would produce, so a Vertex or federated
+// provider cannot be edited into one the gateway answers 500 for on every request.
 func (m *Server) vertexPatchValid(w http.ResponseWriter, r *http.Request, id uuid.UUID, fields map[string]json.RawMessage) bool {
 	_, modeChange := fields["auth_mode"]
 	_, cfgChange := fields["config"]
@@ -250,16 +251,20 @@ func (m *Server) vertexPatchValid(w http.ResponseWriter, r *http.Request, id uui
 		httpError(w, http.StatusNotFound, "provider not found")
 		return false
 	}
-	if typ != "gcp_vertex" {
-		return true
-	}
 	if raw, ok := fields["auth_mode"]; ok {
 		json.Unmarshal(raw, &mode)
 	}
 	if raw, ok := fields["config"]; ok {
 		json.Unmarshal(raw, &cfg)
 	}
-	if err := validateVertexConfig(mode, cfg); err != nil {
+	var err error
+	switch {
+	case typ == "gcp_vertex":
+		err = validateVertexConfig(mode, cfg)
+	case mode == "anthropic_wif":
+		err = provider.ValidateAnthropicWIF(snapshot.AnthropicWIFFromConfig(cfg))
+	}
+	if err != nil {
 		httpError(w, http.StatusBadRequest, err.Error())
 		return false
 	}

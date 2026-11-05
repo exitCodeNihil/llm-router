@@ -32,6 +32,7 @@ const AUTH_MODES: Record<ProviderType, { value: string; label: string; needsKey:
   ],
   openai_compatible: [
     { value: "bearer", label: "Bearer token", needsKey: true },
+    { value: "anthropic_wif", label: "Anthropic workload identity (no key)", needsKey: false },
     { value: "oauth_passthrough", label: "Forward the caller's token", needsKey: false },
     { value: "none", label: "No auth", needsKey: false },
   ],
@@ -70,6 +71,14 @@ function ProviderForm({ editing, onClose }: { editing: Provider | null; onClose:
   const [apiVersion, setApiVersion] = useState((editing?.config?.api_version as string) ?? "");
   const [project, setProject] = useState((editing?.config?.project as string) ?? "");
   const [location, setLocation] = useState((editing?.config?.location as string) ?? "global");
+  const [wif, setWif] = useState({
+    federation_rule_id: (editing?.config?.federation_rule_id as string) ?? "",
+    organization_id: (editing?.config?.organization_id as string) ?? "",
+    service_account_id: (editing?.config?.service_account_id as string) ?? "",
+    workspace_id: (editing?.config?.workspace_id as string) ?? "",
+    identity_token_file: (editing?.config?.identity_token_file as string) ?? "",
+  });
+  const setWifField = (k: keyof typeof wif) => (v: string) => setWif((w) => ({ ...w, [k]: v }));
 
   const modes = AUTH_MODES[type];
   const needsKey = modes.find((m) => m.value === authMode)?.needsKey ?? false;
@@ -95,7 +104,9 @@ function ProviderForm({ editing, onClose }: { editing: Provider | null; onClose:
         ? { api_version: apiVersion.trim() }
         : type === "gcp_vertex"
           ? { project: project.trim(), location: location.trim() || "global" }
-          : undefined;
+          : authMode === "anthropic_wif"
+            ? Object.fromEntries(Object.entries(wif).map(([k, v]) => [k, v.trim()]).filter(([, v]) => v))
+            : undefined;
     // Vertex derives its host from the location server-side; only an explicit
     // private endpoint is stored, so a later region change cannot go stale.
     const url = baseUrl.trim();
@@ -170,7 +181,9 @@ function ProviderForm({ editing, onClose }: { editing: Provider | null; onClose:
             value={authMode}
             onChange={setAuthMode}
             description={
-              authMode === "oauth_passthrough"
+              authMode === "anthropic_wif"
+                ? "No key to store or leak: each gateway exchanges its own identity token for a short-lived Anthropic token. Set up the rule in the Claude Console under Settings, Workload identity."
+                : authMode === "oauth_passthrough"
                 ? "The caller's Authorization header travels upstream. Clients send their gateway key as X-Llmr-Key instead."
                 : authMode === "gcp_adc"
                   ? "The attached service account, workload identity, or `gcloud auth application-default login` on the gateway host."
@@ -186,6 +199,48 @@ function ProviderForm({ editing, onClose }: { editing: Provider | null; onClose:
             title="Not available in the Playground or workspaces"
             description="Models on this provider only work for clients that send their own login, such as Claude Code. The Playground and workspace agents have none to forward."
           />
+        )}
+
+        {authMode === "anthropic_wif" && (
+          <Grid columns={{ minWidth: 200, repeat: "fit" }} gap={3}>
+            <TextInput
+              label="Federation rule ID"
+              value={wif.federation_rule_id}
+              onChange={setWifField("federation_rule_id")}
+              placeholder="fdrl_…"
+              isRequired
+            />
+            <TextInput
+              label="Service account ID"
+              value={wif.service_account_id}
+              onChange={setWifField("service_account_id")}
+              placeholder="svac_…"
+              isRequired
+            />
+            <TextInput
+              label="Organization ID"
+              value={wif.organization_id}
+              onChange={setWifField("organization_id")}
+              placeholder="00000000-0000-0000-0000-000000000000"
+              isRequired
+            />
+            <TextInput
+              label="Workspace ID"
+              value={wif.workspace_id}
+              onChange={setWifField("workspace_id")}
+              placeholder="wrkspc_…"
+              description="Needed when the rule covers more than one workspace"
+              isOptional
+            />
+            <TextInput
+              label="Identity token file"
+              value={wif.identity_token_file}
+              onChange={setWifField("identity_token_file")}
+              placeholder="/var/run/secrets/anthropic.com/token"
+              description="On every gateway. Blank uses ANTHROPIC_IDENTITY_TOKEN_FILE or ANTHROPIC_IDENTITY_TOKEN"
+              isOptional
+            />
+          </Grid>
         )}
 
         {isVertex && (
@@ -216,7 +271,9 @@ function ProviderForm({ editing, onClose }: { editing: Provider | null; onClose:
               ? "https://my-resource.openai.azure.com"
               : isVertex
                 ? vertexHost(location)
-                : "http://vllm:8000/v1"
+                : authMode === "anthropic_wif"
+                  ? "https://api.anthropic.com"
+                  : "http://vllm:8000/v1"
           }
           description={urlHint}
           isRequired={!isVertex}

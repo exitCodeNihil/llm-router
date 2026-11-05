@@ -45,11 +45,20 @@ spec:
               value: {{ . | quote }}
             {{- end }}
             {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.extraVolumeMounts }}
+          volumeMounts: {{- toYaml . | nindent 12 }}
+          {{- end }}
           livenessProbe:
             httpGet: {path: /healthz, port: 8080}
           readinessProbe:
             httpGet: {path: /healthz, port: 8080}
           resources: {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.extraVolumes }}
+      volumes: {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}
