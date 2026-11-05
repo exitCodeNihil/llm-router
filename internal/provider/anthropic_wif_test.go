@@ -107,8 +107,12 @@ func TestWIFOneExchangeForConcurrentRequests(t *testing.T) {
 
 func TestWIFAdvisoryFailureKeepsServing(t *testing.T) {
 	srv, hits, _ := wifStub(t, wifReply{200, 100}, wifReply{401, 0})
-	p, _ := wifProvider(t, srv.URL, "aaa.bbb.ccc")
-	for i, wantHits := range []int64{1, 2, 2} { // 100 s left: tried once, then not again at once
+	p, path := wifProvider(t, srv.URL, "aaa.bbb.ccc")
+	if _, err := anthropicWIFToken(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(path, []byte("ddd.eee.fff"), 0o600)
+	for i, wantHits := range []int64{2, 2} { // 100 s left: tried once, then not again at once
 		tok, err := anthropicWIFToken(context.Background(), p)
 		if err != nil || tok != "sk-ant-oat01-0" {
 			t.Fatalf("call %d: %q, %v", i, tok, err)
@@ -116,6 +120,46 @@ func TestWIFAdvisoryFailureKeepsServing(t *testing.T) {
 		if hits.Load() != wantHits {
 			t.Fatalf("call %d: exchanges = %d, want %d", i, hits.Load(), wantHits)
 		}
+	}
+}
+
+func TestWIFDoesNotResendAnUnrotatedToken(t *testing.T) {
+	srv, hits, _ := wifStub(t, wifReply{200, 100}, wifReply{401, 0})
+	p, _ := wifProvider(t, srv.URL, "aaa.bbb.ccc")
+	for i := range 3 {
+		tok, err := anthropicWIFToken(context.Background(), p)
+		if err != nil || tok != "sk-ant-oat01-0" {
+			t.Fatalf("call %d: %q, %v", i, tok, err)
+		}
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("exchanges = %d, want 1: the file hasn't rotated, so a resend is only a replay", hits.Load())
+	}
+}
+
+func TestWIFUnrotatedTokenIsSentNearExpiry(t *testing.T) {
+	// An issuer with check_jti off accepts the same token again.
+	srv, hits, _ := wifStub(t, wifReply{200, 10}, wifReply{200, 3600})
+	p, _ := wifProvider(t, srv.URL, "aaa.bbb.ccc")
+	anthropicWIFToken(context.Background(), p)
+	tok, err := anthropicWIFToken(context.Background(), p)
+	if err != nil || tok != "sk-ant-oat01-1" || hits.Load() != 2 {
+		t.Fatalf("%q, %v, exchanges = %d", tok, err, hits.Load())
+	}
+}
+
+func TestWIFProvidersWithTheSameSettingsShareAToken(t *testing.T) {
+	srv, hits, _ := wifStub(t, wifReply{200, 3600})
+	p, _ := wifProvider(t, srv.URL, "aaa.bbb.ccc")
+	other := *p
+	other.ID = "another"
+	for _, prov := range []*snapshot.Provider{p, &other} {
+		if tok, err := anthropicWIFToken(context.Background(), prov); err != nil || tok != "sk-ant-oat01-0" {
+			t.Fatalf("%q, %v", tok, err)
+		}
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("exchanges = %d, want 1: a single-use identity token can't be sent twice", hits.Load())
 	}
 }
 

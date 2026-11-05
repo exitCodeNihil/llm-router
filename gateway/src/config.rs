@@ -488,7 +488,7 @@ fn provider(p: WireProvider) -> Provider {
         "anthropic" if p.base_url.is_empty() => "https://api.anthropic.com".to_string(),
         _ => p.base_url.trim_end_matches('/').to_string(),
     };
-    let wif = p.wif.filter(|_| auth_mode == AuthMode::AnthropicWif).map(|w| crate::wif::state(&p.id, &base_url, w));
+    let wif = p.wif.filter(|_| auth_mode == AuthMode::AnthropicWif).map(|w| crate::wif::state(&base_url, w));
     Provider { id: p.id, name: p.name, kind, base_url, auth_mode, api_version: p.api_version, auth_header, wif }
 }
 

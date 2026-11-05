@@ -3,6 +3,7 @@ package provider
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,22 +46,25 @@ type wifToken struct {
 type wifState struct {
 	current atomic.Pointer[wifToken]
 
-	refresh sync.Mutex // one exchange at a time; guards the two fields below
-	retryAt time.Time
-	lastErr error
+	refresh   sync.Mutex // one exchange at a time; guards the fields below
+	retryAt   time.Time
+	lastErr   error
+	used      [sha256.Size]byte // the identity token behind current
+	recheckAt time.Time         // when to look at the file again
 }
 
 // wifStates outlives config reloads: a reload builds new Provider values, and
 // exchanging again for each one would burn single-use identity tokens.
-var wifStates sync.Map // providerID + config -> *wifState
+var wifStates sync.Map // base URL + config -> *wifState
 
 func wifStateFor(p *snapshot.Provider) *wifState {
-	// The base URL is part of it: a repointed provider must not receive a token
-	// minted for the old address.
+	// Providers with the same settings share a token, since exchanging for each
+	// would burn one identity token twice. The base URL is part of it: a repointed
+	// provider must not receive a token minted for the old address.
 	key := struct {
-		id, base string
-		cfg      snapshot.AnthropicWIF
-	}{p.ID, p.BaseURL, p.WIF}
+		base string
+		cfg  snapshot.AnthropicWIF
+	}{BaseURL(p), p.WIF}
 	st, _ := wifStates.LoadOrStore(key, &wifState{})
 	return st.(*wifState)
 }
@@ -97,9 +101,24 @@ func anthropicWIFToken(ctx context.Context, p *snapshot.Provider) (string, error
 		}
 		return "", st.lastErr
 	}
-	// Not the request's context: a client hanging up must not waste an exchange
-	// the next request is waiting for.
-	next, err := exchangeWIF(context.WithoutCancel(ctx), p)
+	if usable && time.Now().Before(st.recheckAt) {
+		return cur.token, nil
+	}
+	assertion, err := identityToken(p.WIF.IdentityTokenFile)
+	sum := sha256.Sum256([]byte(assertion))
+	// The file hasn't rotated yet. Sending it again would only be refused as a
+	// replay, so wait while the current token lasts. Near expiry it is sent anyway,
+	// since an issuer with check_jti off accepts it.
+	if err == nil && usable && sum == st.used {
+		st.recheckAt = time.Now().Add(wifRetryAfter)
+		return cur.token, nil
+	}
+	var next *wifToken
+	if err == nil {
+		// Not the request's context: a client hanging up must not waste an exchange
+		// the next request is waiting for.
+		next, err = exchangeWIF(context.WithoutCancel(ctx), p, assertion)
+	}
 	if err != nil {
 		st.retryAt, st.lastErr = time.Now().Add(wifRetryAfter), err
 		slog.Warn("anthropic workload identity exchange failed", "provider", p.Name, "err", err)
@@ -108,16 +127,13 @@ func anthropicWIFToken(ctx context.Context, p *snapshot.Provider) (string, error
 		}
 		return "", err
 	}
+	st.used = sum
 	st.current.Store(next)
 	return next.token, nil
 }
 
-func exchangeWIF(ctx context.Context, p *snapshot.Provider) (*wifToken, error) {
+func exchangeWIF(ctx context.Context, p *snapshot.Provider, assertion string) (*wifToken, error) {
 	endpoint, err := wifEndpoint(BaseURL(p))
-	if err != nil {
-		return nil, err
-	}
-	assertion, err := identityToken(p.WIF.IdentityTokenFile)
 	if err != nil {
 		return nil, err
 	}

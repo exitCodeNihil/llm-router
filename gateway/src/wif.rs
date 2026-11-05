@@ -44,20 +44,30 @@ struct Failure {
     message: String,
 }
 
+#[derive(Default)]
+struct Refresh {
+    failure: Option<Failure>,
+    /// A hash of the identity token behind `current`.
+    used: Option<u64>,
+    /// When to look at the file again.
+    recheck_at: Option<Instant>,
+}
+
 pub struct Wif {
     cfg: WifConfig,
     base_url: String,
     current: ArcSwapOption<Token>,
-    /// One exchange at a time; holds the last refusal.
-    refresh: tokio::sync::Mutex<Option<Failure>>,
+    /// One exchange at a time.
+    refresh: tokio::sync::Mutex<Refresh>,
 }
 
 /// Outlives config reloads: a reload builds new providers, and exchanging again
-/// for each one would burn single-use identity tokens.
-pub fn state(provider_id: &str, base_url: &str, cfg: WifConfig) -> Arc<Wif> {
-    type Key = (String, String, WifConfig);
+/// for each one would burn single-use identity tokens. Providers with the same
+/// settings share a token for the same reason.
+pub fn state(base_url: &str, cfg: WifConfig) -> Arc<Wif> {
+    type Key = (String, WifConfig);
     static STATES: OnceLock<Mutex<HashMap<Key, Arc<Wif>>>> = OnceLock::new();
-    let key = (provider_id.to_string(), base_url.to_string(), cfg.clone());
+    let key = (base_url.to_string(), cfg.clone());
     let mut states = STATES.get_or_init(Default::default).lock().unwrap();
     states
         .entry(key)
@@ -66,7 +76,7 @@ pub fn state(provider_id: &str, base_url: &str, cfg: WifConfig) -> Arc<Wif> {
                 cfg,
                 base_url: base_url.to_string(),
                 current: ArcSwapOption::empty(),
-                refresh: tokio::sync::Mutex::new(None),
+                refresh: tokio::sync::Mutex::default(),
             })
         })
         .clone()
@@ -96,29 +106,45 @@ impl Wif {
             return Ok(cur.unwrap().header.clone());
         }
         let usable = left(&cur) > MANDATORY_REFRESH;
-        if let Some(f) = guard.as_ref()
+        if let Some(f) = guard.failure.as_ref()
             && Instant::now() < f.retry_at
         {
             return if usable { Ok(cur.unwrap().header.clone()) } else { Err(f.message.clone()) };
         }
-        match self.exchange().await {
+        if usable && guard.recheck_at.is_some_and(|at| Instant::now() < at) {
+            return Ok(cur.unwrap().header.clone());
+        }
+        let assertion = identity_token(&self.cfg.identity_token_file);
+        let hash = assertion.as_deref().ok().map(hash_token);
+        // The file hasn't rotated yet. Sending it again would only be refused as a
+        // replay, so wait while the current token lasts. Near expiry it is sent
+        // anyway, since an issuer with check_jti off accepts it.
+        if usable && hash.is_some() && hash == guard.used {
+            guard.recheck_at = Some(Instant::now() + RETRY_AFTER);
+            return Ok(cur.unwrap().header.clone());
+        }
+        let exchanged = match assertion {
+            Ok(a) => self.exchange(a).await,
+            Err(e) => Err(e),
+        };
+        match exchanged {
             Ok(t) => {
                 let header = t.header.clone();
                 self.current.store(Some(Arc::new(t)));
-                *guard = None;
+                guard.failure = None;
+                guard.used = hash;
                 Ok(header)
             }
             Err(message) => {
                 eprintln!("anthropic workload identity exchange failed: {message}");
-                *guard = Some(Failure { retry_at: Instant::now() + RETRY_AFTER, message: message.clone() });
+                guard.failure = Some(Failure { retry_at: Instant::now() + RETRY_AFTER, message: message.clone() });
                 if usable { Ok(cur.unwrap().header.clone()) } else { Err(message) }
             }
         }
     }
 
-    async fn exchange(&self) -> Result<Token, String> {
+    async fn exchange(&self, assertion: String) -> Result<Token, String> {
         let endpoint = endpoint(&self.base_url)?;
-        let assertion = identity_token(&self.cfg.identity_token_file)?;
         let mut grant = serde_json::json!({
             "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
             "assertion": assertion,
@@ -210,6 +236,13 @@ fn identity_token(path: &str) -> Result<String, String> {
     Ok(token.to_string())
 }
 
+fn hash_token(token: &str) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    token.hash(&mut h);
+    h.finish()
+}
+
 fn is_jwt_shape(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
     parts.len() == 3
@@ -286,7 +319,7 @@ mod tests {
             },
             base_url: url.into(),
             current: ArcSwapOption::empty(),
-            refresh: tokio::sync::Mutex::new(None),
+            refresh: tokio::sync::Mutex::default(),
         }
     }
 
@@ -309,12 +342,42 @@ mod tests {
     #[tokio::test]
     async fn advisory_refresh_failure_keeps_serving_the_token() {
         let (url, hits, _) = stub(vec![(200, 100), (401, 0)]).await;
-        let w = wif(&url, &file("advisory", "aaa.bbb.ccc"));
+        let path = file("advisory", "aaa.bbb.ccc");
+        let w = wif(&url, &path);
         assert_eq!(w.bearer().await.unwrap(), "Bearer sk-ant-oat01-0");
+        std::fs::write(&path, "ddd.eee.fff").unwrap();
         assert_eq!(w.bearer().await.unwrap(), "Bearer sk-ant-oat01-0"); // 100 s left: tried, refused
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         assert_eq!(w.bearer().await.unwrap(), "Bearer sk-ant-oat01-0"); // and not tried again at once
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn does_not_resend_an_unrotated_token() {
+        let (url, hits, _) = stub(vec![(200, 100), (401, 0)]).await;
+        let w = wif(&url, &file("unrotated", "aaa.bbb.ccc"));
+        for _ in 0..3 {
+            assert_eq!(w.bearer().await.unwrap(), "Bearer sk-ant-oat01-0");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unrotated_token_is_sent_near_expiry() {
+        // An issuer with check_jti off accepts the same token again.
+        let (url, hits, _) = stub(vec![(200, 10), (200, 3600)]).await;
+        let w = wif(&url, &file("nearexpiry", "aaa.bbb.ccc"));
+        w.bearer().await.unwrap();
+        assert_eq!(w.bearer().await.unwrap(), "Bearer sk-ant-oat01-1");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn same_settings_share_one_state() {
+        let cfg = WifConfig { federation_rule_id: "fdrl_shared".into(), ..Default::default() };
+        let a = state("https://a.example", cfg.clone());
+        assert!(Arc::ptr_eq(&a, &state("https://a.example", cfg.clone())));
+        assert!(!Arc::ptr_eq(&a, &state("https://b.example", cfg)));
     }
 
     #[tokio::test]
