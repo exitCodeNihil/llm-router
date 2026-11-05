@@ -1,0 +1,80 @@
+{{- if .Values.gateway.enabled }}
+{{- $fullname := printf "%s-llm-router-gateway" .Release.Name }}
+{{- if not .Values.gateway.existingSecret }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $fullname }}
+type: Opaque
+stringData:
+  join-token: {{ required "gateway.joinToken (or gateway.existingSecret) is required: create a group on the console's Gateways page" .Values.gateway.joinToken | quote }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  labels: &labels
+    app.kubernetes.io/name: llm-router-gateway
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.gateway.replicas }}
+  selector:
+    matchLabels: *labels
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      serviceAccountName: {{ include "llm-router.gatewayServiceAccountName" . }}
+      containers:
+        - name: gateway
+          image: "{{ .Values.gateway.image.repository }}:{{ .Values.gateway.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
+          ports:
+            - containerPort: 8080
+          env:
+            - name: LLMR_CONTROL_PLANE_URL
+              value: {{ .Values.gateway.controlPlaneUrl | default (printf "http://%s-llm-router:%v" .Release.Name .Values.service.port) | quote }}
+            - name: LLMR_JOIN_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ .Values.gateway.existingSecret | default $fullname }}, key: join-token}}
+            {{- if .Values.anthropicIdentity.enabled }}
+            {{- include "llm-router.anthropicIdentityEnv" . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.gateway.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if or .Values.anthropicIdentity.enabled .Values.gateway.extraVolumeMounts }}
+          volumeMounts:
+            {{- if .Values.anthropicIdentity.enabled }}
+            {{- include "llm-router.anthropicIdentityMount" . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.gateway.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8080}
+          resources: {{- toYaml .Values.gateway.resources | nindent 12 }}
+      {{- if or .Values.anthropicIdentity.enabled .Values.gateway.extraVolumes }}
+      volumes:
+        {{- if .Values.anthropicIdentity.enabled }}
+        {{- include "llm-router.anthropicIdentityVolume" . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.gateway.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+spec:
+  type: {{ .Values.gateway.service.type }}
+  selector:
+    app.kubernetes.io/name: llm-router-gateway
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - port: {{ .Values.gateway.service.port }}
+      targetPort: 8080
+{{- end }}

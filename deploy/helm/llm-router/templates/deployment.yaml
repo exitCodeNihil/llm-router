@@ -14,9 +14,7 @@ spec:
       labels: *labels
     spec:
       {{- $ws := .Values.workspaces.enabled }}
-      {{- if $ws }}
-      serviceAccountName: {{ .Release.Name }}-llm-router
-      {{- end }}
+      serviceAccountName: {{ include "llm-router.serviceAccountName" . }}
       containers:
         - name: llm-router
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
@@ -45,19 +43,34 @@ spec:
               value: {{ . | quote }}
             {{- end }}
             {{- end }}
+            {{- if .Values.anthropicIdentity.enabled }}
+            {{- include "llm-router.anthropicIdentityEnv" . | nindent 12 }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          {{- with .Values.extraVolumeMounts }}
-          volumeMounts: {{- toYaml . | nindent 12 }}
+          {{- if or .Values.anthropicIdentity.enabled .Values.extraVolumeMounts }}
+          volumeMounts:
+            {{- if .Values.anthropicIdentity.enabled }}
+            {{- include "llm-router.anthropicIdentityMount" . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
           livenessProbe:
             httpGet: {path: /healthz, port: 8080}
           readinessProbe:
             httpGet: {path: /healthz, port: 8080}
           resources: {{- toYaml .Values.resources | nindent 12 }}
-      {{- with .Values.extraVolumes }}
-      volumes: {{- toYaml . | nindent 8 }}
+      {{- if or .Values.anthropicIdentity.enabled .Values.extraVolumes }}
+      volumes:
+        {{- if .Values.anthropicIdentity.enabled }}
+        {{- include "llm-router.anthropicIdentityVolume" . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
