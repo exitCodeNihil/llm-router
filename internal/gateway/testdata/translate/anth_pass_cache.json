@@ -5,6 +5,7 @@
   "usage": {
     "prompt": 1144,
     "completion": 4,
-    "cached": 40
+    "cached": 40,
+    "write_5m": 1096
   }
 }

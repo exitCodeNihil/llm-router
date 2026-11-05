@@ -215,14 +215,17 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 	if rows.Err() != nil {
 		return nil, rows.Err()
 	}
-	rows, err = b.Pool.Query(ctx, `SELECT model_id, input_per_1m, output_per_1m, cached_input_per_1m FROM price_catalog`)
+	rows, err = b.Pool.Query(ctx, `
+		SELECT model_id, input_per_1m, output_per_1m, cached_input_per_1m,
+		       coalesce(long_prompt_tokens, 0), coalesce(long_prompt_multiplier, 1)
+		FROM price_catalog`)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var id string
 		var p Price
-		if err := rows.Scan(&id, &p.InputPer1M, &p.OutputPer1M, &p.CachedInputPer1M); err != nil {
+		if err := rows.Scan(&id, &p.InputPer1M, &p.OutputPer1M, &p.CachedInputPer1M, &p.LongPromptTokens, &p.LongPromptMultiplier); err != nil {
 			return nil, err
 		}
 		s.Prices[id] = p

@@ -32,9 +32,13 @@ type golden struct {
 }
 
 type goldenUsage struct {
-	Prompt     int `json:"prompt"`
-	Completion int `json:"completion"`
-	Cached     int `json:"cached"`
+	Prompt     int  `json:"prompt"`
+	Completion int  `json:"completion"`
+	Cached     int  `json:"cached"`
+	Write5m    int  `json:"write_5m,omitempty"`
+	Write1h    int  `json:"write_1h,omitempty"`
+	US         bool `json:"us,omitempty"`
+	Fast       bool `json:"fast,omitempty"`
 }
 
 func TestGoldenTranslate(t *testing.T) {
@@ -143,7 +147,8 @@ func goldenError(err error) string {
 }
 
 func usageOf(c usageCounts) *goldenUsage {
-	return &goldenUsage{Prompt: c.Prompt, Completion: c.Completion, Cached: c.Cached}
+	return &goldenUsage{Prompt: c.Prompt, Completion: c.Completion, Cached: c.Cached,
+		Write5m: c.Write5m, Write1h: c.Write1h, US: c.USInference, Fast: c.Fast}
 }
 
 func encodeGolden(t *testing.T, g golden) []byte {

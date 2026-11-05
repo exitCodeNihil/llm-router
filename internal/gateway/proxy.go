@@ -26,6 +26,10 @@ type usageCounts struct {
 	Prompt     int
 	Completion int
 	Cached     int
+	// Parts of Prompt that cost more than plain input, and the request options
+	// that raise every rate. Only Anthropic upstreams report them.
+	Write5m, Write1h  int
+	USInference, Fast bool
 	// TTFTMs is set by the streaming paths; 0 for buffered responses.
 	TTFTMs int
 }
@@ -474,6 +478,8 @@ func (g *Server) emit(snap *snapshot.Snapshot, id *auth.Identity, d *snapshot.De
 		PromptTokens:     counts.Prompt,
 		CompletionTokens: counts.Completion,
 		CachedTokens:     counts.Cached,
+		CacheWrite5m:     counts.Write5m,
+		CacheWrite1h:     counts.Write1h,
 		LatencyMS:        int(time.Since(start).Milliseconds()),
 		StatusCode:       status,
 		Stream:           body.Stream,
@@ -496,10 +502,12 @@ func (g *Server) emit(snap *snapshot.Snapshot, id *auth.Identity, d *snapshot.De
 	if d != nil {
 		e.DeploymentID = d.ID
 		e.ProviderID = d.Provider.ID
-		e.CostUSD, e.Unpriced = pricing.Cost(snap, d, counts.Prompt, counts.Completion, counts.Cached)
+		tokens := pricing.Tokens{Prompt: counts.Prompt, Completion: counts.Completion, Cached: counts.Cached,
+			Write5m: counts.Write5m, Write1h: counts.Write1h, USInference: counts.USInference, Fast: counts.Fast}
+		e.CostUSD, e.Unpriced = pricing.Cost(snap, d, tokens)
 		if e.Unpriced {
 			// No real money changed hands, but the tokens still have a list value.
-			e.NotionalCostUSD = pricing.Notional(snap, d, counts.Prompt, counts.Completion, counts.Cached)
+			e.NotionalCostUSD = pricing.Notional(snap, d, e.ModelName, tokens)
 		}
 	}
 	g.Usage.Write(e)

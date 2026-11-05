@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -101,7 +102,7 @@ func (g *Server) authenticate(next http.Handler) http.Handler {
 
 		if g.Limits != nil {
 			if ok, status, code, msg := g.Limits.Check(id, snap); !ok {
-				writeError(w, status, "insufficient_quota", code, msg)
+				writeLimitError(w, status, code, msg)
 				// A denial used to leave no trace at all, so "how often is this
 				// key throttled" was unanswerable. The check runs before the body
 				// is parsed, so model_name is necessarily blank here.
@@ -134,7 +135,7 @@ func (g *Server) ServeAuthed(w http.ResponseWriter, r *http.Request, id *auth.Id
 	}
 	if g.Limits != nil {
 		if ok, status, code, msg := g.Limits.Check(id, snap); !ok {
-			writeError(w, status, "insufficient_quota", code, msg)
+			writeLimitError(w, status, code, msg)
 			return
 		}
 	}
@@ -221,4 +222,13 @@ func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	// The status was never written through us, so record what an upgrade is.
 	w.status = http.StatusSwitchingProtocols
 	return h.Hijack()
+}
+
+// writeLimitError refuses a request over a limit. A rate limit's sliding window
+// frees up by the next minute at the latest; a budget has nothing to wait for.
+func writeLimitError(w http.ResponseWriter, status int, code, msg string) {
+	if code == "rate_limit_exceeded" {
+		w.Header().Set("Retry-After", strconv.Itoa(60-time.Now().Second()))
+	}
+	writeError(w, status, "insufficient_quota", code, msg)
 }

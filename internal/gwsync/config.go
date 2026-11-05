@@ -94,9 +94,11 @@ type Deployment struct {
 }
 
 type Price struct {
-	InputPer1M       float64  `json:"input_per_1m"`
-	OutputPer1M      float64  `json:"output_per_1m"`
-	CachedInputPer1M *float64 `json:"cached_input_per_1m,omitempty"`
+	InputPer1M           float64  `json:"input_per_1m"`
+	OutputPer1M          float64  `json:"output_per_1m"`
+	CachedInputPer1M     *float64 `json:"cached_input_per_1m,omitempty"`
+	LongPromptTokens     int      `json:"long_prompt_tokens,omitempty"`
+	LongPromptMultiplier float64  `json:"long_prompt_multiplier,omitempty"`
 }
 
 // built is a group's config plus what the sync handler needs to check the
@@ -202,7 +204,8 @@ func buildConfig(s *snapshot.Snapshot, g *snapshot.GatewayGroup) built {
 	}
 	c.Prices = make(map[string]Price, len(s.Prices))
 	for id, p := range s.Prices {
-		c.Prices[id] = Price{InputPer1M: p.InputPer1M, OutputPer1M: p.OutputPer1M, CachedInputPer1M: p.CachedInputPer1M}
+		c.Prices[id] = Price{InputPer1M: p.InputPer1M, OutputPer1M: p.OutputPer1M, CachedInputPer1M: p.CachedInputPer1M,
+			LongPromptTokens: p.LongPromptTokens, LongPromptMultiplier: p.LongPromptMultiplier}
 	}
 
 	// Stable order, so a config only changes when its content does.

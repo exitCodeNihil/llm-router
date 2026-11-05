@@ -22,18 +22,40 @@ type anthUsage struct {
 	OutputTokens             int `json:"output_tokens"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheCreation            struct {
+		Ephemeral1h int `json:"ephemeral_1h_input_tokens"`
+	} `json:"cache_creation"`
+	InferenceGeo string `json:"inference_geo"`
+	Speed        string `json:"speed"`
 }
 
 // counts folds both cache buckets into the prompt total: they are prompt tokens
 // the upstream read, and clients that cache aggressively (Claude Code sends most
 // of its prompt as a cache write) would otherwise report almost no input at all.
 // Only cache reads count as Cached, which is what the cached price applies to.
+// A write without the 5m/1h breakdown is the default 5 minute kind.
 func (u *anthUsage) counts() usageCounts {
 	return usageCounts{
-		Prompt:     u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens,
-		Completion: u.OutputTokens,
-		Cached:     u.CacheReadInputTokens,
+		Prompt:      u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens,
+		Completion:  u.OutputTokens,
+		Cached:      u.CacheReadInputTokens,
+		Write5m:     u.CacheCreationInputTokens - u.CacheCreation.Ephemeral1h,
+		Write1h:     u.CacheCreation.Ephemeral1h,
+		USInference: u.InferenceGeo == "us",
+		Fast:        u.Speed == "fast",
 	}
+}
+
+// setInput takes the input side of a streamed usage event: message_start has it,
+// and Anthropic repeats it in message_delta without the options or the 5m/1h split
+// of its cache writes, so an unchanged total keeps the split already known.
+func (c *usageCounts) setInput(n usageCounts) {
+	c.Prompt, c.Cached = n.Prompt, n.Cached
+	if n.Write1h > 0 || n.Write5m+n.Write1h != c.Write5m+c.Write1h {
+		c.Write5m, c.Write1h = n.Write5m, n.Write1h
+	}
+	c.USInference = c.USInference || n.USInference
+	c.Fast = c.Fast || n.Fast
 }
 
 // oaiToAnthBody converts an OpenAI chat-completions request into an Anthropic
@@ -379,7 +401,7 @@ func anthStreamToOAI(w http.ResponseWriter, resp *http.Response, model, reqID st
 			}
 			if json.Unmarshal(data, &ms) == nil && ms.Message.Usage != nil {
 				c := ms.Message.Usage.counts() // one definition of "prompt": cache writes included
-				counts.Prompt, counts.Cached = c.Prompt, c.Cached
+				counts.setInput(c)
 			}
 		case "content_block_start":
 			var bs struct {
@@ -525,13 +547,13 @@ func streamAnthPassthrough(w http.ResponseWriter, resp *http.Response, capture b
 					// streamed request — which is all of Claude Code's traffic.
 					if u := ev.Message.Usage; u != nil { // message_start
 						c := u.counts()
-						counts.Prompt, counts.Cached = c.Prompt, c.Cached
+						counts.setInput(c)
 					}
 					if u := ev.Usage; u != nil { // message_delta
 						// Some upstreams repeat the input side here; others send
 						// only output_tokens, so don't clobber prompt with zero.
 						if c := u.counts(); c.Prompt > 0 {
-							counts.Prompt, counts.Cached = c.Prompt, c.Cached
+							counts.setInput(c)
 						}
 						if u.OutputTokens > 0 {
 							counts.Completion = u.OutputTokens

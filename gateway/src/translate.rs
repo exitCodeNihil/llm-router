@@ -27,6 +27,26 @@ pub struct Usage {
     pub prompt: i64,
     pub completion: i64,
     pub cached: i64,
+    /// Parts of `prompt` that cost more than plain input (Go: usageCounts).
+    pub write_5m: i64,
+    pub write_1h: i64,
+    /// Request options that raise every rate.
+    pub us_inference: bool,
+    pub fast: bool,
+}
+
+impl Usage {
+    /// The input side of a streamed usage event: message_start has it, and Anthropic
+    /// repeats it in message_delta without the options or the 5m/1h split of its
+    /// cache writes, so an unchanged total keeps the split already known.
+    fn set_input(&mut self, n: Usage) {
+        (self.prompt, self.cached) = (n.prompt, n.cached);
+        if n.write_1h > 0 || n.write_5m + n.write_1h != self.write_5m + self.write_1h {
+            (self.write_5m, self.write_1h) = (n.write_5m, n.write_1h);
+        }
+        self.us_inference |= n.us_inference;
+        self.fast |= n.fast;
+    }
 }
 
 /// A request body the gateway could not translate; the message goes back to
@@ -574,14 +594,14 @@ impl SseTransform for AnthPassthrough {
                 if let Some(u) = &ev.message.usage {
                     // message_start
                     let c = u.counts();
-                    (self.usage.prompt, self.usage.cached) = (c.prompt, c.cached);
+                    self.usage.set_input(c);
                 }
                 if let Some(u) = &ev.usage {
                     // message_delta: some upstreams repeat the input side here,
                     // others send only output_tokens, so don't clobber with zero
                     let c = u.counts();
                     if c.prompt > 0 {
-                        (self.usage.prompt, self.usage.cached) = (c.prompt, c.cached);
+                        self.usage.set_input(c);
                     }
                     if u.output_tokens > 0 {
                         self.usage.completion = u.output_tokens;
@@ -811,7 +831,7 @@ impl AnthToOaiStream {
                 {
                     // one definition of "prompt": cache writes included
                     let c = u.counts();
-                    (self.usage.prompt, self.usage.cached) = (c.prompt, c.cached);
+                    self.usage.set_input(c);
                 }
             }
             Event::BlockStart => {
@@ -1180,12 +1200,26 @@ struct AnthUsage {
     cache_read_input_tokens: i64,
     #[serde(default, deserialize_with = "nul")]
     cache_creation_input_tokens: i64,
+    #[serde(default)]
+    cache_creation: Option<CacheCreation>,
+    #[serde(default)]
+    inference_geo: Option<String>,
+    #[serde(default)]
+    speed: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct CacheCreation {
+    #[serde(default, deserialize_with = "nul")]
+    ephemeral_1h_input_tokens: i64,
 }
 
 impl AnthUsage {
     /// Both cache buckets are prompt tokens the upstream read; only reads get
-    /// the cached price (Go: anthUsage.counts).
+    /// the cached price. A write without the 5m/1h breakdown is the default 5
+    /// minute kind (Go: anthUsage.counts).
     fn counts(&self) -> Usage {
+        let write_1h = self.cache_creation.as_ref().map_or(0, |c| c.ephemeral_1h_input_tokens);
         Usage {
             prompt: self
                 .input_tokens
@@ -1193,6 +1227,10 @@ impl AnthUsage {
                 .wrapping_add(self.cache_creation_input_tokens),
             completion: self.output_tokens,
             cached: self.cache_read_input_tokens,
+            write_5m: self.cache_creation_input_tokens.wrapping_sub(write_1h),
+            write_1h,
+            us_inference: self.inference_geo.as_deref() == Some("us"),
+            fast: self.speed.as_deref() == Some("fast"),
         }
     }
 }
@@ -1395,6 +1433,7 @@ impl OaiUsage {
             prompt: self.prompt_tokens,
             completion: self.completion_tokens,
             cached: self.prompt_tokens_details.cached_tokens,
+            ..Usage::default()
         }
     }
 }

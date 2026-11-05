@@ -126,6 +126,10 @@ pub struct Price {
     pub input_per_1m: f64,
     pub output_per_1m: f64,
     pub cached_input_per_1m: Option<f64>,
+    #[serde(default)]
+    pub long_prompt_tokens: i64,
+    #[serde(default)]
+    pub long_prompt_multiplier: f64,
 }
 
 // ---- model --------------------------------------------------------------------------------

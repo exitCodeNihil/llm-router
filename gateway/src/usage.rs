@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use crate::config::{AuthMode, Config, Deployment, Key};
+use crate::config::{AuthMode, Config, Deployment, Key, Price};
 use crate::translate::Usage;
 use crate::{limits, metrics};
 
@@ -32,6 +32,10 @@ pub struct Event {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub cached_tokens: i64,
+    #[serde(skip_serializing_if = "is_zero", rename = "cache_write_5m_tokens")]
+    pub cache_write_5m: i64,
+    #[serde(skip_serializing_if = "is_zero", rename = "cache_write_1h_tokens")]
+    pub cache_write_1h: i64,
     pub cost_usd: f64,
     pub unpriced: bool,
     pub latency_ms: i64,
@@ -86,28 +90,54 @@ pub fn queued() -> usize {
     queue().lock().unwrap().len()
 }
 
+// Anthropic's pricing rules on top of a model's rates (internal/pricing).
+const CACHE_WRITE_5M: f64 = 1.25;
+const CACHE_WRITE_1H: f64 = 2.0;
+const US_INFERENCE: f64 = 1.1;
+const FAST_MODE: f64 = 2.0;
+
 /// Price a request (pricing.price): the deployment's own price, else the
-/// catalog's, else unpriced. Cached tokens are part of the prompt and billed at
-/// the cached rate when there is one.
+/// catalog's, else unpriced.
 fn price(cfg: &Config, d: &Deployment, u: Usage) -> Option<f64> {
-    let (input, output, cached) = match (d.input_per_1m, d.output_per_1m) {
-        (Some(i), Some(o)) => (i, o, d.cached_input_per_1m),
-        _ if !d.catalog_model_id.is_empty() => {
-            let p = cfg.prices.get(&d.catalog_model_id)?;
-            (p.input_per_1m, p.output_per_1m, p.cached_input_per_1m)
-        }
+    let p = match (d.input_per_1m, d.output_per_1m) {
+        (Some(input_per_1m), Some(output_per_1m)) => Price {
+            input_per_1m,
+            output_per_1m,
+            cached_input_per_1m: d.cached_input_per_1m,
+            long_prompt_tokens: 0,
+            long_prompt_multiplier: 1.0,
+        },
+        _ if !d.catalog_model_id.is_empty() => *cfg.prices.get(&d.catalog_model_id)?,
         _ => return None,
     };
-    let mut billed = u.prompt;
-    let mut cached_cost = 0.0;
-    if let Some(rate) = cached
-        && u.cached > 0
-    {
-        let c = u.cached.min(u.prompt);
-        billed = u.prompt - c;
-        cached_cost = c as f64 * rate / 1e6;
+    Some(cost(p, u))
+}
+
+/// Go: pricing.priceCost. Shared fixtures in internal/pricing/testdata/cost.json.
+fn cost(p: Price, u: Usage) -> f64 {
+    // The parts can't exceed the whole, whatever an upstream reports.
+    let part = |n: i64, left: i64| n.min(left).max(0);
+    let cached = part(u.cached, u.prompt);
+    let write_5m = part(u.write_5m, u.prompt - cached);
+    let write_1h = part(u.write_1h, u.prompt - cached - write_5m);
+    let fresh = u.prompt - cached - write_5m - write_1h;
+
+    let cached_rate = p.cached_input_per_1m.unwrap_or(p.input_per_1m); // no cached rate: reads bill as input
+    let mut usd = fresh as f64 * p.input_per_1m
+        + cached as f64 * cached_rate
+        + write_5m as f64 * p.input_per_1m * CACHE_WRITE_5M
+        + write_1h as f64 * p.input_per_1m * CACHE_WRITE_1H
+        + u.completion as f64 * p.output_per_1m;
+    if p.long_prompt_tokens > 0 && u.prompt > p.long_prompt_tokens {
+        usd *= p.long_prompt_multiplier;
     }
-    Some(billed as f64 * input / 1e6 + u.completion as f64 * output / 1e6 + cached_cost)
+    if u.us_inference {
+        usd *= US_INFERENCE;
+    }
+    if u.fast {
+        usd *= FAST_MODE;
+    }
+    usd / 1e6
 }
 
 /// Everything known about a request before its outcome, to emit its event once.
@@ -138,6 +168,8 @@ impl Emit {
             prompt_tokens: u.prompt,
             completion_tokens: u.completion,
             cached_tokens: u.cached,
+            cache_write_5m: u.write_5m,
+            cache_write_1h: u.write_1h,
             cost_usd: 0.0,
             unpriced: false,
             latency_ms: self.start.elapsed().as_millis() as i64,
@@ -154,8 +186,10 @@ impl Emit {
             let listed = price(&self.cfg, d, u);
             if d.provider.auth_mode == AuthMode::OAuthPassthrough {
                 // Billed to the caller's own plan: no real money, but a list value.
+                // A wildcard has no price of its own: use the model asked for.
                 e.unpriced = true;
-                e.notional_cost_usd = listed.unwrap_or(0.0);
+                let by_model = || self.cfg.prices.get(&format!("anthropic/{}", e.model_name)).map(|p| cost(*p, u));
+                e.notional_cost_usd = listed.or_else(by_model).unwrap_or(0.0);
             } else {
                 e.unpriced = listed.is_none();
                 e.cost_usd = listed.unwrap_or(0.0);
@@ -188,11 +222,62 @@ mod tests {
         .unwrap();
         let c = Config::build(w).unwrap();
         let d = |m: &str| c.resolve(m).unwrap().deployments[0].clone();
-        let u = Usage { prompt: 1_000_000, completion: 500_000, cached: 400_000 };
+        let u = Usage { prompt: 1_000_000, completion: 500_000, cached: 400_000, ..Usage::default() };
         // 600k at $2 + 400k at $0.5 + 500k at $8
         assert!((price(&c, &d("a"), u).unwrap() - (1.2 + 0.2 + 4.0)).abs() < 1e-9);
         // no cached rate: all prompt tokens at the input rate
         assert!((price(&c, &d("b"), u).unwrap() - (1.0 + 1.0)).abs() < 1e-9);
         assert!(price(&c, &d("c"), u).is_none());
+    }
+
+    /// The same cases internal/pricing/pricing_test.go checks.
+    #[test]
+    fn cost_fixtures() {
+        #[derive(serde::Deserialize, Default)]
+        #[serde(default)]
+        struct Tokens {
+            prompt: i64,
+            completion: i64,
+            cached: i64,
+            write_5m: i64,
+            write_1h: i64,
+            us: bool,
+            fast: bool,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            rates: Vec<f64>,
+            #[serde(default)]
+            long: Vec<f64>,
+            tokens: Tokens,
+            want: f64,
+        }
+        let raw = std::fs::read("../internal/pricing/testdata/cost.json").unwrap();
+        let cases: Vec<Case> = serde_json::from_slice(&raw).unwrap();
+        assert!(!cases.is_empty());
+        for c in cases {
+            let p = Price {
+                input_per_1m: c.rates[0],
+                output_per_1m: c.rates[1],
+                cached_input_per_1m: c.rates.get(2).copied(),
+                long_prompt_tokens: c.long.first().map_or(0, |t| *t as i64),
+                long_prompt_multiplier: c.long.get(1).copied().unwrap_or(1.0),
+            };
+            let t = c.tokens;
+            let got = cost(
+                p,
+                Usage {
+                    prompt: t.prompt,
+                    completion: t.completion,
+                    cached: t.cached,
+                    write_5m: t.write_5m,
+                    write_1h: t.write_1h,
+                    us_inference: t.us,
+                    fast: t.fast,
+                },
+            );
+            assert!((got - c.want).abs() < 1e-12, "{}: cost = {got}, want {}", c.name, c.want);
+        }
     }
 }
