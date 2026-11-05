@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.1](https://github.com/exitCodeNihil/llm-router/compare/v0.2.0...v0.2.1) (2026-11-05)
+
+
+### Features
+
+* add an Anthropic provider type with its auth modes ([2161d3c](https://github.com/exitCodeNihil/llm-router/commit/2161d3c074ade950a38d51a8bca2274c963b02f8))
+* add service account, Anthropic identity and gateways to the chart ([bca701b](https://github.com/exitCodeNihil/llm-router/commit/bca701b90be1ea16d71feba848c27338dca59af2))
+* authenticate to Anthropic with workload identity federation instead of a key ([a727dcd](https://github.com/exitCodeNihil/llm-router/commit/a727dcd9989e194da7eafd927b0024ef602cffcf))
+
+
+### Bug Fixes
+
+* forward upstream rate limit headers, 400 on unsupported routes ([a7263e5](https://github.com/exitCodeNihil/llm-router/commit/a7263e5a99b987c335e7ac83160f11909a694814))
+* price cache writes, long prompts, US-only and fast mode like Anthropic bills them ([17abd70](https://github.com/exitCodeNihil/llm-router/commit/17abd70d873a020ab5098a287978ff5aba8167cc))
+* repair the spend by team query ([82fb493](https://github.com/exitCodeNihil/llm-router/commit/82fb49321854111dcd825dba46ddd905a83e6676))
+* stop spending Anthropic identity tokens twice ([f24cc6d](https://github.com/exitCodeNihil/llm-router/commit/f24cc6dd129094c321d6063d9e51023b89bbecdb))
+
 ## [0.2.0](https://github.com/exitCodeNihil/llm-router/compare/v0.1.2...v0.2.0) (2026-10-13)
 
 
