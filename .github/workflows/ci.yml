@@ -17,6 +17,23 @@ jobs:
       - run: go test ./...
       - run: go build ./...
 
+  test-db:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env: {POSTGRES_USER: t, POSTGRES_PASSWORD: t, POSTGRES_DB: t}
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U t" --health-interval 2s --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - run: go test -p 1 ./internal/gwsync ./internal/mgmt
+        env:
+          LLMR_TEST_DATABASE_URL: postgres://t:t@127.0.0.1:5432/t?sslmode=disable
+
   gateway:
     runs-on: ubuntu-latest
     defaults:

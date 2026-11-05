@@ -109,7 +109,7 @@ test-db: ## Tests that need Postgres, against a throwaway container
 	@$(ENGINE) run -d --rm --name llmr-test-db -e POSTGRES_USER=t -e POSTGRES_PASSWORD=t -e POSTGRES_DB=t \
 	  -p 127.0.0.1:55433:5432 docker.io/library/postgres:17 >/dev/null
 	@until $(ENGINE) exec llmr-test-db pg_isready -U t >/dev/null 2>&1; do sleep 1; done; sleep 1
-	@LLMR_TEST_DATABASE_URL='postgres://t:t@127.0.0.1:55433/t?sslmode=disable' go test ./internal/gwsync; \
+	@LLMR_TEST_DATABASE_URL='postgres://t:t@127.0.0.1:55433/t?sslmode=disable' go test -p 1 ./internal/gwsync ./internal/mgmt; \
 	  s=$$?; $(ENGINE) rm -f llmr-test-db >/dev/null; exit $$s
 
 test-web: $(NODE_DEPS) ## Console typecheck
