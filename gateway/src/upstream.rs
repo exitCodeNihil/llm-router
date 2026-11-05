@@ -29,6 +29,9 @@ pub fn url_parts(p: &Provider, upstream: &str, flavor: Flavor) -> (String, Strin
 pub enum BuildError {
     /// The provider forwards the caller's own credential and the caller sent none.
     NoCallerCredential(String),
+    /// The caller asked for an endpoint the deployment's flavor doesn't have,
+    /// such as /embeddings on Claude. Also the caller's mistake.
+    UnsupportedRoute(String),
     Unsupported(String),
 }
 
@@ -52,7 +55,9 @@ pub fn request_parts(d: &Deployment, path: &str, inbound: &Inbound) -> Result<(S
     }
     let url = match d.flavor {
         Flavor::Anthropic if path != "/chat/completions" && path != "/messages" => {
-            return Err(BuildError::Unsupported(format!("{path} is not supported by anthropic-flavor deployments")));
+            return Err(BuildError::UnsupportedRoute(format!(
+                "unsupported route: {path} is not supported by anthropic-flavor deployments"
+            )));
         }
         Flavor::Anthropic => d.url_prefix.clone(),
         Flavor::OpenAI => {
@@ -176,7 +181,7 @@ mod tests {
         assert_eq!(u, "https://r.openai.azure.com/anthropic/v1/messages");
         assert_eq!(h["x-api-key"], "k1");
         assert_eq!(h["anthropic-version"], "2023-06-01");
-        assert!(request_parts(&d("claude"), "/embeddings", &none).is_err());
+        assert!(matches!(request_parts(&d("claude"), "/embeddings", &none), Err(BuildError::UnsupportedRoute(_))));
 
         assert!(matches!(request_parts(&d("sub"), "/chat/completions", &none), Err(BuildError::NoCallerCredential(_))));
         let caller =

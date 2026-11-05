@@ -162,11 +162,31 @@ func perMillion(perToken string) *float64 {
 	return &v
 }
 
+// CheckRoute refuses a path the deployment's surface doesn't have, with an error
+// wrapping ErrUnsupportedRoute. Both the Anthropic surface and Vertex are
+// chat-only: Vertex's OpenAI-compatible endpoint answers /embeddings with
+// FAILED_PRECONDITION, and rawPredict is Messages.
+func CheckRoute(d *snapshot.Deployment, path string) error {
+	if path == "/chat/completions" || path == "/messages" {
+		return nil
+	}
+	switch {
+	case d.Provider.Type == "gcp_vertex":
+		return fmt.Errorf("%w: %s is not supported on vertex deployments", ErrUnsupportedRoute, path)
+	case d.APIFlavor == "anthropic":
+		return fmt.Errorf("%w: %s is not supported by anthropic-flavor deployments", ErrUnsupportedRoute, path)
+	}
+	return nil
+}
+
 // NewRequest builds the upstream request for a deployment: URL, auth headers,
 // and the (already model-rewritten) body. Deployments with api_flavor
 // "anthropic" (Claude on Azure AI Foundry) go to the Anthropic Messages
 // surface regardless of path.
 func NewRequest(ctx context.Context, d *snapshot.Deployment, path string, body []byte) (*http.Request, error) {
+	if err := CheckRoute(d, path); err != nil {
+		return nil, err
+	}
 	p := d.Provider
 	var upstreamURL string
 	var err error
@@ -177,9 +197,6 @@ func NewRequest(ctx context.Context, d *snapshot.Deployment, path string, body [
 			return nil, err
 		}
 	case anthropic:
-		if path != "/chat/completions" && path != "/messages" {
-			return nil, fmt.Errorf("%s is not supported by anthropic-flavor deployments", path)
-		}
 		base := strings.TrimSuffix(p.BaseURL, "/")
 		if p.Type == "azure" {
 			// https://{resource}.services.ai.azure.com/anthropic/v1/messages

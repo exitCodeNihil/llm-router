@@ -10,6 +10,11 @@ import (
 // handlers map it to 400 rather than 500.
 var ErrNoCallerCredential = errors.New("no caller credential to forward")
 
+// ErrUnsupportedRoute means the caller asked a deployment for an endpoint its
+// flavor doesn't have, such as /embeddings on Claude. Also the caller's mistake,
+// so also a 400.
+var ErrUnsupportedRoute = errors.New("unsupported route")
+
 // Inbound carries the few caller headers that are allowed to travel upstream.
 // It is an allowlist by construction: nothing else from the client's request
 // reaches a provider. The gateway sets it per request.
