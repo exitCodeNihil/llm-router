@@ -6,12 +6,14 @@ truth, prices it from the table below (typed from the pricing page, independent 
 the gateway), and compares that with the usage_events row and the Langfuse generation.
 Spends real money: about $2 for a full run.
 
-  ANTHROPIC_TOKEN=...  key or token for api.anthropic.com
+  ANTHROPIC_TOKEN=...  API key for api.anthropic.com
   LLMR_ADMIN_TOKEN=... the control plane's admin token
   LLMR_URL=http://127.0.0.1:8080          the control plane
   LLMR_GATEWAY_URL=http://127.0.0.1:8081  a Rust gateway too (optional)
   LLMR_PSQL="psql postgres://..."         or "podman exec db psql -U u -d d"
   LANGFUSE_URL=http://localhost:3001 LANGFUSE_KEYS=pk:sk  also check Langfuse (optional)
+  LLMR_PROVIDER_ID=...  test this existing provider with no models yet, say a workload identity one,
+                        instead of creating one with ANTHROPIC_TOKEN
 
   accuracy.py [models] [cache] [options] [long]    exits 1 on any mismatch
 """
@@ -59,8 +61,8 @@ def api(method, path, body=None):
 def setup():
     """A throwaway provider, catalog-priced models and key; a run tests the catalog too."""
     name = "accuracy-" + uuid.uuid4().hex[:8]
-    prov = api("POST", "/api/providers", {"name": name, "type": "openai_compatible", "base_url": "https://api.anthropic.com",
-                                          "auth_mode": "bearer", "api_key": os.environ["ANTHROPIC_TOKEN"]})
+    prov = {"id": os.environ["LLMR_PROVIDER_ID"]} if os.environ.get("LLMR_PROVIDER_ID") else api(
+        "POST", "/api/providers", {"name": name, "type": "anthropic", "auth_mode": "api_key", "api_key": os.environ["ANTHROPIC_TOKEN"]})
     for m in PUBLISHED:
         api("POST", "/api/deployments", {"provider_id": prov["id"], "model_name": f"{name}/{m}", "upstream_name": m,
                                          "api_flavor": "anthropic", "catalog_model_id": "anthropic/" + m})

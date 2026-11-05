@@ -483,10 +483,10 @@ fn provider(p: WireProvider) -> Provider {
         }
         _ => None,
     };
-    let base_url = if p.base_url.is_empty() && kind == ProviderKind::OpenRouter {
-        "https://openrouter.ai/api/v1".to_string()
-    } else {
-        p.base_url.trim_end_matches('/').to_string()
+    let base_url = match p.kind.as_str() {
+        "openrouter" if p.base_url.is_empty() => "https://openrouter.ai/api/v1".to_string(),
+        "anthropic" if p.base_url.is_empty() => "https://api.anthropic.com".to_string(),
+        _ => p.base_url.trim_end_matches('/').to_string(),
     };
     let wif = p.wif.filter(|_| auth_mode == AuthMode::AnthropicWif).map(|w| crate::wif::state(&p.id, &base_url, w));
     Provider { id: p.id, name: p.name, kind, base_url, auth_mode, api_version: p.api_version, auth_header, wif }

@@ -69,7 +69,7 @@ export interface ApiKey {
   created_at: string;
 }
 
-export type ProviderType = "azure" | "openai_compatible" | "gcp_vertex" | "openrouter";
+export type ProviderType = "anthropic" | "azure" | "openai_compatible" | "gcp_vertex" | "openrouter";
 
 export interface Provider {
   id: string;

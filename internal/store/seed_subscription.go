@@ -27,7 +27,7 @@ func (s *Store) SeedClaudeSubscription(ctx context.Context) error {
 	pid := uuid.New()
 	if _, err := s.Pool.Exec(ctx, `
 		INSERT INTO providers (id, name, type, base_url, auth_mode, config)
-		VALUES ($1, $2, 'openai_compatible', 'https://api.anthropic.com', 'oauth_passthrough', '{}')`,
+		VALUES ($1, $2, 'anthropic', 'https://api.anthropic.com', 'oauth_passthrough', '{}')`,
 		pid, name); err != nil {
 		return fmt.Errorf("seed subscription provider: %w", err)
 	}

@@ -14,6 +14,7 @@ import { Empty, ErrorState, Loading, Page } from "../components/Page";
 import { SearchBox, useTableTools } from "../components/tables";
 
 const PROVIDER_LABEL: Record<string, string> = {
+  anthropic: "Anthropic",
   azure: "Azure",
   gcp_vertex: "Vertex AI",
   openrouter: "OpenRouter",

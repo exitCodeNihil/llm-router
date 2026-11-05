@@ -78,11 +78,17 @@ type ModelInfo struct {
 // OpenRouterBase is where OpenRouter lives; base_url may be left blank.
 const OpenRouterBase = "https://openrouter.ai/api/v1"
 
+// AnthropicBase is the default for Anthropic providers.
+const AnthropicBase = "https://api.anthropic.com"
+
 // BaseURL is the provider's effective base URL, with the aggregator default
 // filled in so an operator only has to paste a key.
 func BaseURL(p *snapshot.Provider) string {
 	if p.BaseURL == "" && p.Type == "openrouter" {
 		return OpenRouterBase
+	}
+	if p.BaseURL == "" && p.Type == "anthropic" {
+		return AnthropicBase
 	}
 	return strings.TrimSuffix(p.BaseURL, "/")
 }
@@ -97,6 +103,8 @@ func ListModels(ctx context.Context, p *snapshot.Provider) ([]ModelInfo, error) 
 	switch p.Type {
 	case "azure":
 		listURL = strings.TrimSuffix(p.BaseURL, "/") + "/openai/deployments?api-version=2023-03-15-preview"
+	case "anthropic":
+		listURL = strings.TrimSuffix(BaseURL(p), "/v1") + "/v1/models?limit=1000"
 	default:
 		listURL = BaseURL(p) + "/models"
 	}
@@ -104,7 +112,10 @@ func ListModels(ctx context.Context, p *snapshot.Provider) ([]ModelInfo, error) 
 	if err != nil {
 		return nil, err
 	}
-	if err := applyAuth(ctx, req, p, false); err != nil {
+	if p.Type == "anthropic" {
+		req.Header.Set("anthropic-version", "2023-06-01")
+	}
+	if err := applyAuth(ctx, req, p, p.Type == "anthropic"); err != nil {
 		return nil, err
 	}
 	resp, err := (&http.Client{Transport: Transport, Timeout: 15 * time.Second}).Do(req)
@@ -135,8 +146,8 @@ func ListModels(ctx context.Context, p *snapshot.Provider) ([]ModelInfo, error) 
 	out := make([]ModelInfo, 0, len(parsed.Data))
 	for _, d := range parsed.Data {
 		m := ModelInfo{ID: d.ID, Model: d.Model, ContextTokens: d.ContextLength}
-		if m.Model == "" && p.Type == "openrouter" {
-			m.Model = d.ID // keys the catalog row "openrouter/<slug>"
+		if m.Model == "" && (p.Type == "openrouter" || p.Type == "anthropic") {
+			m.Model = d.ID // keys the catalog row "openrouter/<slug>", "anthropic/<id>"
 		}
 		// Both must be present to make a price; a lone prompt rate is not one.
 		if in, out := perMillion(d.Pricing.Prompt), perMillion(d.Pricing.Completion); in != nil && out != nil {
@@ -197,7 +208,7 @@ func NewRequest(ctx context.Context, d *snapshot.Deployment, path string, body [
 			return nil, err
 		}
 	case anthropic:
-		base := strings.TrimSuffix(p.BaseURL, "/")
+		base := BaseURL(p)
 		if p.Type == "azure" {
 			// https://{resource}.services.ai.azure.com/anthropic/v1/messages
 			upstreamURL = base + "/anthropic/v1/messages"

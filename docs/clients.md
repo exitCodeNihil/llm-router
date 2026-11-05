@@ -13,8 +13,7 @@ no credential is stored.
 
 1. The quickstart adds an `anthropic-subscription` provider with one model, `claude-*`, which passes
    any Claude model name through, so new Claude models work without changes. To add it by hand:
-   **Providers → Add provider**, type *OpenAI-compatible*, Base URL `https://api.anthropic.com`,
-   Auth mode *Forward the caller's token*; then **Models → Add model** with `claude-*` as both the
+   **Providers → Add provider**, type *Anthropic*, Auth mode *Caller's own login*; then **Models → Add model** with `claude-*` as both the
    model and upstream name.
 2. Point Claude Code at the gateway. The key goes in a header so the subscription token stays in
    `Authorization`:

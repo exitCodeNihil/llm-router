@@ -66,7 +66,7 @@ type Team struct {
 type Provider struct {
 	ID         string
 	Name       string
-	Type       string // azure | openai_compatible | gcp_vertex
+	Type       string // azure | openai_compatible | gcp_vertex | openrouter | anthropic
 	BaseURL    string
 	AuthMode   string // entra | api_key | bearer | none | oauth_passthrough | gcp_adc | gcp_sa | anthropic_wif
 	APIKey     string // decrypted; the service account JSON for gcp_sa
@@ -74,6 +74,16 @@ type Provider struct {
 	Project    string // gcp_vertex only
 	Location   string // gcp_vertex only, e.g. us-east5 or global
 	WIF        AnthropicWIF
+}
+
+// ApplyConfig fills in what a provider keeps in its config column. Everything that
+// builds a Provider from a row goes through here, so none of them misses a field.
+func (p *Provider) ApplyConfig(cfg map[string]any) {
+	s := func(k string) string { v, _ := cfg[k].(string); return v }
+	p.APIVersion, p.Project, p.Location = s("api_version"), s("project"), s("location")
+	if p.AuthMode == "anthropic_wif" {
+		p.WIF = AnthropicWIFFromConfig(cfg)
+	}
 }
 
 // AnthropicWIF identifies a federation rule in the Claude Console. None of it is
