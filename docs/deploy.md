@@ -137,7 +137,9 @@ Placeholder secrets such as `change-me` are refused. Generate them with `openssl
   Wrong credentials are rejected per batch, so check the delivery health on that page. Need a
   Langfuse to point it at? [Compose can run one](#langfuse-in-compose).
 - **Response headers**: every `/v1` response from an upstream carries `X-Request-Id`,
-  `X-Llmr-Provider`, `X-Llmr-Upstream` and `X-Llmr-Attempts`.
+  `X-Llmr-Provider`, `X-Llmr-Upstream` and `X-Llmr-Attempts`. A successful one also carries the
+  answering upstream's `anthropic-ratelimit-*` and `x-ratelimit-*` headers. On a shared provider
+  key those describe that key's quota, not the caller's.
 - **Upgrades**: pull the new tag and restart. Migrations apply on start and only go forward, so
   back up Postgres first.
 

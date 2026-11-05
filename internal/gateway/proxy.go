@@ -85,10 +85,10 @@ func (g *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if r.Context().Err() != nil {
 			return // client went away
 		}
-		if errors.Is(err, provider.ErrNoCallerCredential) {
-			writeError(w, http.StatusBadRequest, "invalid_request_error", "missing_credential", err.Error())
+		if code := callerErrorCode(err); code != "" {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", code, err.Error())
 			g.emit(snap, id, nil, body, reqID, usageCounts{}, http.StatusBadRequest, start, nil, "", dec,
-				emitExtra{Attempts: attempts, ErrorCode: "missing_credential"})
+				emitExtra{Attempts: attempts, ErrorCode: code})
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "server_error", "internal_error", err.Error())
@@ -108,6 +108,7 @@ func (g *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// deployment actually served it, including whether failover kicked in.
 	setRoutingHeaders(w, reqID, chosen, attempts)
 	forwardRetryAfter(w, resp)
+	forwardRateLimits(w, resp)
 
 	capture := dec.CaptureContent
 	var counts usageCounts
@@ -133,6 +134,18 @@ func (g *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if g.Limits != nil {
 		g.Limits.RecordUsage(id, counts.Prompt+counts.Completion, e.CostUSD)
 	}
+}
+
+// callerErrorCode labels a request-build failure that is the caller's mistake,
+// so a 400 and not a 500. Empty for anything else.
+func callerErrorCode(err error) string {
+	switch {
+	case errors.Is(err, provider.ErrNoCallerCredential):
+		return "missing_credential"
+	case errors.Is(err, provider.ErrUnsupportedRoute):
+		return "unsupported_route"
+	}
+	return ""
 }
 
 // telemetryDecision computes the export/capture verdict once per request from
@@ -204,9 +217,16 @@ func tryDeployments(ctx context.Context, deployments []*snapshot.Deployment, ups
 	// Kept so a request that never reached any upstream can say why, instead of
 	// reporting the generic "all deployments failed".
 	var lastBuildErr error
+	reached := false
 	attempts := 0
 	for i, d := range deployments {
 		attempts++
+		// Before the body: an /embeddings body isn't a chat request, so translating
+		// it could fail and hide the actual reason.
+		if err := provider.CheckRoute(d, upstreamPath); err != nil {
+			lastBuildErr = err
+			continue
+		}
 		upBody, err := buildBody(d)
 		if err != nil {
 			return nil, nil, attempts, err
@@ -227,6 +247,7 @@ func tryDeployments(ctx context.Context, deployments []*snapshot.Deployment, ups
 			slog.Warn("upstream request build failed", "deployment", d.UpstreamName, "err", err)
 			continue
 		}
+		reached = true
 		res, err := provider.Client.Do(req)
 		if timedOut := !timer.Stop(); err != nil || timedOut {
 			cancel()
@@ -259,6 +280,9 @@ func tryDeployments(ctx context.Context, deployments []*snapshot.Deployment, ups
 		}
 		return res, d, attempts, nil
 	}
+	if reached {
+		return nil, nil, attempts, nil
+	}
 	return nil, nil, attempts, lastBuildErr
 }
 
@@ -280,6 +304,22 @@ func forwardRetryAfter(w http.ResponseWriter, resp *http.Response) {
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
 		if v := resp.Header.Get("Retry-After"); v != "" {
 			w.Header().Set("Retry-After", v)
+		}
+	}
+}
+
+// forwardRateLimits passes on the upstream's rate-limit state with a successful
+// response: Anthropic's anthropic-ratelimit-* (which Claude Code reads for plan
+// usage) and the x-ratelimit-* that OpenAI, Azure and OpenRouter send. resp is
+// the deployment that answered, so a failed-over attempt's state never reaches
+// the client. net/http has already canonicalised the names.
+func forwardRateLimits(w http.ResponseWriter, resp *http.Response) {
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return
+	}
+	for name, values := range resp.Header {
+		if strings.HasPrefix(name, "Anthropic-Ratelimit-") || strings.HasPrefix(name, "X-Ratelimit-") {
+			w.Header()[name] = values
 		}
 	}
 }

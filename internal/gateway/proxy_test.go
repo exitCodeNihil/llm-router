@@ -371,3 +371,237 @@ func TestModelsHidesPassthroughWithoutCallerCredential(t *testing.T) {
 		t.Errorf("caller with its own token should see the pass-through model, got %s", got)
 	}
 }
+
+func doPath(t *testing.T, g *Server, path, key, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	mux := http.NewServeMux()
+	g.Register(mux)
+	req := httptest.NewRequest("POST", path, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+key)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	return rec
+}
+
+// rateLimitUpstream answers like a real provider of the given flavor, streaming
+// when asked, with rate-limit headers next to ones that must stay upstream.
+func rateLimitUpstream(t *testing.T, flavor string) *httptest.Server {
+	t.Helper()
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var req struct {
+			Stream bool `json:"stream"`
+		}
+		json.Unmarshal(raw, &req)
+		h := w.Header()
+		h.Set("anthropic-ratelimit-requests-remaining", "41")
+		h.Set("anthropic-ratelimit-unified-status", "allowed")
+		h.Set("x-ratelimit-remaining-tokens", "900")
+		h.Add("x-ratelimit-limit", "a")
+		h.Add("x-ratelimit-limit", "b")
+		h.Set("anthropic-organization-id", "org-secret")
+		h.Set("set-cookie", "session=upstream")
+		switch {
+		case req.Stream && flavor == "anthropic":
+			h.Set("Content-Type", "text/event-stream")
+			io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":1}}}\n\n"+
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+		case req.Stream:
+			h.Set("Content-Type", "text/event-stream")
+			io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n")
+		case flavor == "anthropic":
+			io.WriteString(w, `{"content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":1,"output_tokens":1}}`)
+		default:
+			io.WriteString(w, `{"choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+		}
+	}))
+	t.Cleanup(s.Close)
+	return s
+}
+
+// Every way a successful response leaves the gateway. Reads the headers as of
+// the first body byte, so a header set too late for a stream fails here.
+func TestForwardsRateLimitHeadersOnSuccess(t *testing.T) {
+	const messages = `"max_tokens":5,"messages":[{"role":"user","content":"hi"}]`
+	for _, path := range []string{"/v1/chat/completions", "/v1/messages"} {
+		for _, flavor := range []string{"openai", "anthropic"} {
+			for _, stream := range []string{"false", "true"} {
+				t.Run(path+"/"+flavor+"/stream="+stream, func(t *testing.T) {
+					d := stubDeployment(rateLimitUpstream(t, flavor).URL, "m", "rl-ok", 0)
+					if flavor == "anthropic" {
+						d.APIFlavor = "anthropic"
+					}
+					g, _, key := newTestServer(t, map[string][]*snapshot.Deployment{"m": {d}})
+					rec := doPath(t, g, path, key, `{"model":"m","stream":`+stream+`,`+messages+`}`)
+					if rec.Code != 200 {
+						t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+					}
+					h := rec.Result().Header
+					for name, want := range map[string]string{
+						"anthropic-ratelimit-requests-remaining": "41",
+						"anthropic-ratelimit-unified-status":     "allowed",
+						"x-ratelimit-remaining-tokens":           "900",
+					} {
+						if got := h.Get(name); got != want {
+							t.Errorf("%s = %q, want %q", name, got, want)
+						}
+					}
+					if got := h.Values("x-ratelimit-limit"); len(got) != 2 || got[0] != "a" || got[1] != "b" {
+						t.Errorf("repeated header = %q, want both values", got)
+					}
+					for _, name := range []string{"anthropic-organization-id", "set-cookie"} {
+						if got := h.Get(name); got != "" {
+							t.Errorf("%s leaked to the client: %q", name, got)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+// The attempt that failed over describes a deployment that didn't answer.
+func TestRateLimitHeadersNotForwardedFromFailedOverDeployment(t *testing.T) {
+	limited := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("anthropic-ratelimit-requests-remaining", "0")
+		h.Set("anthropic-ratelimit-unified-status", "rejected")
+		h.Set("x-ratelimit-reset-requests", "9s")
+		h.Set("Retry-After", "9")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer limited.Close()
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("anthropic-ratelimit-requests-remaining", "41")
+		io.WriteString(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer good.Close()
+
+	g, _, key := newTestServer(t, map[string][]*snapshot.Deployment{
+		"m": {stubDeployment(limited.URL, "m", "rl-limited", 0), stubDeployment(good.URL, "m", "rl-backup", 1)},
+	})
+	rec := doReq(t, g, key, `{"model":"m","messages":[]}`)
+	h := rec.Result().Header
+	if rec.Code != 200 || h.Get("X-Llmr-Attempts") != "2" {
+		t.Fatalf("status %d after %s attempts, want 200 after 2", rec.Code, h.Get("X-Llmr-Attempts"))
+	}
+	if got := h.Values("anthropic-ratelimit-requests-remaining"); len(got) != 1 || got[0] != "41" {
+		t.Errorf("remaining = %q, want only the backup's 41", got)
+	}
+	for _, name := range []string{"anthropic-ratelimit-unified-status", "x-ratelimit-reset-requests", "Retry-After"} {
+		if got := h.Get(name); got != "" {
+			t.Errorf("%s from the failed attempt reached the client: %q", name, got)
+		}
+	}
+}
+
+func TestRateLimitHeadersOnlyOnSuccess(t *testing.T) {
+	limited := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("anthropic-ratelimit-requests-remaining", "0")
+		w.Header().Set("Retry-After", "9")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer limited.Close()
+	g, _, key := newTestServer(t, map[string][]*snapshot.Deployment{
+		"m": {stubDeployment(limited.URL, "m", "rl-final-429", 0)},
+	})
+	rec := doReq(t, g, key, `{"model":"m","messages":[]}`)
+	h := rec.Result().Header
+	if rec.Code != 429 || h.Get("Retry-After") != "9" {
+		t.Fatalf("status %d Retry-After %q, want 429 and 9", rec.Code, h.Get("Retry-After"))
+	}
+	if got := h.Get("anthropic-ratelimit-requests-remaining"); got != "" {
+		t.Errorf("forwarded on a 429: %q", got)
+	}
+}
+
+func TestUnsupportedRouteIsTheCallersMistake(t *testing.T) {
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++ }))
+	defer upstream.Close()
+
+	anthropic := stubDeployment(upstream.URL, "m", "route-anth", 0)
+	anthropic.APIFlavor = "anthropic"
+	passthrough := stubDeployment(upstream.URL, "m", "route-pass", 0)
+	passthrough.APIFlavor = "anthropic"
+	passthrough.Provider.AuthMode = "oauth_passthrough"
+	vertex := stubDeployment("", "m", "route-vertex", 0)
+	vertex.Provider.Type, vertex.Provider.Project = "gcp_vertex", "proj"
+
+	cases := []struct {
+		name, path, body string
+		d                *snapshot.Deployment
+	}{
+		{"embeddings", "/v1/embeddings", `{"model":"m","input":"hi"}`, anthropic},
+		{"completions", "/v1/completions", `{"model":"m","prompt":"hi"}`, anthropic},
+		// A body that can't translate doesn't get to hide the actual reason.
+		{"untranslatable body", "/v1/embeddings", `{"model":"m","messages":"nope"}`, anthropic},
+		// Nor does a missing credential: bringing one wouldn't help.
+		{"no caller credential", "/v1/embeddings", `{"model":"m","input":"hi"}`, passthrough},
+		{"vertex", "/v1/embeddings", `{"model":"m","input":"hi"}`, vertex},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			g, cw, key := newTestServer(t, map[string][]*snapshot.Deployment{"m": {c.d}})
+			rec := doPath(t, g, c.path, key, c.body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status %d, want 400: %s", rec.Code, rec.Body.String())
+			}
+			var got struct {
+				Error struct{ Message, Type, Code string } `json:"error"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.Error.Type != "invalid_request_error" || got.Error.Code != "unsupported_route" ||
+				!strings.Contains(got.Error.Message, "is not supported") {
+				t.Errorf("error = %+v", got.Error)
+			}
+			if len(cw.events) != 1 || cw.events[0].StatusCode != 400 || cw.events[0].ErrorCode != "unsupported_route" {
+				t.Errorf("usage rows = %+v, want one 400 unsupported_route", cw.events)
+			}
+		})
+	}
+	if hits != 0 {
+		t.Errorf("upstream called %d times", hits)
+	}
+}
+
+// The route is only the caller's mistake when no deployment could have served
+// it: a model that also has one that can isn't refused for its other one.
+func TestUnsupportedRouteWithAnotherDeployment(t *testing.T) {
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"data":[],"usage":{"prompt_tokens":1}}`)
+	}))
+	defer good.Close()
+	down := httptest.NewServer(http.NotFoundHandler())
+	down.Close()
+
+	anthropic := func(name string) *snapshot.Deployment {
+		d := stubDeployment(good.URL, "m", name, 0)
+		d.APIFlavor = "anthropic"
+		return d
+	}
+	body := `{"model":"m","input":"hi"}`
+
+	g, _, key := newTestServer(t, map[string][]*snapshot.Deployment{
+		"m": {anthropic("mix-anth-1"), stubDeployment(good.URL, "m", "mix-good", 1)},
+	})
+	rec := doPath(t, g, "/v1/embeddings", key, body)
+	if rec.Code != 200 || rec.Header().Get("X-Llmr-Upstream") != "mix-good" {
+		t.Errorf("status %d from %q, want 200 from mix-good", rec.Code, rec.Header().Get("X-Llmr-Upstream"))
+	}
+
+	for name, ds := range map[string][]*snapshot.Deployment{
+		"unsupported first": {anthropic("mix-anth-2"), stubDeployment(down.URL, "m", "mix-down-2", 1)},
+		"unsupported last":  {stubDeployment(down.URL, "m", "mix-down-3", 0), anthropic("mix-anth-3")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g, _, key := newTestServer(t, map[string][]*snapshot.Deployment{"m": ds})
+			rec := doPath(t, g, "/v1/embeddings", key, body)
+			if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "upstream_unavailable") {
+				t.Errorf("status %d, want 502 upstream_unavailable: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}

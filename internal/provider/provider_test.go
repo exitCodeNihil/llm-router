@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -69,7 +70,7 @@ func TestNewRequestURLs(t *testing.T) {
 
 	// embeddings must be rejected on anthropic-flavor deployments
 	d := &snapshot.Deployment{Provider: &snapshot.Provider{Type: "azure", BaseURL: "https://x", AuthMode: "none"}, UpstreamName: "c", APIFlavor: "anthropic"}
-	if _, err := NewRequest(context.Background(), d, "/embeddings", []byte("{}")); err == nil || !strings.Contains(err.Error(), "not supported") {
+	if _, err := NewRequest(context.Background(), d, "/embeddings", []byte("{}")); !errors.Is(err, ErrUnsupportedRoute) || !strings.Contains(err.Error(), "not supported") {
 		t.Errorf("embeddings on anthropic flavor should error, got %v", err)
 	}
 }

@@ -388,6 +388,10 @@ async fn proxy_openai(
                     em.send(400, "missing_credential", Default::default(), 0);
                     oai_error(StatusCode::BAD_REQUEST, "invalid_request_error", "missing_credential", &m)
                 }
+                Some(BuildError::UnsupportedRoute(m)) => {
+                    em.send(400, "unsupported_route", Default::default(), 0);
+                    oai_error(StatusCode::BAD_REQUEST, "invalid_request_error", "unsupported_route", &m)
+                }
                 Some(BuildError::Unsupported(m)) => {
                     oai_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "internal_error", &m)
                 }
@@ -482,6 +486,10 @@ async fn proxy_anthropic(cfg: Arc<Config>, key: Arc<Key>, inbound: Inbound, req:
             return match build {
                 Some(BuildError::NoCallerCredential(m)) => {
                     em.send(400, "missing_credential", Default::default(), 0);
+                    anth_error(StatusCode::BAD_REQUEST, "invalid_request_error", &m)
+                }
+                Some(BuildError::UnsupportedRoute(m)) => {
+                    em.send(400, "unsupported_route", Default::default(), 0);
                     anth_error(StatusCode::BAD_REQUEST, "invalid_request_error", &m)
                 }
                 Some(BuildError::Unsupported(m)) => anth_error(StatusCode::INTERNAL_SERVER_ERROR, "api_error", &m),
@@ -600,6 +608,17 @@ fn routed(status: StatusCode, req_id: &str, d: &Deployment, attempts: i64, upstr
     {
         h.insert(header::RETRY_AFTER, ra.clone());
     }
+    // The upstream's rate-limit state with a successful response: Anthropic's
+    // anthropic-ratelimit-* (which Claude Code reads for plan usage) and the
+    // x-ratelimit-* that OpenAI, Azure and OpenRouter send. `upstream` is the
+    // deployment that answered, so a failed-over attempt's state never gets here.
+    if status.is_success() {
+        for (name, value) in upstream {
+            if name.as_str().starts_with("anthropic-ratelimit-") || name.as_str().starts_with("x-ratelimit-") {
+                h.append(name.clone(), value.clone());
+            }
+        }
+    }
     r
 }
 
@@ -645,16 +664,18 @@ async fn try_deployments(
     let mut reached = false;
     for (i, d) in order.iter().enumerate() {
         attempts += 1;
-        let body = match build(d) {
-            Ok(b) => b,
-            Err(BadRequest(m)) => return Outcome::BadBody(m),
-        };
+        // Before the body: an /embeddings body isn't a chat request, so translating
+        // it could fail and hide the actual reason.
         let (url, headers) = match upstream::request_parts(d, path, inbound) {
             Ok(v) => v,
             Err(e) => {
                 last_build = Some(e);
                 continue;
             }
+        };
+        let body = match build(d) {
+            Ok(b) => b,
+            Err(BadRequest(m)) => return Outcome::BadBody(m),
         };
         let mut req = match Request::post(url).body(Full::new(body)) {
             Ok(r) => r,

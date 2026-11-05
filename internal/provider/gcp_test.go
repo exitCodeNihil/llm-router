@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -117,7 +118,7 @@ func TestVertexRejectsEmbeddings(t *testing.T) {
 	// Vertex's openapi endpoint answers /embeddings with FAILED_PRECONDITION;
 	// refusing here gives the caller a reason instead of a 400 from Google.
 	d := &snapshot.Deployment{Provider: vertexProvider("global"), UpstreamName: "google/text-embedding-005"}
-	if _, err := NewRequest(context.Background(), d, "/embeddings", []byte("{}")); err == nil || !strings.Contains(err.Error(), "not supported") {
+	if _, err := NewRequest(context.Background(), d, "/embeddings", []byte("{}")); !errors.Is(err, ErrUnsupportedRoute) || !strings.Contains(err.Error(), "not supported") {
 		t.Errorf("want not-supported error, got %v", err)
 	}
 }

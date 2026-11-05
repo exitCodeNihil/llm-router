@@ -160,11 +160,6 @@ func vertexRequest(p *snapshot.Provider, d *snapshot.Deployment, path string, bo
 	if p.Project == "" {
 		return "", nil, fmt.Errorf("provider %q: gcp project is not set", p.Name)
 	}
-	// Both surfaces are chat-only: the OpenAI-compatible endpoint answers
-	// /embeddings with FAILED_PRECONDITION, and rawPredict is Messages.
-	if path != "/chat/completions" && path != "/messages" {
-		return "", nil, fmt.Errorf("%s is not supported on vertex deployments", path)
-	}
 	if !anthropic {
 		// Gemini's OpenAI-compatible surface; upstream_name carries the publisher
 		// prefix ("google/gemini-2.5-flash") the endpoint expects in the body.

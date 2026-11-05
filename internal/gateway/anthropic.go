@@ -9,7 +9,6 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,7 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/exitcodenihil/llm-router/internal/provider"
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
 )
 
@@ -154,10 +152,10 @@ func (g *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		if r.Context().Err() != nil {
 			return
 		}
-		if errors.Is(err, provider.ErrNoCallerCredential) {
+		if code := callerErrorCode(err); code != "" {
 			writeAnthError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			g.emit(snap, id, nil, &reqBody{Model: areq.Model, Stream: areq.Stream}, reqID, usageCounts{},
-				http.StatusBadRequest, start, nil, "", dec, emitExtra{Attempts: attempts, ErrorCode: "missing_credential"})
+				http.StatusBadRequest, start, nil, "", dec, emitExtra{Attempts: attempts, ErrorCode: code})
 			return
 		}
 		writeAnthError(w, http.StatusInternalServerError, "api_error", err.Error())
@@ -175,6 +173,7 @@ func (g *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	// Code request could not be correlated with its usage row.
 	setRoutingHeaders(w, reqID, chosen, attempts)
 	forwardRetryAfter(w, resp)
+	forwardRateLimits(w, resp)
 
 	capture := dec.CaptureContent
 	var counts usageCounts
