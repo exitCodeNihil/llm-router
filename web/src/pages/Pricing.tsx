@@ -166,7 +166,7 @@ export default function Pricing() {
     <Page
       eyebrow="Routing"
       title="Price catalog"
-      description="List prices per 1M tokens. Azure and Google rows ship built in; OpenRouter rows sync from its API. Edited rows keep your value."
+      description="List prices per 1M tokens. Anthropic, Azure and Google rows ship built in; OpenRouter rows sync from its API. Edited rows keep your value. Anthropic cache writes bill at 1.25× the input price for 5 minutes and 2× for 1 hour."
       action={
         <HStack gap={2} vAlign="center" wrap="wrap">
           <SearchBox value={tools.query} onChange={tools.setQuery} placeholder="Search models…" />
