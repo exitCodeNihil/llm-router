@@ -28,6 +28,8 @@ type Event struct {
 	PromptTokens     int       `json:"prompt_tokens"`
 	CompletionTokens int       `json:"completion_tokens"`
 	CachedTokens     int       `json:"cached_tokens"`
+	CacheWrite5m     int       `json:"cache_write_5m_tokens,omitempty"`
+	CacheWrite1h     int       `json:"cache_write_1h_tokens,omitempty"`
 	CostUSD          float64   `json:"cost_usd"`
 	Unpriced         bool      `json:"unpriced"`
 	LatencyMS        int       `json:"latency_ms"`
@@ -210,13 +212,14 @@ func InsertEvents(ctx context.Context, tx pgx.Tx, events []Event) error {
 		b.Queue(`INSERT INTO usage_events
 			(ts, request_id, api_key_id, user_id, team_id, model_name, deployment_id, provider_id,
 			 prompt_tokens, completion_tokens, cached_tokens, cost_usd, unpriced, latency_ms, status_code, stream, gateway_id,
-			 attempts, error_code, ttft_ms, notional_cost_usd)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
+			 attempts, error_code, ttft_ms, notional_cost_usd, cache_write_5m_tokens, cache_write_1h_tokens)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
 			e.TS, e.RequestID, nilIfEmpty(e.APIKeyID), nilIfEmpty(e.UserID), nilIfEmpty(e.TeamID),
 			e.ModelName, nilIfEmpty(e.DeploymentID), nilIfEmpty(e.ProviderID),
 			e.PromptTokens, e.CompletionTokens, e.CachedTokens, e.CostUSD, e.Unpriced,
 			e.LatencyMS, e.StatusCode, e.Stream, nilIfEmpty(e.GatewayID),
-			zeroIfNil(e.Attempts), nilIfEmpty(e.ErrorCode), zeroIfNil(e.TTFTMs), zeroFloatIfNil(e.NotionalCostUSD))
+			zeroIfNil(e.Attempts), nilIfEmpty(e.ErrorCode), zeroIfNil(e.TTFTMs), zeroFloatIfNil(e.NotionalCostUSD),
+			e.CacheWrite5m, e.CacheWrite1h)
 
 		day := e.TS.UTC().Truncate(24 * time.Hour)
 		tokens := int64(e.PromptTokens + e.CompletionTokens)

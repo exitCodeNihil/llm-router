@@ -67,6 +67,7 @@
   "usage": {
     "prompt": 150,
     "completion": 8,
-    "cached": 100
+    "cached": 100,
+    "write_5m": 30
   }
 }

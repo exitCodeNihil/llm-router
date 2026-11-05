@@ -1,0 +1,17 @@
+{
+  "fn": "anth_json_usage",
+  "in": {
+    "content": [],
+    "usage": {
+      "input_tokens": 10,
+      "output_tokens": 5,
+      "cache_creation_input_tokens": 300
+    }
+  },
+  "usage": {
+    "prompt": 310,
+    "completion": 5,
+    "cached": 0,
+    "write_5m": 300
+  }
+}

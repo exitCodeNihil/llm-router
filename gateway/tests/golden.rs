@@ -34,6 +34,14 @@ struct GoldenUsage {
     prompt: i64,
     completion: i64,
     cached: i64,
+    #[serde(default)]
+    write_5m: i64,
+    #[serde(default)]
+    write_1h: i64,
+    #[serde(default)]
+    us: bool,
+    #[serde(default)]
+    fast: bool,
 }
 
 #[test]
@@ -86,7 +94,15 @@ fn check(g: &Golden) -> Result<(), String> {
         "anth_to_oai_stream" => stream(translate::AnthToOaiStream::new(&g.model, &g.req_id), input),
         other => return Err(format!("unknown fn {other:?}")),
     };
-    let have = GoldenUsage { prompt: usage.prompt, completion: usage.completion, cached: usage.cached };
+    let have = GoldenUsage {
+        prompt: usage.prompt,
+        completion: usage.completion,
+        cached: usage.cached,
+        write_5m: usage.write_5m,
+        write_1h: usage.write_1h,
+        us: usage.us_inference,
+        fast: usage.fast,
+    };
     if g.usage.as_ref() != Some(&have) {
         return Err(format!("usage: want {:?}, have {have:?}", g.usage));
     }

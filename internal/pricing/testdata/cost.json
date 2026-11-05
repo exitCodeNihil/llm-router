@@ -1,0 +1,17 @@
+[
+  {"name": "plain input and output", "rates": [3, 15, 0.3], "tokens": {"prompt": 1000, "completion": 100}, "want": 0.0045},
+  {"name": "cache read at the cached rate", "rates": [3, 15, 0.3], "tokens": {"prompt": 1000, "completion": 100, "cached": 800}, "want": 0.00234},
+  {"name": "cache read with no cached rate bills as input", "rates": [3, 15], "tokens": {"prompt": 1000, "completion": 100, "cached": 800}, "want": 0.0045},
+  {"name": "5 minute write costs 1.25x input", "rates": [2, 10, 0.1], "tokens": {"prompt": 10000, "completion": 4, "write_5m": 9000}, "want": 0.02454},
+  {"name": "1 hour write costs 2x input", "rates": [2, 10, 0.1], "tokens": {"prompt": 10000, "completion": 4, "write_1h": 9000}, "want": 0.03804},
+  {"name": "write and read together", "rates": [4, 20, 0.2], "tokens": {"prompt": 10000, "completion": 100, "cached": 4000, "write_5m": 3000, "write_1h": 2000}, "want": 0.0378},
+  {"name": "write with no cached rate still costs 1.25x", "rates": [1, 5], "tokens": {"prompt": 1000, "write_5m": 1000}, "want": 0.00125},
+  {"name": "long prompt below the threshold", "rates": [0.1, 0.5, 0.01], "long": [100000, 5], "tokens": {"prompt": 100000, "completion": 10}, "want": 0.010005},
+  {"name": "long prompt raises every rate", "rates": [0.1, 0.5, 0.01], "long": [100000, 5], "tokens": {"prompt": 100001, "completion": 10}, "want": 0.05002550},
+  {"name": "cache tokens count toward the long prompt threshold", "rates": [0.1, 0.5, 0.01], "long": [100000, 5], "tokens": {"prompt": 150000, "completion": 10, "cached": 100000, "write_5m": 40000}, "want": 0.035025},
+  {"name": "US-only inference is 1.1x", "rates": [3, 15, 0.3], "tokens": {"prompt": 1000, "completion": 100, "us": true}, "want": 0.00495},
+  {"name": "fast mode is 2x", "rates": [4, 20, 0.2], "tokens": {"prompt": 1000, "completion": 100, "fast": true}, "want": 0.012},
+  {"name": "fast mode and US-only stack, cache rules on top", "rates": [4, 20, 0.2], "tokens": {"prompt": 1000, "completion": 100, "cached": 500, "write_5m": 500, "us": true, "fast": true}, "want": 0.01012},
+  {"name": "parts over the prompt are clamped", "rates": [1, 5, 0.5], "tokens": {"prompt": 100, "cached": 80, "write_5m": 80, "write_1h": 80}, "want": 0.000065},
+  {"name": "no tokens costs nothing", "rates": [10, 50, 1], "tokens": {}, "want": 0}
+]

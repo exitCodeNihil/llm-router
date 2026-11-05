@@ -105,6 +105,9 @@ type Price struct {
 	InputPer1M       float64
 	OutputPer1M      float64
 	CachedInputPer1M *float64
+	// Above LongPromptTokens prompt tokens every rate is multiplied. 0 = no tier.
+	LongPromptTokens     int
+	LongPromptMultiplier float64
 }
 
 type Issuer struct {

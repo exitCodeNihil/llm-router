@@ -1,0 +1,16 @@
+{
+  "fn": "anth_to_oai_stream",
+  "model": "m",
+  "req_id": "r",
+  "in": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":300,\"cache_creation\":{\"ephemeral_5m_input_tokens\":100,\"ephemeral_1h_input_tokens\":200},\"inference_geo\":\"us\",\"speed\":\"fast\"}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":7,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":300}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+  "out": "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0}],\"id\":\"chatcmpl-r\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}],\"id\":\"chatcmpl-r\",\"model\":\"m\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[],\"id\":\"chatcmpl-r\",\"model\":\"m\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":7,\"prompt_tokens\":410,\"total_tokens\":417}}\n\ndata: [DONE]\n\n",
+  "usage": {
+    "prompt": 410,
+    "completion": 7,
+    "cached": 100,
+    "write_5m": 100,
+    "write_1h": 200,
+    "us": true,
+    "fast": true
+  }
+}
