@@ -283,3 +283,25 @@ async fn unreachable_provider_is_recorded() {
         assert_eq!((events[0].status_code, events[0].error_code), (500, "internal_error"), "{path}");
     }
 }
+
+/// A JWT goes to identity-token verification, not the key lookup; with no
+/// issuers configured it is refused as the control plane's /v1 refuses it.
+#[tokio::test]
+async fn identity_tokens_are_verified_not_looked_up() {
+    let (up, hits) = upstream(Reply { status: 200, flavor: "openai", headers: &[] }).await;
+    let gw = gateway("m", &[(&up, "openai", "none")]).await;
+    for (token, want) in [
+        ("eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJ4In0.c2ln", "invalid identity token: no token issuers configured"),
+        ("not-a-key", "invalid API key"),
+    ] {
+        let req = Request::post(format!("{gw}/v1/chat/completions"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Full::new(Bytes::from(json!({"model": "m", "messages": []}).to_string())))
+            .unwrap();
+        let resp = server::https_client(1).request(req).await.unwrap();
+        assert_eq!(resp.status(), 401, "{token}");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains(want), "{token}: {}", String::from_utf8_lossy(&body));
+    }
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
+}

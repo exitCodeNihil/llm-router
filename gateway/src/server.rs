@@ -160,9 +160,16 @@ async fn dispatch(st: &'static State, req: Request<Incoming>) -> Response<Body> 
                     "gateway has no config snapshot yet",
                 );
             };
-            let (key, inbound) = match authenticate(&cfg, req.headers()) {
+            let (caller, inbound) = match authenticate(&cfg, req.headers()) {
                 Ok(v) => v,
                 Err(r) => return r,
+            };
+            let key = match caller {
+                Caller::Key(key) => key,
+                Caller::Token(token) => match crate::cloud::jwt::identities().authenticate(&cfg, &token).await {
+                    Ok(key) => key,
+                    Err(e) => return auth_error(&format!("invalid identity token: {e}")),
+                },
             };
             let route = route_of(req.method(), path);
             if let Err(d) = limits::check(&key) {
@@ -190,10 +197,17 @@ async fn dispatch(st: &'static State, req: Request<Incoming>) -> Response<Body> 
     }
 }
 
+/// Who a request says it is: a gateway key, resolved, or an identity token,
+/// which needs verifying.
+enum Caller {
+    Key(Arc<Key>),
+    Token(String),
+}
+
 /// Resolve the caller (gateway.authenticate): X-Llmr-Key first, so a
 /// pass-through client can keep Authorization for its own upstream token, then
 /// Authorization, then x-api-key.
-fn authenticate(cfg: &Config, h: &HeaderMap) -> Result<(Arc<Key>, Inbound), Response<Body>> {
+fn authenticate(cfg: &Config, h: &HeaderMap) -> Result<(Caller, Inbound), Response<Body>> {
     let header_str = |name: &str| h.get(name).and_then(|v| v.to_str().ok()).filter(|s| !s.is_empty());
     let mut via_authz = false;
     let token = match header_str("x-llmr-key") {
@@ -209,23 +223,28 @@ fn authenticate(cfg: &Config, h: &HeaderMap) -> Result<(Arc<Key>, Inbound), Resp
             },
         },
     };
-    let key = token
-        .starts_with("llmr_")
-        .then(|| {
-            let digest = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(digest.as_ref());
-            cfg.keys.get(&hash).cloned()
-        })
-        .flatten()
-        .filter(|k| k.expires_at == 0 || now_ms() / 1000 <= k.expires_at);
-    let Some(key) = key else { return Err(auth_error("invalid API key")) };
+    let caller = if !token.starts_with("llmr_") && token.bytes().filter(|&b| b == b'.').count() == 2 {
+        Some(Caller::Token(token.to_string()))
+    } else {
+        token
+            .starts_with("llmr_")
+            .then(|| {
+                let digest = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(digest.as_ref());
+                cfg.keys.get(&hash).cloned()
+            })
+            .flatten()
+            .filter(|k| k.expires_at == 0 || now_ms() / 1000 <= k.expires_at)
+            .map(Caller::Key)
+    };
+    let Some(caller) = caller else { return Err(auth_error("invalid API key")) };
     let inbound = Inbound {
         // Only when it wasn't the gateway key: that must never travel upstream.
         authorization: if via_authz { None } else { h.get(header::AUTHORIZATION).cloned() },
         anthropic_beta: h.get("anthropic-beta").cloned(),
     };
-    Ok((key, inbound))
+    Ok((caller, inbound))
 }
 
 fn emit(cfg: &Arc<Config>, key: &Arc<Key>, model: String, stream: bool) -> Emit {
