@@ -6,6 +6,7 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy)]
 pub struct Memory {
     /// The cgroup's working set (memory.current less inactive page cache,
     /// what the kubelet and `docker stats` report), or the process's RSS
@@ -46,7 +47,23 @@ fn field(s: &str, key: &str) -> Option<u64> {
     s.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix(' ')?.trim().parse().ok())
 }
 
+/// Memory, read at most once a second: /metrics is unauthenticated and the
+/// sync loop runs back to back under load, and each read is several file reads
+/// on a request thread (memory.stat also makes the kernel flush its stats).
 pub fn memory() -> Memory {
+    static LAST: Mutex<Option<(Instant, Memory)>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    if let Some((at, m)) = *last
+        && at.elapsed() < Duration::from_secs(1)
+    {
+        return m;
+    }
+    let m = read_memory();
+    *last = Some((Instant::now(), m));
+    m
+}
+
+fn read_memory() -> Memory {
     if let Some(dir) = cgroup_dir()
         && let Some(current) = read(&format!("{dir}/memory.current")).as_deref().and_then(number)
     {
@@ -107,9 +124,13 @@ pub fn cpu_pct() -> f64 {
     static LAST: Mutex<Option<(Instant, f64, f64)>> = Mutex::new(None);
     let mut last = LAST.lock().unwrap();
     let now = Instant::now();
+    if let Some((at, _, pct)) = *last
+        && now.duration_since(at) < Duration::from_secs(5)
+    {
+        return pct;
+    }
     let Some(used) = cpu_seconds() else { return 0.0 };
     match *last {
-        Some((at, _, pct)) if now.duration_since(at) < Duration::from_secs(5) => pct,
         Some((at, before, _)) => {
             let wall = now.duration_since(at).as_secs_f64();
             let pct = ((used - before) / wall / cpu_allowance() * 100.0).clamp(0.0, 100.0);
