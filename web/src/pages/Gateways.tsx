@@ -204,12 +204,6 @@ function historyRows(h: NodesHistoryResponse, ids: string[]) {
   return rows;
 }
 
-function colorIndex(id: string) {
-  let h = 0;
-  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
-  return h % SERIES_COLORS.length;
-}
-
 function GatewayHistory() {
   const history = useNodesHistory();
   const [picked, setSelected] = useState(ALL);
@@ -224,12 +218,17 @@ function GatewayHistory() {
     [history.data, key],
   );
   const one = shown.length === 1;
+  // By place among all gateways sorted by id, so neighbours get distinct hues
+  // and a gateway keeps its colour while the set stays the same, whichever
+  // one is picked. A lone gateway takes the accent.
+  const byId = gateways.map((g) => g.id).sort();
+  const color = (id: string) =>
+    gateways.length === 1 ? chart.accent : SERIES_COLORS[byId.indexOf(id) % SERIES_COLORS.length];
   const series = (prefix: string) =>
     shown.map((g, i) => ({
       key: `${prefix}${i}`,
       name: one ? g.name : `${g.group} / ${g.name}`,
-      // By id, so a gateway keeps its colour as others come and go.
-      color: one ? chart.accent : SERIES_COLORS[colorIndex(g.id)],
+      color: color(g.id),
     }));
   const memory = one
     ? [...series("m"), { key: "l0", name: "Limit", color: chart.crit, isDashed: true }]

@@ -201,13 +201,18 @@ export function LatencyLine({
   );
 }
 
-/** Categorical hues for one line per series, from the Astryx data palette. */
+/**
+ * Categorical hues for one line per series, from the Astryx data palette as
+ * src/theme.ts steps it. Assign them in this order: neighbours are the pairs
+ * checked to stay apart.
+ */
 export const SERIES_COLORS = [
-  "var(--color-icon-blue)",
-  "var(--color-accent)",
-  "var(--color-icon-green)",
-  "var(--color-icon-purple)",
-  "var(--color-text-disabled)",
+  "var(--color-data-categorical-blue)",
+  "var(--color-data-categorical-orange)",
+  "var(--color-data-categorical-teal)",
+  "var(--color-data-categorical-brown)",
+  "var(--color-data-categorical-pink)",
+  "var(--color-data-categorical-purple)",
 ];
 
 /**
