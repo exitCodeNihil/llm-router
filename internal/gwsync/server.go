@@ -344,6 +344,7 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request, p peer) {
 		e.GatewayID, e.GatewayGroupID = instance, group
 		if e.TraceID == "" {
 			e.TraceID = usage.TraceIDFor(e.RequestID) // gateways before 0.3.0 send none
+			e.Export = true                           // nor their own verdict
 		}
 		events = append(events, e)
 	}
@@ -518,8 +519,10 @@ func (s *Server) record(r *http.Request, instance string, batch int64, events []
 
 // export hands an uploaded event to the exporters, deciding here whether it is
 // exported and with what content: the control plane stays authoritative for
-// the policy, and the group's data rule can only take away. Destinations
-// then apply their own scopes to e.GatewayGroupID.
+// the policy, and the group's data rule can only take away. So can the
+// gateway's own verdict: it says no for a caller whose traceparent is not
+// sampled, and for a policy it evaluated the same way. Destinations then
+// apply their own scopes to e.GatewayGroupID.
 func (s *Server) export(snap *snapshot.Snapshot, g *snapshot.GatewayGroup, enc *encoded, e usage.Event) {
 	if s.Export == nil {
 		return
@@ -536,7 +539,7 @@ func (s *Server) export(snap *snapshot.Snapshot, g *snapshot.GatewayGroup, enc *
 	}
 	dec := snap.Telemetry.Evaluate(e.APIKeyID, e.UserID, e.TeamID, tags, e.RequestID)
 	e.Tags, e.RuleID = tags, dec.RuleID
-	e.Export = dec.Export && g.DataRule != "no_export"
+	e.Export = e.Export && dec.Export && g.DataRule != "no_export"
 	e.CaptureContent = dec.CaptureContent && g.DataRule == "inherit"
 	if !e.CaptureContent {
 		e.Input, e.Output, e.System = nil, "", nil

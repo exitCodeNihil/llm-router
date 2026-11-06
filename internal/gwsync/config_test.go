@@ -13,6 +13,7 @@ import (
 
 	"github.com/exitcodenihil/llm-router/internal/auth"
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
+	"github.com/exitcodenihil/llm-router/internal/usage"
 )
 
 // fixture: team A (only "gpt-a") and team B; alice is in A, bob in B, carol in
@@ -306,5 +307,122 @@ func TestMemberOfAllowed(t *testing.T) {
 	}
 	if memberOfAllowed(s, g, "bob") || memberOfAllowed(s, g, "carol") || memberOfAllowed(s, g, "") {
 		t.Fatal("bob, carol and nobody are not this group's")
+	}
+}
+
+// Schema 2 gateways get the capture policy and the content scopes of the
+// destinations that take their group with content; never a destination's
+// endpoint or credentials. Schema 1 gets neither.
+func TestConfigTelemetry(t *testing.T) {
+	s := fixture()
+	s.Telemetry = snapshot.Telemetry{Mode: "by_rule", Rules: []snapshot.TelemetryRule{
+		{ID: "r2", Order: 2, ScopeType: "tag", ScopeValue: "prod", Capture: "content", Sample: 50, Enabled: true},
+		{ID: "r1", Order: 1, ScopeType: "team", ScopeValue: "A", Capture: "meta", Sample: 100, Enabled: true},
+	}}
+	s.KeysByHash[[32]byte{1}].Tags = []string{"prod", "eu"}
+	s.TeamsByID["A"].Tags = []string{"team-tag"}
+	content := func(name string, max int, teams, groups snapshot.Scope) *snapshot.Destination {
+		return &snapshot.Destination{Name: name, Kind: "otlp", Enabled: true, Endpoint: "https://collector.example/" + name,
+			Secrets: map[string]string{"header:authorization": "Bearer dest-secret"}, ContentMode: "content",
+			MaxContentBytes: max, Teams: teams, Groups: groups}
+	}
+	all := snapshot.Scope{Mode: "all"}
+	onlyA := snapshot.Scope{Mode: "selected", Values: []string{"A"}}
+	s.Destinations = append(s.Destinations,
+		content("small", 1000, all, all),
+		content("big", 5000, all, snapshot.Scope{Mode: "selected", Values: []string{"g"}}),
+		content("team-a", 300, onlyA, all),
+		content("other-group", 9000, all, snapshot.Scope{Mode: "except", Values: []string{"g"}}),
+		&snapshot.Destination{Name: "meta", Enabled: true, ContentMode: "metadata_only", MaxContentBytes: 9000},
+		&snapshot.Destination{Name: "off", Enabled: false, ContentMode: "content", MaxContentBytes: 9000},
+		&snapshot.Destination{Name: "broken", Enabled: true, ContentMode: "content", MaxContentBytes: 9000, Err: "bad"},
+	)
+	g := &snapshot.GatewayGroup{ID: "g", Name: "all", DataRule: "inherit"}
+
+	old := buildConfig(s, g, 1)
+	raw, _ := json.Marshal(old.cfg)
+	for _, leak := range []string{`"telemetry"`, `"tags"`, "prod"} {
+		if strings.Contains(string(raw), leak) {
+			t.Errorf("schema 1 config carries %s", leak)
+		}
+	}
+
+	c := buildConfig(s, g, 2).cfg
+	tel := c.Telemetry
+	if tel == nil || tel.Mode != "by_rule" || len(tel.Rules) != 2 || tel.Rules[0].ID != "r1" || tel.Rules[1].Sample != 50 {
+		t.Fatalf("telemetry = %+v", tel)
+	}
+	want := []ContentScope{
+		{Teams: snapshot.Scope{Mode: "all", Values: []string{}}, MaxBytes: 5000},
+		{Teams: snapshot.Scope{Mode: "selected", Values: []string{"A"}}, MaxBytes: 300},
+	}
+	if len(tel.Content) != len(want) {
+		t.Fatalf("content = %+v, want %+v", tel.Content, want)
+	}
+	for i := range want {
+		if tel.Content[i].Teams.Mode != want[i].Teams.Mode || strings.Join(tel.Content[i].Teams.Values, ",") !=
+			strings.Join(want[i].Teams.Values, ",") || tel.Content[i].MaxBytes != want[i].MaxBytes {
+			t.Fatalf("content = %+v, want %+v", tel.Content, want)
+		}
+	}
+	raw, _ = json.Marshal(c)
+	for _, leak := range []string{"dest-secret", "collector.example", "lf-secret"} {
+		if strings.Contains(string(raw), leak) {
+			t.Errorf("schema 2 config carries %s", leak)
+		}
+	}
+	for _, k := range c.Keys {
+		if k.ID == "k-alice-team" && strings.Join(k.Tags, ",") != "eu,prod" {
+			t.Errorf("key tags = %v", k.Tags)
+		}
+	}
+	for _, tm := range c.Teams {
+		if tm.ID == "A" && strings.Join(tm.Tags, ",") != "team-tag" {
+			t.Errorf("team tags = %v", tm.Tags)
+		}
+	}
+
+	// A group that keeps content in captures none, whatever the destinations.
+	for _, rule := range []string{"no_content", "no_export"} {
+		c := buildConfig(s, &snapshot.GatewayGroup{ID: "g", Name: "all", DataRule: rule}, 2).cfg
+		if c.Telemetry == nil || len(c.Telemetry.Content) != 0 || c.Telemetry.Mode != "by_rule" {
+			t.Errorf("%s: telemetry = %+v", rule, c.Telemetry)
+		}
+	}
+	// No destinations and the default policy: an empty, not a missing, list.
+	raw, _ = json.Marshal(buildConfig(fixture(), g, 2).cfg.Telemetry)
+	if string(raw) != `{"mode":"","capture_content":false,"rules":[],"content":[]}` {
+		t.Errorf("default telemetry = %s", raw)
+	}
+}
+
+type collected struct{ events []usage.Event }
+
+func (c *collected) Write(e usage.Event) { c.events = append(c.events, e) }
+
+// The control plane decides export, and the gateway's verdict and the group's
+// data rule can only take away: a caller's unsampled trace stays unexported.
+func TestExportVerdicts(t *testing.T) {
+	snap := fixture()
+	snap.Telemetry = snapshot.Telemetry{Mode: "everything", CaptureContent: true}
+	for _, c := range []struct {
+		rule            string
+		gateway         bool
+		export, content bool
+	}{
+		{"inherit", true, true, true},
+		{"inherit", false, false, true},
+		{"no_content", true, true, false},
+		{"no_export", true, false, false},
+	} {
+		out := &collected{}
+		s := &Server{Export: out}
+		g := &snapshot.GatewayGroup{ID: "g", DataRule: c.rule}
+		s.export(snap, g, &encoded{built: built{keys: map[string]*snapshot.Key{}}}, usage.Event{RequestID: "r",
+			TraceID: "4bf92f3577b34da6a3ce929d0e0e4736", Export: c.gateway, CaptureContent: true, Output: "answer"})
+		e := out.events[0]
+		if e.Export != c.export || (e.Output != "") != c.content {
+			t.Errorf("%+v: export %v, output %q", c, e.Export, e.Output)
+		}
 	}
 }

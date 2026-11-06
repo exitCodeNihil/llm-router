@@ -37,6 +37,29 @@ type Config struct {
 	// so a gateway can map a verified token to a user without the address.
 	Issuers []Issuer          `json:"issuers,omitempty"`
 	Emails  map[string]string `json:"emails,omitempty"`
+	// Schema 2: the capture policy and what content the group's gateways
+	// capture. Destinations and their credentials stay on the control plane.
+	Telemetry *Telemetry `json:"telemetry,omitempty"`
+}
+
+// Telemetry is the capture policy (snapshot.Telemetry) plus Content: the
+// content scope of every usable destination that takes this group's traffic
+// with content. A gateway captures content for a request only when the policy
+// captures it and a scope here takes the caller's team, up to the largest
+// MaxBytes that does (snapshot.ContentWanted). Empty when the group's data
+// rule keeps content in. The control plane decides again what each
+// destination receives; this only spares gateways capturing what none would.
+type Telemetry struct {
+	Mode           string                   `json:"mode"`
+	CaptureContent bool                     `json:"capture_content"`
+	Rules          []snapshot.TelemetryRule `json:"rules"` // by order
+	Content        []ContentScope           `json:"content"`
+}
+
+// ContentScope is the teams a content destination takes, and its cap.
+type ContentScope struct {
+	Teams    snapshot.Scope `json:"teams"`
+	MaxBytes int            `json:"max_bytes"`
 }
 
 // Issuer is a token issuer a gateway verifies callers' identity tokens
@@ -59,6 +82,7 @@ type Group struct {
 }
 
 // Model lists are null when they don't restrict and [] when they admit nothing.
+// Tags (schema 2) are for the telemetry policy's tag rules.
 type Key struct {
 	Hash          string   `json:"hash"` // hex SHA-256 of the secret
 	ID            string   `json:"id"`
@@ -69,6 +93,7 @@ type Key struct {
 	RPMLimit      *int     `json:"rpm_limit,omitempty"`
 	TPMLimit      *int     `json:"tpm_limit,omitempty"`
 	ExpiresAt     int64    `json:"expires_at,omitempty"` // unix seconds
+	Tags          []string `json:"tags,omitempty"`
 }
 
 type User struct {
@@ -80,6 +105,7 @@ type User struct {
 	RPMLimit      *int                `json:"rpm_limit,omitempty"`
 	TPMLimit      *int                `json:"tpm_limit,omitempty"`
 	TeamIDs       []string            `json:"team_ids,omitempty"` // schema 2
+	Tags          []string            `json:"tags,omitempty"`     // schema 2
 }
 
 type Team struct {
@@ -88,6 +114,7 @@ type Team struct {
 	BudgetUSD     *float64 `json:"budget_usd,omitempty"`
 	RPMLimit      *int     `json:"rpm_limit,omitempty"`
 	TPMLimit      *int     `json:"tpm_limit,omitempty"`
+	Tags          []string `json:"tags,omitempty"` // schema 2
 }
 
 type Provider struct {
@@ -185,6 +212,9 @@ func buildConfig(s *snapshot.Snapshot, g *snapshot.GatewayGroup, schema int) bui
 		if k.ExpiresAt != nil {
 			wk.ExpiresAt = k.ExpiresAt.Unix()
 		}
+		if schema >= 2 {
+			wk.Tags = tags(k.Tags)
+		}
 		c.Keys = append(c.Keys, wk)
 	}
 	if schema >= 2 && len(s.Issuers) > 0 {
@@ -204,11 +234,21 @@ func buildConfig(s *snapshot.Snapshot, g *snapshot.GatewayGroup, schema int) bui
 		if schema >= 2 && len(u.TeamIDs) > 0 {
 			wu.TeamIDs = slices.Sorted(slices.Values(u.TeamIDs))
 		}
+		if schema >= 2 {
+			wu.Tags = tags(u.Tags)
+		}
 		c.Users = append(c.Users, wu)
 	}
 	for _, t := range teams {
-		c.Teams = append(c.Teams, Team{ID: t.ID, AllowedModels: list(t.AllowedModels),
-			BudgetUSD: t.BudgetUSD, RPMLimit: t.RPMLimit, TPMLimit: t.TPMLimit})
+		wt := Team{ID: t.ID, AllowedModels: list(t.AllowedModels),
+			BudgetUSD: t.BudgetUSD, RPMLimit: t.RPMLimit, TPMLimit: t.TPMLimit}
+		if schema >= 2 {
+			wt.Tags = tags(t.Tags)
+		}
+		c.Teams = append(c.Teams, wt)
+	}
+	if schema >= 2 {
+		c.Telemetry = telemetryFor(s, g)
 	}
 
 	names := make([]string, 0, len(s.DeploymentsByModel))
@@ -252,6 +292,56 @@ func buildConfig(s *snapshot.Snapshot, g *snapshot.GatewayGroup, schema int) bui
 	sort.Slice(c.Teams, func(i, j int) bool { return c.Teams[i].ID < c.Teams[j].ID })
 	sort.Slice(c.Providers, func(i, j int) bool { return c.Providers[i].ID < c.Providers[j].ID })
 	return b
+}
+
+// telemetryFor is the policy, and the content scopes of the destinations that
+// take group g's traffic with content: none when its data rule keeps content
+// in. Equal team scopes merge, keeping the larger cap.
+func telemetryFor(s *snapshot.Snapshot, g *snapshot.GatewayGroup) *Telemetry {
+	t := &Telemetry{Mode: s.Telemetry.Mode, CaptureContent: s.Telemetry.CaptureContent,
+		Rules: append([]snapshot.TelemetryRule{}, s.Telemetry.Rules...), Content: []ContentScope{}}
+	sort.SliceStable(t.Rules, func(i, j int) bool { return t.Rules[i].Order < t.Rules[j].Order })
+	if g.DataRule != "" && g.DataRule != "inherit" {
+		return t
+	}
+	byScope := map[string]int{} // scope → index in t.Content
+	for _, d := range s.Destinations {
+		if !d.Usable() || d.ContentMode != "content" || !d.Groups.Match(g.ID) {
+			continue
+		}
+		teams := snapshot.Scope{Mode: d.Teams.Mode, Values: slices.Sorted(slices.Values(d.Teams.Values))}
+		switch teams.Mode {
+		case "selected", "except":
+		default:
+			teams = snapshot.Scope{Mode: "all", Values: []string{}}
+		}
+		if teams.Values == nil {
+			teams.Values = []string{}
+		}
+		k := teams.Mode + "\x00" + strings.Join(teams.Values, "\x00")
+		if i, ok := byScope[k]; ok {
+			t.Content[i].MaxBytes = max(t.Content[i].MaxBytes, d.MaxContentBytes)
+			continue
+		}
+		byScope[k] = len(t.Content)
+		t.Content = append(t.Content, ContentScope{Teams: teams, MaxBytes: d.MaxContentBytes})
+	}
+	sort.Slice(t.Content, func(i, j int) bool {
+		a, b := t.Content[i].Teams, t.Content[j].Teams
+		if a.Mode != b.Mode {
+			return a.Mode < b.Mode
+		}
+		return strings.Join(a.Values, "\x00") < strings.Join(b.Values, "\x00")
+	})
+	return t
+}
+
+// tags is a sorted copy, nil when empty.
+func tags(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	return slices.Sorted(slices.Values(in))
 }
 
 // servable reports whether a gateway speaking schema can serve p. Schema 1
