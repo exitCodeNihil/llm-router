@@ -115,10 +115,60 @@ func TestSyncAgainstPostgres(t *testing.T) {
 		t.Fatalf("spend = %v, want 0.25 counted once", got)
 	}
 
+	// Events Postgres could not store as sent: one from before the partition
+	// window, one from a gateway clock running a day ahead, and one with an id
+	// that is not a uuid. They are corrected and stored, not refused, so the
+	// gateway does not resend the batch forever.
+	old, future, badID := ev(keyID, teamA), ev(keyID, teamA), ev(keyID, teamA)
+	old.TSMS = time.Now().AddDate(0, -4, 0).UnixMilli()
+	future.TSMS = time.Now().Add(24 * time.Hour).UnixMilli()
+	badID.DeploymentID = "not-a-uuid"
+	res, body = post("/gw/v1/sync", joined.Session, SyncRequest{Batch: 2, Events: []SyncEvent{old, future, badID}})
+	if res.StatusCode != 200 {
+		t.Fatalf("a batch with an old, a future and a malformed event: %d %s", res.StatusCode, body)
+	}
+	if n := rows(); n != 4 {
+		t.Fatalf("usage rows = %d, want 4", n)
+	}
+	lo, _ := usage.Window(time.Now())
+	var oldTS, futureTS time.Time
+	st.Pool.QueryRow(ctx, `SELECT ts FROM usage_events WHERE request_id=$1`, old.RequestID).Scan(&oldTS)
+	st.Pool.QueryRow(ctx, `SELECT ts FROM usage_events WHERE request_id=$1`, future.RequestID).Scan(&futureTS)
+	if !oldTS.Equal(lo) {
+		t.Fatalf("old event stored at %v, want the start of the window %v", oldTS, lo)
+	}
+	if futureTS.After(time.Now().Add(time.Minute)) {
+		t.Fatalf("future event stored at %v, want about now", futureTS)
+	}
+
+	// A row Postgres still refuses (here, a year with no partition) is skipped
+	// and adds no spend; the rest of the batch is stored.
+	tx, err := st.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, refused := ev(keyID, teamA).Event, ev(keyID, teamA).Event
+	good.TS, refused.TS = time.Now(), time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	kept, err := usage.InsertEvents(ctx, tx, []usage.Event{refused, good})
+	if err != nil {
+		t.Fatalf("a refused row failed the batch: %v", err)
+	}
+	if len(kept) != 1 || kept[0].RequestID != good.RequestID {
+		t.Fatalf("kept %d events, want only the good one", len(kept))
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var stored int
+	st.Pool.QueryRow(ctx, `SELECT count(*) FROM usage_events WHERE request_id IN ($1,$2)`, good.RequestID, refused.RequestID).Scan(&stored)
+	if stored != 1 {
+		t.Fatalf("stored %d of the good and refused rows, want 1", stored)
+	}
+
 	if _, err := st.Pool.Exec(ctx, `DELETE FROM gateway_instances WHERE id=$1`, joined.InstanceID); err != nil {
 		t.Fatal(err)
 	}
-	batch.Batch = 2
+	batch.Batch = 3
 	if res, _ := post("/gw/v1/sync", joined.Session, batch); res.StatusCode != 401 {
 		t.Fatalf("a removed instance got %d, want 401 so it joins again", res.StatusCode)
 	}

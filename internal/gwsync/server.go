@@ -288,7 +288,8 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request, instance, group st
 	// A gateway can only report usage for callers its group serves.
 	enc := s.encoded(snap, group)
 	events := make([]usage.Event, 0, len(req.Events))
-	dropped := 0
+	dropped, clamped, fixed := 0, 0, 0
+	now := time.Now()
 	for _, se := range req.Events {
 		e := se.Event
 		if g.AllowedTeams != nil && enc.keys[e.APIKeyID] == nil && !g.AllowedTeams[e.TeamID] {
@@ -296,7 +297,16 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request, instance, group st
 			continue
 		}
 		if se.TSMS > 0 {
-			e.TS = time.UnixMilli(se.TSMS).UTC()
+			e.TS = time.UnixMilli(se.TSMS)
+		}
+		// A gateway's clock or a corrupt event must not produce a row Postgres
+		// refuses: that would fail the batch, and the gateway would resend it.
+		var moved bool
+		if e.TS, moved = usage.ClampTS(e.TS, now); moved {
+			clamped++
+		}
+		if usage.Sanitize(&e) > 0 {
+			fixed++
 		}
 		e.GatewayID = instance
 		events = append(events, e)
@@ -304,8 +314,12 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request, instance, group st
 	if dropped > 0 {
 		slog.Warn("gateway reported usage outside its group", "instance", instance, "group", g.Name, "dropped", dropped)
 	}
+	if clamped > 0 || fixed > 0 {
+		slog.Warn("gateway reported usage the control plane corrected", "instance", instance,
+			"timestamps_clamped", clamped, "events_fixed", fixed)
+	}
 
-	fresh, err := s.record(r, instance, req.Batch, events)
+	fresh, events, err := s.record(r, instance, req.Batch, events)
 	if errors.Is(err, pgx.ErrNoRows) {
 		http.Error(w, "instance removed: join again", http.StatusUnauthorized)
 		return
@@ -334,23 +348,29 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request, instance, group st
 }
 
 // record writes a new batch's events and moves the instance's batch number on,
-// in one transaction. It reports false for a batch it has already recorded.
-func (s *Server) record(r *http.Request, instance string, batch int64, events []usage.Event) (bool, error) {
+// in one transaction. It reports false for a batch it has already recorded,
+// and returns the events it stored: rows Postgres refuses are skipped, so a
+// bad row cannot make the gateway resend the batch forever.
+func (s *Server) record(r *http.Request, instance string, batch int64, events []usage.Event) (bool, []usage.Event, error) {
 	ctx := r.Context()
 	tx, err := s.Store.Pool.Begin(ctx)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	defer tx.Rollback(ctx)
 	var last int64
 	if err := tx.QueryRow(ctx, `SELECT last_batch FROM gateway_instances WHERE id=$1 FOR UPDATE`, instance).Scan(&last); err != nil {
-		return false, err
+		return false, nil, err
 	}
 	fresh := batch > last
+	var kept []usage.Event
 	if fresh {
 		if len(events) > 0 {
-			if err := usage.InsertEvents(ctx, tx, events); err != nil {
-				return false, err
+			if kept, err = usage.InsertEvents(ctx, tx, events); err != nil {
+				return false, nil, err
+			}
+			if n := len(events) - len(kept); n > 0 {
+				slog.Warn("gateway usage rows refused", "instance", instance, "refused", n, "of", len(events))
 			}
 		}
 		_, err = tx.Exec(ctx, `UPDATE gateway_instances SET last_batch=$2, last_seen_at=now() WHERE id=$1`, instance, batch)
@@ -358,9 +378,9 @@ func (s *Server) record(r *http.Request, instance string, batch int64, events []
 		_, err = tx.Exec(ctx, `UPDATE gateway_instances SET last_seen_at=now() WHERE id=$1`, instance)
 	}
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
-	return fresh, tx.Commit(ctx)
+	return fresh, kept, tx.Commit(ctx)
 }
 
 // export hands an uploaded event to the exporters, deciding here whether it is

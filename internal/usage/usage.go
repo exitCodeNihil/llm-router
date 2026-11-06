@@ -6,6 +6,7 @@ package usage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -170,8 +172,12 @@ func (w *PGWriter) flush(ctx context.Context, events []Event) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if err := InsertEvents(ctx, tx, events); err != nil {
+	kept, err := InsertEvents(ctx, tx, events)
+	if err != nil {
 		return err
+	}
+	if n := len(events) - len(kept); n > 0 {
+		slog.Warn("usage rows refused", "refused", n, "of", len(events))
 	}
 	return tx.Commit(ctx)
 }
@@ -196,31 +202,95 @@ func ScopeKeys(e Event) []string {
 }
 
 // InsertEvents writes events and their spend_counters in tx: one multi-row
-// batch plus one aggregated upsert per (scope, day).
-func InsertEvents(ctx context.Context, tx pgx.Tx, events []Event) error {
+// batch plus one aggregated upsert per (scope, day). It returns the events it
+// stored. When Postgres refuses the batch over a row's data (error classes 22
+// and 23, a missing partition among them), it stores the rows one at a time
+// and skips the ones it refuses, so one bad row cannot sink the rest; those
+// skipped rows add no spend. Any other error is returned as is.
+func InsertEvents(ctx context.Context, tx pgx.Tx, events []Event) ([]Event, error) {
+	err := savepoint(ctx, tx, func(sp pgx.Tx) error {
+		b := &pgx.Batch{}
+		for _, e := range events {
+			queueRow(b, e)
+		}
+		return sp.SendBatch(ctx, b).Close()
+	})
+	if err == nil {
+		return events, writeCounters(ctx, tx, events)
+	}
+	if !refusedRow(err) {
+		return nil, err
+	}
+	kept := make([]Event, 0, len(events))
+	for _, e := range events {
+		err := savepoint(ctx, tx, func(sp pgx.Tx) error {
+			b := &pgx.Batch{}
+			queueRow(b, e)
+			return sp.SendBatch(ctx, b).Close()
+		})
+		if err == nil {
+			kept = append(kept, e)
+			continue
+		}
+		if !refusedRow(err) {
+			return nil, err
+		}
+		slog.Warn("usage row refused", "request_id", e.RequestID, "ts", e.TS, "err", err)
+	}
+	return kept, writeCounters(ctx, tx, kept)
+}
+
+// savepoint runs fn in a nested transaction, so a failure rolls back only
+// what fn did and leaves tx usable.
+func savepoint(ctx context.Context, tx pgx.Tx, fn func(pgx.Tx) error) error {
+	sp, err := tx.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	if err := fn(sp); err != nil {
+		sp.Rollback(ctx)
+		return err
+	}
+	return sp.Commit(ctx)
+}
+
+// refusedRow reports whether Postgres refused a row's data (classes 22, data
+// exception, and 23, integrity constraint violation, which includes "no
+// partition of relation found"), as opposed to a failure retrying could fix.
+func refusedRow(err error) bool {
+	var pg *pgconn.PgError
+	if !errors.As(err, &pg) || len(pg.Code) < 2 {
+		return false
+	}
+	return pg.Code[:2] == "22" || pg.Code[:2] == "23"
+}
+
+func queueRow(b *pgx.Batch, e Event) {
+	b.Queue(`INSERT INTO usage_events
+		(ts, request_id, api_key_id, user_id, team_id, model_name, deployment_id, provider_id,
+		 prompt_tokens, completion_tokens, cached_tokens, cost_usd, unpriced, latency_ms, status_code, stream, gateway_id,
+		 attempts, error_code, ttft_ms, notional_cost_usd, cache_write_5m_tokens, cache_write_1h_tokens)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+		e.TS, e.RequestID, nilIfEmpty(e.APIKeyID), nilIfEmpty(e.UserID), nilIfEmpty(e.TeamID),
+		e.ModelName, nilIfEmpty(e.DeploymentID), nilIfEmpty(e.ProviderID),
+		e.PromptTokens, e.CompletionTokens, e.CachedTokens, e.CostUSD, e.Unpriced,
+		e.LatencyMS, e.StatusCode, e.Stream, nilIfEmpty(e.GatewayID),
+		zeroIfNil(e.Attempts), nilIfEmpty(e.ErrorCode), zeroIfNil(e.TTFTMs), zeroFloatIfNil(e.NotionalCostUSD),
+		e.CacheWrite5m, e.CacheWrite1h)
+}
+
+// writeCounters adds the events' spend: one upsert per (scope, day).
+func writeCounters(ctx context.Context, tx pgx.Tx, events []Event) error {
 	type counter struct {
 		scopeType, scopeID string
 		day                time.Time
 	}
-	agg := map[counter]*struct {
+	type total struct {
 		usd    float64
 		tokens int64
-	}{}
-
-	b := &pgx.Batch{}
+	}
+	agg := map[counter]*total{}
 	for _, e := range events {
-		b.Queue(`INSERT INTO usage_events
-			(ts, request_id, api_key_id, user_id, team_id, model_name, deployment_id, provider_id,
-			 prompt_tokens, completion_tokens, cached_tokens, cost_usd, unpriced, latency_ms, status_code, stream, gateway_id,
-			 attempts, error_code, ttft_ms, notional_cost_usd, cache_write_5m_tokens, cache_write_1h_tokens)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
-			e.TS, e.RequestID, nilIfEmpty(e.APIKeyID), nilIfEmpty(e.UserID), nilIfEmpty(e.TeamID),
-			e.ModelName, nilIfEmpty(e.DeploymentID), nilIfEmpty(e.ProviderID),
-			e.PromptTokens, e.CompletionTokens, e.CachedTokens, e.CostUSD, e.Unpriced,
-			e.LatencyMS, e.StatusCode, e.Stream, nilIfEmpty(e.GatewayID),
-			zeroIfNil(e.Attempts), nilIfEmpty(e.ErrorCode), zeroIfNil(e.TTFTMs), zeroFloatIfNil(e.NotionalCostUSD),
-			e.CacheWrite5m, e.CacheWrite1h)
-
 		day := e.TS.UTC().Truncate(24 * time.Hour)
 		tokens := int64(e.PromptTokens + e.CompletionTokens)
 		for _, key := range ScopeKeys(e) {
@@ -228,17 +298,17 @@ func InsertEvents(ctx context.Context, tx pgx.Tx, events []Event) error {
 			k := counter{scopeType, scopeID, day}
 			c := agg[k]
 			if c == nil {
-				c = &struct {
-					usd    float64
-					tokens int64
-				}{}
+				c = &total{}
 				agg[k] = c
 			}
 			c.usd += e.CostUSD
 			c.tokens += tokens
 		}
 	}
-	// one aggregated upsert per (scope, day) instead of three per event
+	if len(agg) == 0 {
+		return nil
+	}
+	b := &pgx.Batch{}
 	for k, c := range agg {
 		b.Queue(`INSERT INTO spend_counters (scope_type, scope_id, period_start, usd, tokens)
 			VALUES ($1,$2,$3,$4,$5)
@@ -251,7 +321,7 @@ func InsertEvents(ctx context.Context, tx pgx.Tx, events []Event) error {
 }
 
 // EnsurePartitions creates last, this and next month's usage_events
-// partitions. Called once at startup, where a failure is fatal: without a
+// partitions, the months in Window. Called once at startup, where a failure is fatal: without a
 // partition every usage row is silently dropped while the gateway reports
 // healthy. Last month is included so late gateway batches still land.
 func (w *PGWriter) EnsurePartitions(ctx context.Context) error {
@@ -259,9 +329,9 @@ func (w *PGWriter) EnsurePartitions(ctx context.Context) error {
 }
 
 func (w *PGWriter) ensurePartitions(ctx context.Context, now time.Time) error {
-	cur := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	lo, hi := Window(now)
 	var firstErr error
-	for _, start := range []time.Time{cur.AddDate(0, -1, 0), cur, cur.AddDate(0, 1, 0)} {
+	for start := lo; start.Before(hi); start = start.AddDate(0, 1, 0) {
 		end := start.AddDate(0, 1, 0)
 		name := "usage_events_" + start.Format("2006_01")
 		// DDL cannot take bind params; bounds are generated, not user input
