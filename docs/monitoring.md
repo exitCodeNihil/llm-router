@@ -54,6 +54,8 @@ Gateways only:
 | `llmr_limit_denials_total` | counter | `reason` (`budget_exceeded`, `rate_limit_exceeded`) | Requests refused by a budget or rate limit |
 | `llmr_sync_failures_total` | counter | | Failed syncs with the control plane |
 | `llmr_sync_refused_events_total` | counter | | Usage events dropped because the control plane refused their batch |
+| `llmr_usage_queued_content_bytes` | gauge | | Captured prompts and responses the queued usage events hold, at most 64 MiB |
+| `llmr_usage_content_stripped_total` | counter | | Usage events sent without their captured content because that 64 MiB was full |
 | `llmr_config_version`, `llmr_workers` | gauge | | Config version in use; worker threads |
 
 The control plane only:
