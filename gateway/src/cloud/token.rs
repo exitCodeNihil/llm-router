@@ -23,6 +23,9 @@ pub(crate) const MANDATORY_REFRESH: Duration = Duration::from_secs(30);
 /// A failed fetch isn't retried on every request.
 pub(crate) const RETRY_AFTER: Duration = Duration::from_secs(5);
 pub(crate) const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// The longest a token is trusted for, whatever its issuer says: a huge
+/// expires_in must neither overflow an Instant nor keep a token forever.
+pub(crate) const MAX_LIFETIME: Duration = Duration::from_secs(24 * 3600);
 
 /// Where new tokens come from.
 pub trait TokenSource: Send + Sync + 'static {
@@ -91,6 +94,7 @@ pub(crate) struct Token {
 impl Token {
     fn new(mut header: HeaderValue, lifetime: Duration) -> Token {
         header.set_sensitive(true);
+        let lifetime = lifetime.min(MAX_LIFETIME);
         let now = Instant::now();
         Token { header, expires: now + lifetime, refresh_at: now + refresh_after(lifetime) }
     }
@@ -317,6 +321,14 @@ mod tests {
         // 10 s left: too close to send, so this request waits for a new one.
         assert_eq!(t.bearer().await.unwrap(), "Bearer t1");
         assert_eq!(calls(&t), 2);
+    }
+
+    #[tokio::test]
+    async fn a_huge_lifetime_is_capped() {
+        let t = Fake::token(vec![Ok(u64::MAX)]);
+        assert_eq!(t.bearer().await.unwrap(), "Bearer t0");
+        let left = t.0.current.load_full().unwrap().expires - Instant::now();
+        assert!(left <= MAX_LIFETIME, "{left:?}");
     }
 
     #[tokio::test]

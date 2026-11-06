@@ -76,7 +76,7 @@ pub(crate) fn bearer_from(
     let token = v["access_token"].as_str().filter(|t| !t.is_empty());
     match (token, lifetime) {
         (Some(t), Some(secs)) => HeaderValue::try_from(format!("Bearer {t}"))
-            .map(|h| (h, Duration::from_secs(secs)))
+            .map(|h| (h, Duration::from_secs(secs).min(token::MAX_LIFETIME)))
             .map_err(|_| "the token response holds an unusable token".to_string().into()),
         _ => Err("the token response holds no usable token".to_string().into()),
     }
@@ -254,6 +254,8 @@ mod tests {
         let at = crate::now_ms() as u64 / 1000 + 600;
         let (_, d) = ok(serde_json::json!({"access_token": "a", "expires_on": at.to_string()})).unwrap();
         assert!(d > Duration::from_secs(590) && d <= Duration::from_secs(600), "{d:?}");
+        let (_, d) = ok(serde_json::json!({"access_token": "a", "expires_in": u64::MAX})).unwrap();
+        assert_eq!(d, token::MAX_LIFETIME);
         assert!(ok(serde_json::json!({"access_token": "", "expires_in": 1})).is_err());
         assert!(ok(serde_json::json!({"access_token": "a"})).is_err());
         let err = bearer_from(
