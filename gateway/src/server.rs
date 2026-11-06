@@ -393,6 +393,9 @@ async fn proxy_openai(
                     oai_error(StatusCode::BAD_REQUEST, "invalid_request_error", "unsupported_route", &m)
                 }
                 Some(BuildError::Unsupported(m)) => {
+                    // Recorded too, or a provider that can't be reached (a refused
+                    // token exchange, say) would fail requests without a trace.
+                    em.send(500, "internal_error", Default::default(), 0);
                     oai_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "internal_error", &m)
                 }
                 None => {
@@ -492,7 +495,10 @@ async fn proxy_anthropic(cfg: Arc<Config>, key: Arc<Key>, inbound: Inbound, req:
                     em.send(400, "unsupported_route", Default::default(), 0);
                     anth_error(StatusCode::BAD_REQUEST, "invalid_request_error", &m)
                 }
-                Some(BuildError::Unsupported(m)) => anth_error(StatusCode::INTERNAL_SERVER_ERROR, "api_error", &m),
+                Some(BuildError::Unsupported(m)) => {
+                    em.send(500, "internal_error", Default::default(), 0);
+                    anth_error(StatusCode::INTERNAL_SERVER_ERROR, "api_error", &m)
+                }
                 None => {
                     em.send(502, "upstream_unavailable", Default::default(), 0);
                     anth_error(

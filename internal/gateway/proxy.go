@@ -95,7 +95,11 @@ func (g *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				emitExtra{Attempts: attempts, ErrorCode: code})
 			return
 		}
+		// Recorded too, or a provider that can't be reached (a refused token
+		// exchange, say) would fail requests without a trace in usage.
 		writeError(w, http.StatusInternalServerError, "server_error", "internal_error", err.Error())
+		g.emit(snap, id, nil, body, reqID, usageCounts{}, http.StatusInternalServerError, start, nil, "", dec,
+			emitExtra{Attempts: attempts, ErrorCode: "internal_error"})
 		return
 	}
 	if resp == nil {

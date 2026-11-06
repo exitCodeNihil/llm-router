@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -244,6 +245,30 @@ func TestOAuthPassthrough(t *testing.T) {
 		if e.StatusCode != 400 || e.ErrorCode != "missing_credential" || e.ModelName != "claude-sonnet-5" {
 			t.Errorf("refusal row = %d %q %q, want 400 missing_credential claude-sonnet-5",
 				e.StatusCode, e.ErrorCode, e.ModelName)
+		}
+	}
+}
+
+// A provider that can't be reached at all, such as a refused workload identity
+// exchange, still leaves a usage row on both surfaces.
+func TestUnreachableProviderIsRecorded(t *testing.T) {
+	d := &snapshot.Deployment{ID: "dep-wif", ModelName: "wif", UpstreamName: "claude-x", APIFlavor: "anthropic",
+		Provider: &snapshot.Provider{ID: "prov-wif", Name: "wif", Type: "anthropic", BaseURL: "http://127.0.0.1:9",
+			AuthMode: "anthropic_wif", WIF: snapshot.AnthropicWIF{FederationRuleID: "fdrl_1", OrganizationID: "o",
+				ServiceAccountID: "svac_1", IdentityTokenFile: filepath.Join(t.TempDir(), "missing")}}}
+	g, cw, key := newTestServer(t, map[string][]*snapshot.Deployment{"wif": {d}})
+	if rec := doReq(t, g, key, `{"model":"wif","messages":[{"role":"user","content":"hi"}]}`); rec.Code != 500 {
+		t.Fatalf("/v1/chat/completions: status %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec := doAnthReq(t, g, key, `{"model":"wif","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}`); rec.Code != 500 {
+		t.Fatalf("/v1/messages: status %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(cw.events) != 2 {
+		t.Fatalf("want 2 usage rows, got %d", len(cw.events))
+	}
+	for _, e := range cw.events {
+		if e.StatusCode != 500 || e.ErrorCode != "internal_error" || e.ModelName != "wif" {
+			t.Errorf("row = %d %q %q, want 500 internal_error wif", e.StatusCode, e.ErrorCode, e.ModelName)
 		}
 	}
 }

@@ -159,6 +159,8 @@ func (g *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		writeAnthError(w, http.StatusInternalServerError, "api_error", err.Error())
+		g.emit(snap, id, nil, &reqBody{Model: areq.Model, Stream: areq.Stream}, reqID, usageCounts{},
+			http.StatusInternalServerError, start, nil, "", dec, emitExtra{Attempts: attempts, ErrorCode: "internal_error"})
 		return
 	}
 	body := &reqBody{Model: areq.Model, Stream: areq.Stream}
