@@ -122,31 +122,56 @@ impl<'de> Deserialize<'de> for Tag {
     }
 }
 
-/// Response text kept for telemetry: whole deltas while fewer than `cap`
-/// bytes are kept (Go: output.Len() < capture), cut to the cap when the
-/// event is sent. A cap of 0 keeps nothing and costs nothing.
+/// Response text kept for telemetry: at most `cap` bytes, cut at a
+/// character. Go keeps whole deltas while fewer than `cap` bytes are kept and
+/// cuts the text to the cap when the event is sent; this keeps the same text
+/// without ever holding more, and its buffer never grows past the cap. A cap
+/// of 0 keeps nothing and costs nothing.
 #[derive(Default)]
 pub struct Capture {
     cap: usize,
     text: String,
+    /// Some text was left out.
+    cut: bool,
 }
 
 impl Capture {
     pub fn new(cap: usize) -> Capture {
-        Capture { cap, text: String::new() }
+        Capture { cap, ..Capture::default() }
     }
 
     #[inline]
     fn wants(&self) -> bool {
-        self.text.len() < self.cap
+        !self.cut && self.text.len() < self.cap
     }
 
     fn push(&mut self, s: JStr) {
-        self.text.push_str(&s.value());
+        let inner = s.inner();
+        let room = self.cap.saturating_sub(self.text.len());
+        // Escaped text is never shorter than its value: this is room enough.
+        self.grow(inner.len().min(room));
+        if inner.contains('\\') {
+            self.cut |= unescape_into(inner, &mut self.text, room);
+        } else if inner.len() > room {
+            self.text.push_str(&inner[..floor_boundary(inner, room)]);
+            self.cut = true;
+        } else {
+            self.text.push_str(inner);
+        }
     }
 
-    fn take(&mut self) -> String {
-        std::mem::take(&mut self.text)
+    /// Room for `n` more bytes: doubling as a String does, up to the cap.
+    fn grow(&mut self, n: usize) {
+        let need = self.text.len() + n;
+        if need > self.text.capacity() {
+            let want = (self.text.capacity() * 2).clamp(need, self.cap.max(need));
+            self.text.reserve_exact(want - self.text.len());
+        }
+    }
+
+    /// The text kept, and whether any was left out.
+    pub fn into_parts(self) -> (String, bool) {
+        (self.text, self.cut)
     }
 }
 
@@ -614,22 +639,33 @@ pub fn anth_json_usage(body: &[u8]) -> Usage {
     }
 }
 
-/// The assistant text of an OpenAI chat-completion JSON, for telemetry (Go:
-/// copyJSON, writeAnthResponse).
-pub fn oai_json_text(body: &[u8]) -> String {
-    match parse::<OaiResponse>(body) {
-        Ok(r) => r.choices.first().map(|c| c.message.content.value().into_owned()).unwrap_or_default(),
-        Err(_) => String::new(),
+/// The assistant text of an OpenAI chat-completion JSON, at most `cap` bytes
+/// of it, for telemetry (Go: copyJSON, writeAnthResponse).
+pub fn oai_json_text(body: &[u8], cap: usize) -> Capture {
+    let mut c = Capture::new(cap);
+    if let Ok(r) = parse::<OaiResponse>(body)
+        && let Some(choice) = r.choices.first()
+        && c.wants()
+    {
+        c.push(choice.message.content);
     }
+    c
 }
 
-/// The text blocks of an Anthropic message JSON, joined, for telemetry (Go:
-/// passthroughAnthJSON, anthRespToOAI).
-pub fn anth_json_text(body: &[u8]) -> String {
-    match parse::<AnthResponse>(body) {
-        Ok(r) => r.content.iter().filter(|b| b.typ.is("text")).map(|b| b.text.value()).collect(),
-        Err(_) => String::new(),
+/// The text blocks of an Anthropic message JSON, joined, at most `cap` bytes
+/// of them, for telemetry (Go: passthroughAnthJSON, anthRespToOAI).
+pub fn anth_json_text(body: &[u8], cap: usize) -> Capture {
+    let mut c = Capture::new(cap);
+    if let Ok(r) = parse::<AnthResponse>(body) {
+        for b in r.content.iter().filter(|b| b.typ.is("text")) {
+            if !c.wants() {
+                c.cut |= !b.text.is_empty();
+                continue;
+            }
+            c.push(b.text);
+        }
     }
+    c
 }
 
 /// A streaming converter, fed one event at a time.
@@ -641,8 +677,8 @@ pub trait SseTransform: Send {
     /// Usage seen so far.
     fn usage(&self) -> Usage;
     /// The response text captured for telemetry; empty unless asked for.
-    fn take_output(&mut self) -> String {
-        String::new()
+    fn take_output(&mut self) -> Capture {
+        Capture::default()
     }
 }
 
@@ -702,8 +738,8 @@ impl SseTransform for OaiPassthrough {
     fn usage(&self) -> Usage {
         self.usage
     }
-    fn take_output(&mut self) -> String {
-        self.capture.take()
+    fn take_output(&mut self) -> Capture {
+        std::mem::take(&mut self.capture)
     }
 }
 
@@ -775,8 +811,8 @@ impl SseTransform for AnthPassthrough {
     fn usage(&self) -> Usage {
         self.usage
     }
-    fn take_output(&mut self) -> String {
-        self.capture.take()
+    fn take_output(&mut self) -> Capture {
+        std::mem::take(&mut self.capture)
     }
 }
 
@@ -932,8 +968,8 @@ impl SseTransform for OaiToAnthStream {
     fn usage(&self) -> Usage {
         self.usage
     }
-    fn take_output(&mut self) -> String {
-        self.capture.take()
+    fn take_output(&mut self) -> Capture {
+        std::mem::take(&mut self.capture)
     }
 }
 
@@ -1108,8 +1144,8 @@ impl SseTransform for AnthToOaiStream {
     fn usage(&self) -> Usage {
         self.usage
     }
-    fn take_output(&mut self) -> String {
-        self.capture.take()
+    fn take_output(&mut self) -> Capture {
+        std::mem::take(&mut self.capture)
     }
 }
 
@@ -1848,7 +1884,109 @@ mod tests {
         for d in [r"a\ud83d", r"\ude00 tail"] {
             t.event(format!(r#"data: {{"choices":[{{"delta":{{"content":"{d}"}}}}]}}"#).as_bytes(), &mut out);
         }
-        assert_eq!(t.take_output(), "a\u{fffd}\u{fffd} tail");
+        assert_eq!(t.take_output().into_parts(), ("a\u{fffd}\u{fffd} tail".to_string(), false));
+    }
+
+    fn run(t: &mut dyn SseTransform, events: &[String]) -> (String, bool) {
+        let mut out = Vec::new();
+        for e in events {
+            t.event(e.as_bytes(), &mut out);
+        }
+        t.finish(&mut out);
+        t.take_output().into_parts()
+    }
+
+    fn oai_chunk(content: &str) -> String {
+        format!(r#"data: {{"choices":[{{"index":0,"delta":{{"content":{content}}}}}]}}"#)
+    }
+
+    fn anth_delta(index: usize, delta: &str) -> String {
+        format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{delta}}}"
+        )
+    }
+
+    /// Every converter captures the response text, unescaped, non-ASCII
+    /// intact, and nothing of tool calls, thinking or a second choice.
+    #[test]
+    fn converters_capture_the_text() {
+        let want = "a\"b\n\u{e9}😀 ü tail";
+        let oai: Vec<String> = vec![
+            oai_chunk(r#""a\"b\n\u00e9\ud83d\ude00""#),
+            oai_chunk(r#"" ü""#),
+            r#"data: {"choices":[{"index":0,"delta":{"content":null,"tool_calls":[{"index":0,"id":"t","function":{"name":"f","arguments":"{\"content\":1}"}}]}}]}"#.into(),
+            oai_chunk(r#"" tail""#),
+            r#"data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":7}}"#.into(),
+            "data: [DONE]".into(),
+        ];
+        let anth: Vec<String> = vec![
+            anth_delta(0, r#"{"type":"thinking_delta","thinking":"hmm"}"#),
+            anth_delta(1, r#"{"type":"text_delta","text":"a\"b\n\u00e9\ud83d\ude00"}"#),
+            anth_delta(1, r#"{"type":"text_delta","text":" ü"}"#),
+            anth_delta(2, r#"{"type":"input_json_delta","partial_json":"{\"text_delta\":1}"}"#),
+            anth_delta(1, r#"{"type":"text_delta","text":" tail"}"#),
+        ];
+        let full = |t: &mut dyn SseTransform, evs: &[String]| run(t, evs);
+        assert_eq!(full(&mut OaiPassthrough::new(true).capturing(1000), &oai), (want.into(), false));
+        assert_eq!(full(&mut OaiToAnthStream::new("m", "r").capturing(1000), &oai), (want.into(), false));
+        assert_eq!(full(&mut AnthPassthrough::new().capturing(1000), &anth), (want.into(), false));
+        assert_eq!(full(&mut AnthToOaiStream::new("m", "r").capturing(1000), &anth), (want.into(), false));
+
+        // cut at the cap, at a character: "a\"b\n" is 4 bytes, é 2
+        let cut = ("a\"b\n".to_string(), true);
+        assert_eq!(full(&mut OaiPassthrough::new(true).capturing(5), &oai), cut);
+        assert_eq!(full(&mut OaiToAnthStream::new("m", "r").capturing(5), &oai), cut);
+        assert_eq!(full(&mut AnthPassthrough::new().capturing(5), &anth), cut);
+        assert_eq!(full(&mut AnthToOaiStream::new("m", "r").capturing(5), &anth), cut);
+        // not asked for: nothing
+        assert_eq!(full(&mut OaiPassthrough::new(true), &oai), (String::new(), false));
+        assert_eq!(full(&mut AnthPassthrough::new(), &anth), (String::new(), false));
+
+        // A response that only calls tools has no text to capture.
+        let tools_only = [r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"t","type":"function","function":{"name":"f","arguments":"{\"content\":\"x\"}"}}]}}]}"#.to_string()];
+        assert_eq!(full(&mut OaiPassthrough::new(false).capturing(100), &tools_only), (String::new(), false));
+        assert_eq!(full(&mut OaiToAnthStream::new("m", "r").capturing(100), &tools_only), (String::new(), false));
+        let tools_only = [anth_delta(0, r#"{"type":"input_json_delta","partial_json":"{\"text\":\"x\"}"}"#)];
+        assert_eq!(full(&mut AnthPassthrough::new().capturing(100), &tools_only), (String::new(), false));
+        assert_eq!(full(&mut AnthToOaiStream::new("m", "r").capturing(100), &tools_only), (String::new(), false));
+    }
+
+    #[test]
+    fn json_responses_capture_the_text() {
+        let oai = br#"{"choices":[{"message":{"content":"x\u00e9\ud83d\ude00 \"q\""}}]}"#;
+        assert_eq!(oai_json_text(oai, 100).into_parts(), ("xé😀 \"q\"".into(), false));
+        assert_eq!(oai_json_text(oai, 2).into_parts(), ("x".into(), true));
+        let tools = br#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"t","function":{"name":"f","arguments":"{}"}}]}}]}"#;
+        assert_eq!(oai_json_text(tools, 100).into_parts(), (String::new(), false));
+        let anth = r#"{"content":[{"type":"thinking","thinking":"hm"},{"type":"text","text":"x\u00e9"},
+            {"type":"tool_use","id":"t","name":"f","input":{"text":"in"}},{"type":"text","text":"ü"}]}"#;
+        let anth = anth.as_bytes();
+        assert_eq!(anth_json_text(anth, 100).into_parts(), ("xéü".into(), false));
+        assert_eq!(anth_json_text(anth, 3).into_parts(), ("xé".into(), true));
+        assert_eq!(anth_json_text(anth, 2).into_parts(), ("x".into(), true));
+        let tools = br#"{"content":[{"type":"tool_use","id":"t","name":"f","input":{"text":"in"}}]}"#;
+        assert_eq!(anth_json_text(tools, 100).into_parts(), (String::new(), false));
+        assert_eq!(oai_json_text(b"not json", 100).into_parts(), (String::new(), false));
+    }
+
+    /// However long the response, what is kept, and the memory it holds,
+    /// stays within the cap.
+    #[test]
+    fn captures_never_hold_more_than_the_cap() {
+        let cap = 10_000;
+        let mut t = OaiPassthrough::new(false).capturing(cap);
+        let mut out = Vec::new();
+        for _ in 0..5_000 {
+            t.event(oai_chunk(r#""0123456789\n\u00e9""#).as_bytes(), &mut out);
+            assert!(t.capture.text.capacity() <= cap, "{}", t.capture.text.capacity());
+        }
+        let (text, cut) = t.take_output().into_parts();
+        assert!(cut && text.len() <= cap && text.len() > cap - 4, "{}", text.len());
+        assert!(text.capacity() <= cap);
+
+        let long = format!(r#"{{"choices":[{{"message":{{"content":"{}"}}}}]}}"#, "y".repeat(2 << 20));
+        let (text, cut) = oai_json_text(long.as_bytes(), 64 << 10).into_parts();
+        assert!(cut && text.len() == 64 << 10 && text.capacity() == 64 << 10);
     }
 
     #[test]

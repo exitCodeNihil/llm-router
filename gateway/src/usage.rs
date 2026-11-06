@@ -12,7 +12,7 @@ use serde_json::value::RawValue;
 
 use crate::config::{AuthMode, Config, Deployment, Key, Price};
 use crate::telemetry::{self, Operation, Trace, Verdict};
-use crate::translate::{Tag, Usage};
+use crate::translate::{Capture, Tag, Usage};
 use crate::{limits, metrics};
 
 /// One request, as gwsync.SyncEvent expects it.
@@ -362,7 +362,7 @@ pub struct Emit {
     pub verdict: Verdict,
     /// The request's content, once captured; the response text joins it at send.
     pub content: Option<Box<Content>>,
-    pub output: String,
+    pub output: Capture,
 }
 
 /// The fields of a request body whose content is captured, the last of each
@@ -510,21 +510,25 @@ impl Emit {
     }
 
     /// The response text, for a verdict that captures content.
-    pub fn set_output(&mut self, text: String) {
+    pub fn set_output(&mut self, text: Capture) {
         if self.verdict.capture > 0 {
             self.output = text;
         }
     }
 
-    /// The captured content, the output cut to the cap; None when there is none.
+    /// The captured content, the output within the cap; None when there is
+    /// none. It holds no more memory than its bytes: those are what the
+    /// queue's content budget counts.
     fn take_content(&mut self) -> Option<Box<Content>> {
         let limit = self.verdict.capture;
         if limit == 0 {
             return None;
         }
         let mut c = self.content.take().unwrap_or_default();
-        c.output = std::mem::take(&mut self.output);
-        c.content_truncated |= cut_utf8(&mut c.output, limit);
+        let (output, cut) = std::mem::take(&mut self.output).into_parts();
+        c.output = output;
+        c.content_truncated |= cut | cut_utf8(&mut c.output, limit);
+        c.output.shrink_to_fit();
         if c.input.is_none() && c.system.is_none() && c.output.is_empty() && !c.content_truncated {
             return None;
         }
@@ -840,6 +844,52 @@ mod tests {
         assert!(cut_utf8(&mut s, 2));
         assert_eq!(s, "h");
         assert!(!cut_utf8(&mut s, 2));
+    }
+
+    pub(crate) fn emit_capturing(model: &str, capture: usize) -> Emit {
+        let w: Wire = serde_json::from_str(r#"{"schema":2,"version":1,"group":{"id":"g","name":"g"}}"#).unwrap();
+        Emit {
+            cfg: Arc::new(Config::build(w).unwrap()),
+            key: Arc::new(Key {
+                id: "k".into(),
+                user_id: String::new(),
+                team_id: String::new(),
+                user: None,
+                team: None,
+                allowed_models: None,
+                expires_at: 0,
+                scope: None,
+                tags: Vec::new(),
+            }),
+            model: model.into(),
+            request_id: "r".into(),
+            stream: false,
+            start: Instant::now(),
+            ts_ms: 0,
+            deployment: None,
+            attempts: 0,
+            trace: Trace::new(),
+            operation: Operation::Chat,
+            verdict: Verdict {
+                decision: telemetry::Decision { export: true, capture_content: true, rule_id: None },
+                capture,
+            },
+            content: None,
+            output: Capture::default(),
+        }
+    }
+
+    /// What is queued holds no more memory than the bytes the budget counts.
+    #[test]
+    fn captured_output_holds_only_its_bytes() {
+        let mut em = emit_capturing("capacity-test", 1000);
+        // text kept at a larger cap than the verdict's is cut here
+        let body = format!(r#"{{"choices":[{{"message":{{"content":"{}"}}}}]}}"#, "é".repeat(1500));
+        em.set_output(crate::translate::oai_json_text(body.as_bytes(), 3000));
+        let c = em.take_content().unwrap();
+        assert!(c.content_truncated);
+        assert_eq!(c.output.len(), 1000);
+        assert_eq!(c.output.capacity(), c.output.len());
     }
 
     #[test]

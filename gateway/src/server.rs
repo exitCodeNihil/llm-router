@@ -293,7 +293,7 @@ fn emit(cfg: &Arc<Config>, key: &Arc<Key>, model: String, stream: bool, rq: Rq) 
         operation: rq.operation,
         verdict,
         content: None,
-        output: String::new(),
+        output: Default::default(),
     }
 }
 
@@ -497,8 +497,8 @@ async fn proxy_openai(
             };
             if capture > 0 && status == StatusCode::OK {
                 em.set_output(match flavor {
-                    Flavor::Anthropic => translate::anth_json_text(&bytes),
-                    Flavor::OpenAI => translate::oai_json_text(&bytes),
+                    Flavor::Anthropic => translate::anth_json_text(&bytes, capture),
+                    Flavor::OpenAI => translate::oai_json_text(&bytes, capture),
                 });
             }
             let (bytes, usage) = if status != StatusCode::OK {
@@ -625,8 +625,8 @@ async fn proxy_anthropic(
             };
             if capture > 0 {
                 em.set_output(match flavor {
-                    Flavor::Anthropic => translate::anth_json_text(&bytes),
-                    Flavor::OpenAI => translate::oai_json_text(&bytes),
+                    Flavor::Anthropic => translate::anth_json_text(&bytes, capture),
+                    Flavor::OpenAI => translate::oai_json_text(&bytes, capture),
                 });
             }
             let (bytes, usage) = if flavor == Flavor::Anthropic {
