@@ -64,6 +64,8 @@ async fn google() -> (String, Seen) {
 
 async fn gateway(google: &str) -> String {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    // The stand-in Google is on loopback; a real stored key's token_uri is https.
+    llmr_gateway::cloud::gcp::allow_loopback_token_uri_for_tests();
     let digest = ring::digest::digest(&ring::digest::SHA256, KEY.as_bytes());
     let hash: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
     let sa = json!({"type": "service_account", "client_email": "gw@p.iam.gserviceaccount.com",

@@ -11,6 +11,7 @@
 //!   files aren't supported.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -66,10 +67,20 @@ struct File {
     refresh_token: String,
 }
 
+/// A credential JSON: a stored key (`allow_user` false) or a file on this
+/// machine. A stored key's token_uri must be https; a file's may be plain
+/// http to this machine, for a local test setup.
 fn parse(json: &str, allow_user: bool) -> Result<Creds, String> {
+    parse_with(json, allow_user, allow_user)
+}
+
+/// `parse`, with the loopback allowance for token_uri given separately, so
+/// tests can point a stored key at a local token server.
+fn parse_with(json: &str, allow_user: bool, loopback: bool) -> Result<Creds, String> {
     let f: File = serde_json::from_str(json).map_err(|e| format!("the credential JSON doesn't parse: {e}"))?;
     let token_uri = if f.token_uri.is_empty() { TOKEN_URI.to_string() } else { f.token_uri };
-    if !https_or_loopback(&token_uri) {
+    let ok = if loopback { https_or_loopback(&token_uri) } else { token_uri.starts_with("https://") };
+    if !ok {
         return Err(format!("token_uri {token_uri:?} must use https"));
     }
     match f.kind.as_str() {
@@ -261,6 +272,17 @@ pub fn adc() -> Arc<dyn Bearer> {
         .clone()
 }
 
+/// Set only by tests (allow_loopback_token_uri_for_tests).
+static LOOPBACK_TOKEN_URI: AtomicBool = AtomicBool::new(false);
+
+/// Lets stored keys name a token endpoint on this machine, for tests that
+/// serve their own. The gateway never calls it: a stored key's token_uri is
+/// https only.
+#[doc(hidden)]
+pub fn allow_loopback_token_uri_for_tests() {
+    LOOPBACK_TOKEN_URI.store(true, Ordering::Relaxed);
+}
+
 /// The token for a gcp_sa provider's key. Outlives config reloads, so a reload
 /// doesn't mint again; a re-pasted key is a new entry.
 pub fn service_account(provider: &str, json: &str) -> Arc<dyn Bearer> {
@@ -274,7 +296,7 @@ pub fn service_account(provider: &str, json: &str) -> Arc<dyn Bearer> {
             let parsed = if json.trim().is_empty() {
                 Err("no service account JSON stored".to_string())
             } else {
-                parse(json, false)
+                parse_with(json, false, LOOPBACK_TOKEN_URI.load(Ordering::Relaxed))
             };
             match parsed {
                 Ok(Creds::ServiceAccount(sa)) => Arc::new(RefreshingToken::new(Key(*sa))),
@@ -331,7 +353,8 @@ mod tests {
     #[tokio::test]
     async fn service_account_mints_a_signed_jwt_grant() {
         let (url, log) = mock::server(HashMap::from([("/token", (200, OK.into()))])).await;
-        let Creds::ServiceAccount(sa) = parse(&key_json(PKCS8, &format!("{url}/token")), false).unwrap() else {
+        let Creds::ServiceAccount(sa) = parse_with(&key_json(PKCS8, &format!("{url}/token")), false, true).unwrap()
+        else {
             panic!()
         };
         let public = sa.key.public().as_ref().to_vec();
@@ -375,6 +398,9 @@ mod tests {
         let err = service_account("gcp", " ").bearer().await.unwrap_err();
         assert!(err.contains("no service account JSON"), "{err}");
         let err = service_account("gcp", &key_json(PKCS8, "http://evil.example/token")).bearer().await.unwrap_err();
+        assert!(err.contains("https"), "{err}");
+        // Not even to this machine: a stored key is never a local test setup.
+        let err = service_account("gcp", &key_json(PKCS8, "http://127.0.0.1:9/token")).bearer().await.unwrap_err();
         assert!(err.contains("https"), "{err}");
         assert!(service_account("gcp", "{").bearer().await.is_err());
     }
@@ -463,7 +489,8 @@ mod tests {
     async fn token_errors_are_explained() {
         let reply = r#"{"error":"invalid_grant","error_description":"Invalid JWT Signature."}"#;
         let (url, _) = mock::server(HashMap::from([("/token", (400, reply.into()))])).await;
-        let Creds::ServiceAccount(sa) = parse(&key_json(PKCS8, &format!("{url}/token")), false).unwrap() else {
+        let Creds::ServiceAccount(sa) = parse_with(&key_json(PKCS8, &format!("{url}/token")), false, true).unwrap()
+        else {
             panic!()
         };
         let key = Key(*sa);
