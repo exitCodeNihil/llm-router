@@ -400,8 +400,8 @@ type collected struct{ events []usage.Event }
 
 func (c *collected) Write(e usage.Event) { c.events = append(c.events, e) }
 
-// The control plane decides export, and the gateway's verdict and the group's
-// data rule can only take away: a caller's unsampled trace stays unexported.
+// The control plane decides export, and the group's data rule can only take
+// away; the gateway's own verdict doesn't decide it, so a caller can't opt out.
 func TestExportVerdicts(t *testing.T) {
 	snap := fixture()
 	snap.Telemetry = snapshot.Telemetry{Mode: "everything", CaptureContent: true}
@@ -411,7 +411,7 @@ func TestExportVerdicts(t *testing.T) {
 		export, content bool
 	}{
 		{"inherit", true, true, true},
-		{"inherit", false, false, true},
+		{"inherit", false, true, true},
 		{"no_content", true, true, false},
 		{"no_export", true, false, false},
 	} {
