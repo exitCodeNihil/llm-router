@@ -25,19 +25,16 @@ import { useMe,
 import type { FlowEdgeRow, UsageByModel, UsageRecent } from "../lib/types";
 import { compact, dateShort, int, money, plural } from "../lib/format";
 import { Empty, ErrorState, Loading, Page } from "../components/Page";
-import { Breakdown, ChartCard, SpendArea, Stat, TokensBars, chart } from "../components/charts";
+import { Breakdown, ChartCard, SERIES_COLORS, SpendArea, Stat, TokensBars, chart } from "../components/charts";
 import { Sankey, type SankeyEdge, type SankeyNode } from "../components/Sankey";
 
 type Metric = "cost_usd" | "requests" | "tokens";
 
-// Categorical hues for provider series, from the Astryx data palette.
-const PROVIDER_COLORS = [
-  "var(--color-icon-blue)",
-  "var(--color-accent)",
-  "var(--color-icon-green)",
-  "var(--color-icon-purple)",
-  "var(--color-text-disabled)",
-];
+// A provider keeps its colour when the ranking changes: hues go by name order.
+function providerColors(names: string[]): (name: string) => string {
+  const order = [...new Set(names)].sort();
+  return (name) => SERIES_COLORS[order.indexOf(name) % SERIES_COLORS.length];
+}
 
 const trunc = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
@@ -92,9 +89,8 @@ function buildFlow(rows: FlowEdgeRow[], liveLed: Map<string, SankeyNode["led"]>)
     led: liveLed.get(id),
   }));
 
-  const colorOf = new Map(
-    provRanked.map(([id], i) => [id, PROVIDER_COLORS[i % PROVIDER_COLORS.length]]),
-  );
+  const colorByName = providerColors(provRanked.map(([, p]) => p.name));
+  const colorOf = new Map(provRanked.map(([id, p]) => [id, colorByName(p.name)]));
 
   const agg = new Map<string, SankeyEdge>();
   const add = (from: string, to: string, volume: number, color?: string) => {
@@ -161,11 +157,9 @@ function ProviderSpend({ days }: { days: number }) {
     [byProvider.data],
   );
 
-  const series = (byProvider.data?.providers ?? []).map((p, i) => ({
-    key: p,
-    name: p,
-    color: PROVIDER_COLORS[i % PROVIDER_COLORS.length],
-  }));
+  const names = byProvider.data?.providers ?? [];
+  const colorOf = providerColors(names);
+  const series = names.map((p) => ({ key: p, name: p, color: colorOf(p) }));
 
   if (byProvider.isLoading) return <Loading />;
   if (byProvider.error)
