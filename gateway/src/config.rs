@@ -36,6 +36,29 @@ pub struct Wire {
     pub deployments: Vec<WireDeployment>,
     #[serde(default)]
     pub prices: HashMap<String, Price>,
+    /// Identity-token issuers (schema 2).
+    #[serde(default)]
+    pub issuers: Vec<Issuer>,
+    /// Hex SHA-256 of a lowercased email → user id (schema 2).
+    #[serde(default)]
+    pub emails: HashMap<String, String>,
+}
+
+/// An identity-token issuer (gwsync.Issuer).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Issuer {
+    pub url: String,
+    pub audience: String,
+    #[serde(default)]
+    pub email_claim: String,
+    #[serde(default, rename = "match")]
+    pub match_claims: HashMap<String, String>,
+    #[serde(default)]
+    pub map_to_team: String,
+    /// Whether a caller with no user may be created; only set when the group
+    /// serves the team new users join.
+    #[serde(default)]
+    pub auto_create: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -74,6 +97,8 @@ pub struct WireUser {
     pub budget_usd: Option<f64>,
     pub rpm_limit: Option<i64>,
     pub tpm_limit: Option<i64>,
+    #[serde(default)]
+    pub team_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +188,7 @@ pub struct User {
     /// The member's share of a team's budget, by team id.
     pub memberships: HashMap<String, Arc<Scope>>,
     pub scope: Option<Arc<Scope>>,
+    pub team_ids: Vec<String>,
 }
 
 pub struct Key {
@@ -310,6 +336,10 @@ pub struct Config {
     /// Exact names in order, for /v1/models.
     pub names: Vec<String>,
     pub prices: HashMap<String, Price>,
+    pub teams: HashMap<String, Arc<Team>>,
+    pub issuers: Vec<Issuer>,
+    /// SHA-256 of a lowercased email → the user, for identity-token callers.
+    pub emails: HashMap<[u8; 32], Arc<User>>,
 }
 
 /// What a requested model name resolves to.
@@ -352,10 +382,12 @@ impl Config {
                     team_models: policy(u.team_models),
                     memberships,
                     scope,
+                    team_ids: u.team_ids,
                 };
                 (u.id, Arc::new(user))
             })
             .collect();
+        let emails = w.emails.iter().filter_map(|(hash, id)| Some((unhex32(hash)?, users.get(id)?.clone()))).collect();
         let mut keys = HashMap::with_capacity(w.keys.len());
         for k in w.keys {
             let Some(hash) = unhex32(&k.hash) else { continue };
@@ -420,7 +452,18 @@ impl Config {
         }
         patterns.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         names.sort();
-        Ok(Config { version: w.version, group: w.group, keys, models, patterns, names, prices: w.prices })
+        Ok(Config {
+            version: w.version,
+            group: w.group,
+            keys,
+            models,
+            patterns,
+            names,
+            prices: w.prices,
+            teams,
+            issuers: w.issuers,
+            emails,
+        })
     }
 
     /// Resolve a requested model (snapshot.Resolve): an exact name wins, else
