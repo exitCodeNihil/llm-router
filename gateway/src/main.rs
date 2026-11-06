@@ -41,6 +41,10 @@ fn main() {
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
+        // Blocking work is a sync body's encoding and the odd file or DNS
+        // lookup. Every blocking thread keeps its own allocator heap, so a
+        // burst must not start hundreds of them.
+        .max_blocking_threads(16)
         .enable_all()
         .build()
         .expect("tokio runtime");

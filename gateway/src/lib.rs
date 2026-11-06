@@ -5,6 +5,7 @@
 pub mod body;
 pub mod config;
 pub mod cp;
+pub mod dns;
 pub mod health;
 pub mod limits;
 pub mod metrics;

@@ -48,12 +48,12 @@ impl State {
     }
 }
 
-pub type HttpsClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+pub type HttpsClient = Client<HttpsConnector<HttpConnector<crate::dns::Resolver>>, Full<Bytes>>;
 
 /// An HTTP client with its own connection pool, for the control plane or for
 /// one worker thread's upstream calls.
 pub fn https_client(pool: usize) -> HttpsClient {
-    let mut http = HttpConnector::new();
+    let mut http = HttpConnector::new_with_resolver(crate::dns::Resolver::default());
     http.set_nodelay(true);
     http.set_connect_timeout(Some(Duration::from_secs(5)));
     http.enforce_http(false);
@@ -76,13 +76,17 @@ pub fn https_client(pool: usize) -> HttpsClient {
         .build(https)
 }
 
+/// Idle upstream connections a worker keeps per host. A burst opens as many as
+/// it needs; afterwards only this many wait for reuse, not thousands for 90 s.
+const MAX_IDLE_UPSTREAM: usize = 256;
+
 thread_local! {
     // One pool per worker: a shared pool is one lock every request takes.
     static UPSTREAM: RefCell<Option<HttpsClient>> = const { RefCell::new(None) };
 }
 
 pub(crate) fn upstream_client() -> HttpsClient {
-    UPSTREAM.with(|c| c.borrow_mut().get_or_insert_with(|| https_client(4096)).clone())
+    UPSTREAM.with(|c| c.borrow_mut().get_or_insert_with(|| https_client(MAX_IDLE_UPSTREAM)).clone())
 }
 
 pub async fn handle(st: &'static State, req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
