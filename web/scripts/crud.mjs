@@ -127,30 +127,30 @@ check("provider type persisted", provider?.type === "openai_compatible");
 check("providers table refreshed", await page.getByText(`${TAG}-provider`).first().isVisible());
 if (provider) created.providers.push(provider.id);
 
-// ── Deployments ─────────────────────────────────────────────────
+// ── Models ─────────────────────────────────────────────────
 if (provider) {
-  await page.goto(`${BASE}/deployments`, { waitUntil: "networkidle" });
-  await page.getByRole("button", { name: "Add deployment" }).first().click();
+  await page.goto(`${BASE}/models`, { waitUntil: "networkidle" });
+  await page.getByRole("button", { name: "Add model" }).first().click();
   await page.waitForTimeout(600);
   await dialog().getByRole("combobox", { name: /Provider/i }).click();
   await page.waitForTimeout(400);
   await page.getByRole("option", { name: new RegExp(`${TAG}-provider`) }).click();
   await page.waitForTimeout(600);
-  await dialog().getByLabel(/Model alias/).fill(`${TAG}-model`);
+  await dialog().getByLabel(/Model name/).fill(`${TAG}-model`);
   // Discovery fails against a dead host, so this exercises the manual-entry
   // path: type an arbitrary name, then Enter to commit it.
-  const upstream = dialog().getByRole("combobox", { name: /Upstream name/i });
+  const upstream = dialog().getByRole("combobox", { name: /Upstream model/i });
   await upstream.fill("upstream-probe");
   await page.waitForTimeout(600);
   await upstream.press("Enter");
   await page.waitForTimeout(400);
   check("manual upstream entry accepted when discovery fails", true);
   await dialog().getByLabel(/Catalog model id/).fill("azure/gpt-4o-2024-08-06");
-  await submitDialog("Add deployment");
+  await submitDialog("Add model");
 
   const dep = (await api("/api/deployments")).find((d) => d.model_name === `${TAG}-model`);
-  check("deployment created", !!dep, dep?.upstream_name);
-  check("deployment catalog pricing persisted", dep?.catalog_model_id === "azure/gpt-4o-2024-08-06");
+  check("model created", !!dep, dep?.upstream_name);
+  check("model catalog pricing persisted", dep?.catalog_model_id === "azure/gpt-4o-2024-08-06");
   if (dep) created.deployments.push(dep.id);
 }
 
