@@ -46,7 +46,7 @@ import {
   useTelemetry,
   useTelemetryKinds,
   useTestDestination,
-  useUpdateDestination,
+  useToggleDestination,
   useUsers,
 } from "../lib/hooks";
 import { int, money } from "../lib/format";
@@ -143,7 +143,7 @@ function DestinationsCard({ policyCapturesContent }: { policyCapturesContent: bo
   const kinds = useTelemetryKinds();
   const teams = useTeams();
   const groups = useGatewayGroups();
-  const update = useUpdateDestination();
+  const toggleDestination = useToggleDestination();
   const del = useDeleteDestination();
   const test = useTestDestination();
   const showToast = useToast();
@@ -161,21 +161,7 @@ function DestinationsCard({ policyCapturesContent }: { policyCapturesContent: bo
 
   async function toggle(d: TelemetryDestination) {
     try {
-      // PUT is a full replacement. Secrets and headers left out keep their
-      // stored values.
-      await update.mutateAsync({
-        id: d.id,
-        name: d.name,
-        kind: d.kind,
-        enabled: !d.enabled,
-        endpoint: d.endpoint,
-        traces_url: d.traces_url,
-        config: d.config,
-        content_mode: d.content_mode,
-        max_content_bytes: d.max_content_bytes,
-        team_scope: d.team_scope,
-        group_scope: d.group_scope,
-      });
+      await toggleDestination.mutateAsync({ id: d.id, enabled: !d.enabled });
       showToast({ body: d.enabled ? `${d.name} disabled` : `${d.name} enabled` });
     } catch (err) {
       showToast({ body: err instanceof Error ? err.message : "Failed", type: "error" });
@@ -393,7 +379,7 @@ function DestinationsCard({ policyCapturesContent }: { policyCapturesContent: bo
               } is sent to ${toggling ? hostOf(toggling) : ""}.`
         }
         actionLabel={toggling?.enabled ? "Disable" : "Enable"}
-        isLoading={update.isPending}
+        isLoading={toggleDestination.isPending}
         onCancel={() => setToggling(null)}
         onConfirm={async () => {
           if (!toggling) return;

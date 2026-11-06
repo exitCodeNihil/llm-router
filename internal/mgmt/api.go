@@ -186,6 +186,7 @@ func (m *Server) Register(mux *http.ServeMux) {
 	mux.Handle("GET /api/telemetry/destinations/{id}", h(m.getDestination))
 	mux.Handle("POST /api/telemetry/destinations", h(m.createDestination))
 	mux.Handle("PUT /api/telemetry/destinations/{id}", h(m.putDestination))
+	mux.Handle("PATCH /api/telemetry/destinations/{id}", h(m.patchDestination))
 	mux.Handle("DELETE /api/telemetry/destinations/{id}", h(m.deleteDestination))
 	mux.Handle("POST /api/telemetry/destinations/test", h(m.testDestination))
 	mux.Handle("GET /api/observability/exported", h(m.observabilityExported))

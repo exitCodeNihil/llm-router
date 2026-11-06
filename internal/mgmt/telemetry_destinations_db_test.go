@@ -131,6 +131,20 @@ func TestDestinationsAPIAgainstPostgres(t *testing.T) {
 		t.Fatalf("after put %+v", d)
 	}
 
+	// PATCH switches it on and leaves everything else alone.
+	if code, body = call("PATCH", "/api/telemetry/destinations/"+created.ID, `{"enabled":true}`); code != 204 {
+		t.Fatalf("patch: %d %s", code, body)
+	}
+	if d := stored(created.ID); !d.Enabled || d.Secrets["header:Authorization"] != "Bearer t0ken" || d.Name != "Tempo" {
+		t.Fatalf("after patch %+v", d)
+	}
+	if code, _ = call("PATCH", "/api/telemetry/destinations/"+created.ID, `{}`); code != 400 {
+		t.Fatalf("patch without enabled: %d", code)
+	}
+	if code, _ = call("PATCH", "/api/telemetry/destinations/"+uuid.NewString(), `{"enabled":false}`); code != 404 {
+		t.Fatalf("patch unknown: %d", code)
+	}
+
 	// Langfuse: the secret key is required, then kept when left out.
 	if code, body = call("POST", "/api/telemetry/destinations", `{"name":"LF","kind":"langfuse","endpoint":"https://cloud.langfuse.com",
 		"config":{"public_key":"pk-lf"}}`); code != 400 || !strings.Contains(body, "secret key") {

@@ -505,6 +505,12 @@ export const useUpdateDestination = () =>
     ({ id, ...b }: DestinationInput & { id: string }) => api.put(`/api/telemetry/destinations/${id}`, b),
     [["telemetry-destinations"]],
   );
+export const useToggleDestination = () =>
+  useInvalidatingMutation(
+    ({ id, enabled }: { id: string; enabled: boolean }) =>
+      api.patch(`/api/telemetry/destinations/${id}`, { enabled }),
+    [["telemetry-destinations"]],
+  );
 export const useDeleteDestination = () =>
   useInvalidatingMutation(
     (id: string) => api.del(`/api/telemetry/destinations/${id}`),

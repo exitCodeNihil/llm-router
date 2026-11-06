@@ -286,6 +286,38 @@ func (m *Server) putDestination(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// patchDestination switches a destination on or off and changes nothing else,
+// so the console's switch can't undo an edit another admin saved meanwhile.
+func (m *Server) patchDestination(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		httpError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	req, ok := decode[struct {
+		Enabled *bool `json:"enabled"`
+	}](w, r)
+	if !ok {
+		return
+	}
+	if req.Enabled == nil {
+		httpError(w, http.StatusBadRequest, "enabled is required")
+		return
+	}
+	tag, err := m.Store.Pool.Exec(r.Context(),
+		`UPDATE telemetry_destinations SET enabled=$2, updated_at=now() WHERE id=$1`, id, *req.Enabled)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		httpError(w, http.StatusNotFound, "not found")
+		return
+	}
+	m.bump(r.Context())
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // checkScopes refuses scope values that name no team or gateway group.
 func (m *Server) checkScopes(ctx context.Context, d *snapshot.Destination) error {
 	for _, c := range []struct {
