@@ -275,6 +275,99 @@ export interface TelemetrySettings {
   };
 }
 
+// Capture policy (GET/PUT /api/settings/telemetry). It decides what may be
+// exported at all; each destination then filters by its own scope and
+// content mode.
+export interface TelemetryPolicy {
+  mode: TelemetryMode | ""; // "" == everything
+  capture_content: boolean;
+  rules: TelemetryRule[];
+}
+
+// ── Telemetry destinations (/api/telemetry/*) ───────────────────
+export interface TelemetryKind {
+  name: string;
+  label: string;
+  beta: boolean;
+  /** Write-only fields of the kind; values never come back. */
+  secret_fields: string[];
+}
+
+export type ScopeMode = "all" | "selected" | "except";
+export interface DestinationScope {
+  mode: ScopeMode;
+  values: string[];
+}
+export type ContentMode = "metadata_only" | "content";
+export type DestinationStatus = "healthy" | "failing" | "no_data" | "disabled";
+
+export interface DestinationHealth {
+  status: DestinationStatus;
+  queued: number;
+  queued_bytes: number;
+  delivered: number;
+  dropped: { overflow: number; rejected: number; expired: number };
+  last_success_at: string | null;
+  last_error: string;
+  last_error_at: string | null;
+}
+
+export interface TelemetryDestination {
+  id: string;
+  name: string;
+  kind: string;
+  enabled: boolean;
+  endpoint: string;
+  traces_url: string;
+  config: Record<string, string>;
+  /** Which of the kind's secret fields are stored. */
+  secret_names: string[];
+  /** Names of the extra request headers; values are write-only. */
+  headers: string[];
+  content_mode: ContentMode;
+  max_content_bytes: number;
+  team_scope: DestinationScope;
+  group_scope: DestinationScope;
+  created_at: string;
+  updated_at: string;
+  health: DestinationHealth;
+  /** Why the destination can't run, e.g. undecryptable secrets. */
+  error?: string;
+  /** Trace link template containing {trace_id}; "" when there is none. */
+  trace_url: string;
+}
+
+/** Body of create, replace and test. */
+export interface DestinationInput {
+  /** Test only: the saved destination whose secrets fill in the draft. */
+  id?: string;
+  name: string;
+  kind: string;
+  enabled: boolean;
+  endpoint: string;
+  traces_url: string;
+  config: Record<string, string>;
+  /** Blank or missing keeps the stored value. */
+  secrets?: Record<string, string>;
+  /**
+   * The complete set: a stored header left out is deleted, one listed
+   * without a value keeps its stored value. Omitted keeps them all.
+   */
+  headers?: { name: string; value?: string }[];
+  content_mode: ContentMode;
+  max_content_bytes: number;
+  team_scope: DestinationScope;
+  group_scope: DestinationScope;
+}
+
+export interface DestinationTestResult {
+  ok: boolean;
+  /** HTTP status of a failed export. */
+  status?: number;
+  detail: string;
+  trace_url?: string;
+}
+
 // ── Live metrics (GET /api/metrics/live, admin) ──────────────────
 export interface LiveProvider {
   id: string;

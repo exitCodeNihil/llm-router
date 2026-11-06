@@ -15,6 +15,8 @@ import type {
   ChatSummary,
   Deployment,
   DeploymentReq,
+  DestinationInput,
+  DestinationTestResult,
   GatewayGroup,
   ExportedEvent,
   FlowEdgeRow,
@@ -33,6 +35,8 @@ import type {
   SsoSettings,
   Team,
   TeamMember,
+  TelemetryDestination,
+  TelemetryKind,
   TelemetrySettings,
   TimeseriesPoint,
   TokenIssuer,
@@ -61,8 +65,8 @@ export function useMe() {
 }
 
 // ── Generic mutation helper: run, then invalidate query keys ─────
-function useInvalidatingMutation<V>(
-  fn: (v: V) => Promise<unknown>,
+function useInvalidatingMutation<V, R = unknown>(
+  fn: (v: V) => Promise<R>,
   invalidate: QueryKey[],
 ) {
   const qc = useQueryClient();
@@ -469,6 +473,54 @@ export const useSetTelemetry = () =>
   useInvalidatingMutation(
     (b: Record<string, unknown>) => api.put("/api/settings/telemetry", b),
     [["telemetry"]],
+  );
+
+// ── Telemetry destinations ──────────────────────────────────────
+export function useTelemetryKinds() {
+  return useQuery({
+    queryKey: ["telemetry-kinds"],
+    queryFn: () => api.get<TelemetryKind[]>("/api/telemetry/kinds"),
+    staleTime: 5 * 60_000,
+  });
+}
+export function useDestinations(enabled = true) {
+  return useQuery({
+    queryKey: ["telemetry-destinations"],
+    enabled,
+    queryFn: async () =>
+      (await api.get<TelemetryDestination[]>("/api/telemetry/destinations")).map((d) => ({
+        ...d,
+        config: d.config ?? {},
+        secret_names: d.secret_names ?? [],
+        headers: d.headers ?? [],
+        team_scope: { mode: d.team_scope?.mode || "all", values: d.team_scope?.values ?? [] },
+        group_scope: { mode: d.group_scope?.mode || "all", values: d.group_scope?.values ?? [] },
+      })),
+    // Health moves as exports succeed or fail.
+    refetchInterval: 10_000,
+  });
+}
+export const useCreateDestination = () =>
+  useInvalidatingMutation(
+    (b: DestinationInput) => api.post<{ id: string }>("/api/telemetry/destinations", b),
+    [["telemetry-destinations"]],
+  );
+export const useUpdateDestination = () =>
+  useInvalidatingMutation(
+    ({ id, ...b }: DestinationInput & { id: string }) => api.put(`/api/telemetry/destinations/${id}`, b),
+    [["telemetry-destinations"]],
+  );
+export const useDeleteDestination = () =>
+  useInvalidatingMutation(
+    (id: string) => api.del(`/api/telemetry/destinations/${id}`),
+    [["telemetry-destinations"]],
+  );
+// Always HTTP 200 for an export outcome; check `ok`.
+export const useTestDestination = () =>
+  useInvalidatingMutation(
+    (b: Partial<DestinationInput> & { id?: string }) =>
+      api.post<DestinationTestResult>("/api/telemetry/destinations/test", b),
+    [["telemetry-destinations"]],
   );
 
 // ── Token issuers (cloud token auth) ────────────────────────────
