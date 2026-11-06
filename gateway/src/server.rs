@@ -689,8 +689,8 @@ async fn try_deployments(
                 continue;
             }
         };
-        if let Some(wif) = &d.provider.wif {
-            match wif.bearer().await {
+        if let Some(token) = &d.provider.token {
+            match token.bearer().await {
                 Ok(v) => {
                     headers.insert(header::AUTHORIZATION, v);
                 }
@@ -700,8 +700,8 @@ async fn try_deployments(
                 }
             }
         }
-        let body = match build(d) {
-            Ok(b) => b,
+        let (url, body) = match build(d).and_then(|b| upstream::finish(d, url, b)) {
+            Ok(v) => v,
             Err(BadRequest(m)) => return Outcome::BadBody(m),
         };
         let mut req = match Request::post(url).body(Full::new(body)) {

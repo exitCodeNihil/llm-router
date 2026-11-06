@@ -232,7 +232,12 @@ pub enum AuthMode {
     OAuthPassthrough,
     /// Exchanges this gateway's identity token for short-lived Anthropic tokens.
     AnthropicWif,
-    /// Needs a cloud token the gateway can't mint yet (Entra, GCP).
+    /// An Entra ID token for this gateway's own Azure identity.
+    Entra,
+    /// A Google token: the provider's service account key, or this gateway's
+    /// application default credentials.
+    Gcp,
+    /// An auth mode this gateway doesn't know.
     Unsupported,
 }
 
@@ -245,7 +250,11 @@ pub struct Provider {
     pub api_version: String,
     /// The credential header, built once: (name, value).
     pub auth_header: Option<(http::HeaderName, HeaderValue)>,
-    pub wif: Option<Arc<crate::wif::Wif>>,
+    /// A short-lived Authorization header, fetched per request (AnthropicWif, Entra, Gcp).
+    pub token: Option<Arc<dyn crate::cloud::token::Bearer>>,
+    /// Vertex only.
+    pub project: String,
+    pub location: String,
 }
 
 pub struct Deployment {
@@ -472,6 +481,8 @@ fn provider(p: WireProvider) -> Provider {
         "api_key" => AuthMode::ApiKey,
         "oauth_passthrough" => AuthMode::OAuthPassthrough,
         "anthropic_wif" if p.wif.is_some() => AuthMode::AnthropicWif,
+        "entra" => AuthMode::Entra,
+        "gcp_adc" | "gcp_sa" => AuthMode::Gcp,
         _ => AuthMode::Unsupported,
     };
     let auth_header = match auth_mode {
@@ -488,8 +499,25 @@ fn provider(p: WireProvider) -> Provider {
         "anthropic" if p.base_url.is_empty() => "https://api.anthropic.com".to_string(),
         _ => p.base_url.trim_end_matches('/').to_string(),
     };
-    let wif = p.wif.filter(|_| auth_mode == AuthMode::AnthropicWif).map(|w| crate::wif::state(&base_url, w));
-    Provider { id: p.id, name: p.name, kind, base_url, auth_mode, api_version: p.api_version, auth_header, wif }
+    let token: Option<Arc<dyn crate::cloud::token::Bearer>> = match p.auth_mode.as_str() {
+        "anthropic_wif" => p.wif.map(|w| crate::wif::state(&base_url, w) as _),
+        "entra" => Some(crate::cloud::entra::shared()),
+        "gcp_adc" => Some(crate::cloud::gcp::adc()),
+        "gcp_sa" => Some(crate::cloud::gcp::service_account(&p.name, &p.api_key)),
+        _ => None,
+    };
+    Provider {
+        id: p.id,
+        name: p.name,
+        kind,
+        base_url,
+        auth_mode,
+        api_version: p.api_version,
+        auth_header,
+        token,
+        project: p.project,
+        location: p.location,
+    }
 }
 
 fn unhex32(s: &str) -> Option<[u8; 32]> {
