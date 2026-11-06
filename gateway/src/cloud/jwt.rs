@@ -2,10 +2,13 @@
 //! issuer configured on the control plane, verified here against the issuer's
 //! published keys and mapped to a user by its email claim.
 //!
-//! The issuer's keys come from OIDC discovery and are kept for an hour; a key
-//! id they don't have refetches them, at most once a minute. A verified token
-//! is kept until it expires, five minutes at most, so the hot path for a known
-//! caller is one hash lookup: no control-plane call and no database.
+//! The issuer's keys come from OIDC discovery and are kept for an hour, then
+//! renewed in the background while they go on being used; a key id they don't
+//! have refetches them, at most once a minute. Only a verification that has no
+//! key to use waits for a fetch, and one fetch per issuer runs at a time. A
+//! verified token is kept until it expires, five minutes at most, so the hot
+//! path for a known caller is one hash lookup: no control-plane call and no
+//! database.
 //!
 //! A caller with no user, from an issuer that creates users, is provisioned
 //! through the control plane, which verifies the token again itself: a gateway
@@ -19,6 +22,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use http::{Request, StatusCode, header};
 use http_body_util::{BodyExt, Full, Limited};
@@ -80,7 +84,7 @@ type Pending = Arc<tokio::sync::OnceCell<Result<Provisioned, ProvisionError>>>;
 pub struct Identities {
     client: OnceLock<HttpsClient>,
     provisioner: OnceLock<Arc<dyn Provisioner>>,
-    keys: Mutex<HashMap<String, Arc<tokio::sync::Mutex<KeySet>>>>,
+    keys: Mutex<HashMap<String, Arc<IssuerKeys>>>,
     tokens: Mutex<HashMap<[u8; 32], Cached>>,
     /// By SHA-256 of the email: what provisioning answered.
     outcomes: Mutex<HashMap<[u8; 32], Outcome>>,
@@ -307,8 +311,9 @@ impl Identities {
         Ok(Verified { issuer: idx, email: email.to_lowercase(), exp })
     }
 
-    /// Check the signature with the issuer's keys, fetching them when they
-    /// are stale or don't have the token's key id.
+    /// Check the signature with the issuer's keys. Only a token the current
+    /// keys can't check (none yet, or not its key id) waits for a fetch; keys
+    /// past their time are used while new ones are fetched in the background.
     async fn check_signature(
         &self,
         issuer: &str,
@@ -323,13 +328,13 @@ impl Identities {
             _ => return Err(format!("unsupported signing algorithm {alg:?}")),
         };
         let slot = lock(&self.keys).entry(issuer.to_string()).or_default().clone();
-        let mut ks = slot.lock().await;
-        if ks.fetched.is_none_or(|t| t.elapsed() > KEYS_TTL) {
-            self.refresh(issuer, &mut ks).await?;
-        }
-        if kid.is_some() && !ks.has(kid, kty) {
-            // A key the issuer rotated in since we last looked.
-            self.refresh(issuer, &mut ks).await?;
+        let mut ks = slot.current.load_full();
+        if ks.fetched.is_none() || (kid.is_some() && !ks.has(kid, kty)) {
+            // Nothing to check it with; for a known key id, a key the issuer
+            // rotated in since we last looked.
+            ks = refresh(self.client(), issuer, &slot, &ks).await?;
+        } else if ks.fetched.is_some_and(|t| t.elapsed() > KEYS_TTL) {
+            refresh_in_background(self.client().clone(), issuer.to_string(), slot.clone());
         }
         if !ks.algs.iter().any(|a| a == alg) {
             return Err(format!("issuer does not sign with {alg}"));
@@ -343,79 +348,104 @@ impl Identities {
         }
         Err(if found { "bad signature".into() } else { "no issuer key for this token".into() })
     }
+}
 
-    /// Fetch an issuer's keys, unless that was tried too recently. A failure
-    /// keeps the keys it has.
-    async fn refresh(&self, issuer: &str, ks: &mut KeySet) -> Result<(), String> {
-        let wait = if ks.fetched.is_some() { REFETCH_EVERY } else { RETRY_EMPTY };
-        if ks.attempted.is_some_and(|t| t.elapsed() < wait) {
-            return if ks.fetched.is_some() { Ok(()) } else { Err("issuer keys unavailable".into()) };
-        }
-        ks.attempted = Some(Instant::now());
-        match self.fetch_keys(issuer).await {
-            Ok(fresh) => {
-                *ks = fresh;
-                Ok(())
-            }
-            Err(e) if ks.fetched.is_some() => {
-                eprintln!("identity token: refreshing keys of {issuer}: {e}");
-                Ok(())
-            }
-            Err(e) => Err(format!("issuer discovery failed: {e}")),
-        }
-    }
+/// One issuer's keys. Verifications load `current` and never wait on a fetch
+/// they don't need; `fetching` lets one fetch run at a time and holds when the
+/// last one was tried.
+#[derive(Default)]
+struct IssuerKeys {
+    current: ArcSwap<KeySet>,
+    fetching: tokio::sync::Mutex<Option<Instant>>,
+}
 
-    async fn fetch_keys(&self, issuer: &str) -> Result<KeySet, String> {
-        #[derive(Deserialize)]
-        struct Discovery {
-            issuer: String,
-            jwks_uri: String,
-            #[serde(default)]
-            id_token_signing_alg_values_supported: Vec<String>,
-        }
-        let url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
-        let d: Discovery = serde_json::from_slice(&self.get(&url).await?).map_err(|e| format!("discovery: {e}"))?;
-        if d.issuer != issuer {
-            return Err(format!(
-                "issuer did not match the issuer returned by provider, expected {issuer:?} got {:?}",
-                d.issuer
-            ));
-        }
-        let jwks: Jwks = serde_json::from_slice(&self.get(&d.jwks_uri).await?).map_err(|e| format!("jwks: {e}"))?;
-        // What the issuer says it signs with, of what we verify; RS256 when
-        // it doesn't say (go-oidc's rule).
-        let mut algs: Vec<String> =
-            d.id_token_signing_alg_values_supported.into_iter().filter(|a| a == "RS256" || a == "ES256").collect();
-        if algs.is_empty() {
-            algs.push("RS256".into());
-        }
-        let now = Instant::now();
-        Ok(KeySet {
-            keys: jwks.keys.into_iter().filter_map(Jwk::parse).collect(),
-            algs,
-            fetched: Some(now),
-            attempted: Some(now),
-        })
+/// Fetch an issuer's keys, unless that was tried too recently, and swap them
+/// in. `seen` is the set the caller found wanting: if another fetch replaced
+/// it while this one waited its turn, that one's keys are the answer. A
+/// failure keeps the keys there are.
+async fn refresh(
+    client: &HttpsClient,
+    issuer: &str,
+    slot: &IssuerKeys,
+    seen: &Arc<KeySet>,
+) -> Result<Arc<KeySet>, String> {
+    let mut last = slot.fetching.lock().await;
+    let cur = slot.current.load_full();
+    if !Arc::ptr_eq(&cur, seen) {
+        return Ok(cur);
     }
+    let wait = if cur.fetched.is_some() { REFETCH_EVERY } else { RETRY_EMPTY };
+    if last.is_some_and(|t| t.elapsed() < wait) {
+        return if cur.fetched.is_some() { Ok(cur) } else { Err("issuer keys unavailable".into()) };
+    }
+    *last = Some(Instant::now());
+    match fetch_keys(client, issuer).await {
+        Ok(fresh) => {
+            let fresh = Arc::new(fresh);
+            slot.current.store(fresh.clone());
+            Ok(fresh)
+        }
+        Err(e) if cur.fetched.is_some() => {
+            eprintln!("identity token: refreshing keys of {issuer}: {e}");
+            Ok(cur)
+        }
+        Err(e) => Err(format!("issuer discovery failed: {e}")),
+    }
+}
 
-    async fn get(&self, url: &str) -> Result<Bytes, String> {
-        let req = Request::get(url)
-            .header(header::USER_AGENT, format!("llmr-gateway/{}", crate::cp::VERSION))
-            .body(Full::new(Bytes::new()))
-            .map_err(|e| e.to_string())?;
-        let fetch = async {
-            let resp = self.client().request(req).await.map_err(|e| format!("{url}: {e}"))?;
-            if resp.status() != StatusCode::OK {
-                return Err(format!("{url}: {}", resp.status()));
-            }
-            Limited::new(resp.into_body(), 1 << 20)
-                .collect()
-                .await
-                .map(|b| b.to_bytes())
-                .map_err(|e| format!("{url}: {e}"))
-        };
-        tokio::time::timeout(FETCH_TIMEOUT, fetch).await.map_err(|_| format!("{url}: timed out"))?
+/// Renew keys past their time without making anyone wait for them.
+fn refresh_in_background(client: HttpsClient, issuer: String, slot: Arc<IssuerKeys>) {
+    // Not a task per request: only when no fetch is running or due to wait.
+    match slot.fetching.try_lock() {
+        Ok(last) if last.is_none_or(|t| t.elapsed() >= REFETCH_EVERY) => {}
+        _ => return,
     }
+    tokio::spawn(async move {
+        let seen = slot.current.load_full();
+        let _ = refresh(&client, &issuer, &slot, &seen).await;
+    });
+}
+
+async fn fetch_keys(client: &HttpsClient, issuer: &str) -> Result<KeySet, String> {
+    #[derive(Deserialize)]
+    struct Discovery {
+        issuer: String,
+        jwks_uri: String,
+        #[serde(default)]
+        id_token_signing_alg_values_supported: Vec<String>,
+    }
+    let url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
+    let d: Discovery = serde_json::from_slice(&get(client, &url).await?).map_err(|e| format!("discovery: {e}"))?;
+    if d.issuer != issuer {
+        return Err(format!(
+            "issuer did not match the issuer returned by provider, expected {issuer:?} got {:?}",
+            d.issuer
+        ));
+    }
+    let jwks: Jwks = serde_json::from_slice(&get(client, &d.jwks_uri).await?).map_err(|e| format!("jwks: {e}"))?;
+    // What the issuer says it signs with, of what we verify; RS256 when
+    // it doesn't say (go-oidc's rule).
+    let mut algs: Vec<String> =
+        d.id_token_signing_alg_values_supported.into_iter().filter(|a| a == "RS256" || a == "ES256").collect();
+    if algs.is_empty() {
+        algs.push("RS256".into());
+    }
+    Ok(KeySet { keys: jwks.keys.into_iter().filter_map(Jwk::parse).collect(), algs, fetched: Some(Instant::now()) })
+}
+
+async fn get(client: &HttpsClient, url: &str) -> Result<Bytes, String> {
+    let req = Request::get(url)
+        .header(header::USER_AGENT, format!("llmr-gateway/{}", crate::cp::VERSION))
+        .body(Full::new(Bytes::new()))
+        .map_err(|e| e.to_string())?;
+    let fetch = async {
+        let resp = client.request(req).await.map_err(|e| format!("{url}: {e}"))?;
+        if resp.status() != StatusCode::OK {
+            return Err(format!("{url}: {}", resp.status()));
+        }
+        Limited::new(resp.into_body(), 1 << 20).collect().await.map(|b| b.to_bytes()).map_err(|e| format!("{url}: {e}"))
+    };
+    tokio::time::timeout(FETCH_TIMEOUT, fetch).await.map_err(|_| format!("{url}: timed out"))?
 }
 
 /// A user the control plane created that the config doesn't have yet: no
@@ -440,13 +470,12 @@ fn provisional_user(cfg: &Config, p: &Provisioned) -> Arc<User> {
     })
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct KeySet {
     keys: Vec<Jwk>,
     /// The algorithms tokens from this issuer may use.
     algs: Vec<String>,
     fetched: Option<Instant>,
-    attempted: Option<Instant>,
 }
 
 impl KeySet {
@@ -476,12 +505,14 @@ struct RawJwk {
     y: Option<String>,
 }
 
+#[derive(Clone)]
 struct Jwk {
     kid: Option<String>,
     alg: Option<String>,
     key: PublicKey,
 }
 
+#[derive(Clone)]
 enum PublicKey {
     Rsa {
         n: Vec<u8>,
@@ -589,7 +620,7 @@ fn b64url(s: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use hyper::body::Incoming;
     use hyper::service::service_fn;
@@ -689,6 +720,8 @@ mod tests {
         url: String,
         jwks: Arc<Mutex<Value>>,
         fetches: Arc<AtomicUsize>,
+        /// How long the JWKS endpoint takes to answer, in milliseconds.
+        delay_ms: Arc<AtomicU64>,
         rsa: RsaKeyPair,
         ec: EcdsaKeyPair,
     }
@@ -702,9 +735,11 @@ mod tests {
             let ec = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng).unwrap();
             let jwks = Arc::new(Mutex::new(json!({"keys": []})));
             let fetches = Arc::new(AtomicUsize::new(0));
+            let delay_ms = Arc::new(AtomicU64::new(0));
             let me: Arc<OnceLock<String>> = Arc::default();
-            let (j, f, m) = (jwks.clone(), fetches.clone(), me.clone());
+            let (j, f, m, d) = (jwks.clone(), fetches.clone(), me.clone(), delay_ms.clone());
             let url = serve(Arc::new(move |path, _, _| {
+                let delay = Duration::from_millis(d.load(Ordering::SeqCst));
                 let base = m.get().cloned().unwrap_or_default();
                 let reply = match path.as_str() {
                     "/.well-known/openid-configuration" => (
@@ -719,11 +754,17 @@ mod tests {
                     }
                     _ => (404, String::new()),
                 };
-                Box::pin(async move { reply })
+                let slow = path == "/jwks";
+                Box::pin(async move {
+                    if slow {
+                        tokio::time::sleep(delay).await;
+                    }
+                    reply
+                })
             }))
             .await;
             me.set(url.clone()).unwrap();
-            let idp = Idp { url, jwks, fetches, rsa, ec };
+            let idp = Idp { url, jwks, fetches, delay_ms, rsa, ec };
             idp.publish(&["k1", "ec1"]);
             idp
         }
@@ -896,7 +937,7 @@ mod tests {
         // refetches the keys.
         idp.publish(&["k1", "ec2"]);
         let a_minute_ago = Instant::now().checked_sub(REFETCH_EVERY).unwrap();
-        lock(&ids.keys)[&idp.url].try_lock().unwrap().attempted = Some(a_minute_ago);
+        *lock(&ids.keys)[&idp.url].fetching.try_lock().unwrap() = Some(a_minute_ago);
         ids.verify(&cfg, &idp.mint("ES256", "ec2", json!({}))).await.unwrap();
         assert_eq!(idp.fetches(), 2);
 
@@ -908,6 +949,49 @@ mod tests {
         assert_eq!(idp.fetches(), 2, "at most one refetch a minute");
         ids.verify(&cfg, &idp.mint("RS256", "k1", json!({}))).await.unwrap();
         assert_eq!(idp.fetches(), 2);
+    }
+
+    /// The current keys, as if fetched `age` ago.
+    fn age_keys(ids: &Identities, issuer: &str, age: Duration) {
+        let slot = lock(&ids.keys)[issuer].clone();
+        let mut ks = KeySet::clone(&slot.current.load());
+        ks.fetched = Some(Instant::now().checked_sub(age).unwrap());
+        slot.current.store(Arc::new(ks));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slow_key_fetch_holds_up_only_those_who_need_it() {
+        let idp = Idp::new().await;
+        let ids = Arc::new(Identities::default());
+        let cfg = Arc::new(idp.config(1, false));
+        ids.verify(&cfg, &idp.mint("RS256", "k1", json!({}))).await.unwrap();
+        idp.delay_ms.store(1500, Ordering::SeqCst);
+
+        // A token with a key id nobody publishes (anyone can send one) makes
+        // a slow refetch...
+        *lock(&ids.keys)[&idp.url].fetching.try_lock().unwrap() = Some(Instant::now() - REFETCH_EVERY);
+        let unknown = {
+            let (ids, cfg, t) = (ids.clone(), cfg.clone(), idp.mint("RS256", "k9", json!({})));
+            tokio::spawn(async move { ids.verify(&cfg, &t).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(idp.fetches(), 2, "the refetch is under way");
+        // ...that a token under a key we have doesn't wait for.
+        let t = Instant::now();
+        ids.verify(&cfg, &idp.mint("ES256", "ec1", json!({}))).await.unwrap();
+        assert!(t.elapsed() < Duration::from_millis(500), "waited {:?} for a fetch it didn't need", t.elapsed());
+        assert!(unknown.await.unwrap().refused().contains("no issuer key"));
+
+        // Keys past their hour go on being used while new ones are fetched.
+        age_keys(&ids, &idp.url, KEYS_TTL + Duration::from_secs(1));
+        *lock(&ids.keys)[&idp.url].fetching.try_lock().unwrap() = Some(Instant::now() - REFETCH_EVERY);
+        let t = Instant::now();
+        ids.verify(&cfg, &idp.mint("RS256", "k1", json!({}))).await.unwrap();
+        assert!(t.elapsed() < Duration::from_millis(500), "waited {:?} for a background renewal", t.elapsed());
+        tokio::time::sleep(Duration::from_millis(1800)).await;
+        assert_eq!(idp.fetches(), 3, "renewed in the background");
+        let renewed = lock(&ids.keys)[&idp.url].current.load().fetched.unwrap();
+        assert!(renewed.elapsed() < Duration::from_secs(5));
     }
 
     #[tokio::test]
