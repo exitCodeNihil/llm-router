@@ -273,3 +273,37 @@ func TestInFlightBatchFlushedAtShutdown(t *testing.T) {
 		}
 	}
 }
+
+// poisonSink refuses any batch holding the record "bad" with status.
+type poisonSink struct {
+	fakeSink
+	status int
+}
+
+func (s *poisonSink) Export(ctx context.Context, b []*Record) error {
+	for _, r := range b {
+		if r.E.RequestID == "bad" {
+			s.mu.Lock()
+			s.calls++
+			s.mu.Unlock()
+			return &ExportError{Status: s.status, Msg: "invalid span"}
+		}
+	}
+	return s.fakeSink.Export(ctx, b)
+}
+
+// One span a backend can't take doesn't cost the rest of its batch.
+func TestDeliverIsolatesAPoisonSpan(t *testing.T) {
+	for _, status := range []int{400, 422} {
+		s := &poisonSink{fakeSink: fakeSink{got: make(chan []*Record, 10)}, status: status}
+		w := testWorker(fastPolicy(), s)
+		w.deliver(context.Background(), []*Record{rec("1"), rec("2"), rec("bad"), rec("4")})
+		var got [][]string
+		for _, b := range s.batches {
+			got = append(got, ids(b))
+		}
+		if h := w.health(); fmt.Sprint(got) != "[[1 2] [4]]" || h.Delivered != 3 || h.Dropped.Rejected != 1 {
+			t.Fatalf("%d: batches %v, health %+v", status, got, h)
+		}
+	}
+}

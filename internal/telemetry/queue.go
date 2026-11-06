@@ -213,7 +213,8 @@ func (w *worker) final() {
 }
 
 // deliver sends a batch, retrying what may succeed later, halving it when the
-// backend says it is too large, and dropping it when it can't succeed.
+// backend says it is too large or malformed, and dropping it when it can't
+// succeed.
 func (w *worker) deliver(ctx context.Context, batch []*Record) {
 	oldest := time.Now()
 	for _, r := range batch {
@@ -243,7 +244,9 @@ func (w *worker) deliver(ctx context.Context, batch []*Record) {
 		if !errors.As(err, &xe) {
 			xe = &ExportError{Msg: err.Error()}
 		}
-		if xe.Status == 413 && len(batch) > 1 {
+		// Too large, or a span the backend can't take: halve the batch,
+		// down to the one span at fault, so the rest still go.
+		if (xe.Status == 413 || xe.Status == 400 || xe.Status == 422) && len(batch) > 1 {
 			half := len(batch) / 2
 			w.deliver(ctx, batch[:half])
 			w.deliver(ctx, batch[half:])
