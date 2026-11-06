@@ -107,11 +107,15 @@ func (m *Manager) Reconcile() {
 		w := old[d.ID]
 		if w == nil {
 			w = newWorker(d, &m.p)
+			w.snaps = m.Snapshots
 			ctx, cancel := context.WithCancel(m.ctx)
 			w.stop = cancel
 			go w.run(ctx)
 		}
 		w.dest.Store(d)
+		if !d.Usable() {
+			w.q.clear() // disabled: what it queued is not sent later
+		}
 		if fp := fingerprint(d); fp != w.fp {
 			w.fp = fp
 			w.sink.Store(buildSink(d))

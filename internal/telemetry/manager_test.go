@@ -77,6 +77,11 @@ func sinkFor(t *testing.T, name string) *fakeSink {
 
 func testManager(t *testing.T, snap *snapshot.Snapshot) *Manager {
 	t.Helper()
+	return lingerManager(t, snap, 10*time.Millisecond)
+}
+
+func lingerManager(t *testing.T, snap *snapshot.Snapshot, linger time.Duration) *Manager {
+	t.Helper()
 	fakes.Lock()
 	for _, d := range snap.Destinations {
 		delete(fakes.sinks, d.Name)
@@ -85,7 +90,7 @@ func testManager(t *testing.T, snap *snapshot.Snapshot) *Manager {
 	h := &snapshot.Holder{}
 	h.Set(snap)
 	m := NewManager(h, nil)
-	m.p.Linger = 10 * time.Millisecond
+	m.p.Linger = linger
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	m.ctx = ctx
@@ -114,10 +119,15 @@ func receive(t *testing.T, s *fakeSink) []*Record {
 
 func nothing(t *testing.T, s *fakeSink) {
 	t.Helper()
+	nothingFor(t, s, 50*time.Millisecond)
+}
+
+func nothingFor(t *testing.T, s *fakeSink, d time.Duration) {
+	t.Helper()
 	select {
 	case b := <-s.got:
 		t.Fatalf("delivered %d records, want none", len(b))
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(d):
 	}
 }
 
@@ -130,6 +140,7 @@ func TestContentLeakTable(t *testing.T) {
 				t.Run(fmt.Sprintf("capture=%v/%s/content=%v", policy, rule, mode), func(t *testing.T) {
 					d := dest(fmt.Sprintf("d-%v-%s-%v", policy, rule, mode), mode)
 					m := testManager(t, &snapshot.Snapshot{
+						Telemetry:     snapshot.Telemetry{CaptureContent: policy},
 						GatewayGroups: map[string]*snapshot.GatewayGroup{"g": {ID: "g", DataRule: rule}},
 						Destinations:  []*snapshot.Destination{d},
 					})
@@ -159,7 +170,8 @@ func TestContentLeakTable(t *testing.T) {
 // One event to a content destination and a metadata one shares the event,
 // and only the content destination's record carries content.
 func TestContentPerDestination(t *testing.T) {
-	m := testManager(t, &snapshot.Snapshot{Destinations: []*snapshot.Destination{dest("with", true), dest("without", false)}})
+	m := testManager(t, &snapshot.Snapshot{Telemetry: snapshot.Telemetry{CaptureContent: true},
+		Destinations: []*snapshot.Destination{dest("with", true), dest("without", false)}})
 	m.Write(usage.Event{RequestID: "r", Export: true, CaptureContent: true, Output: "answer"})
 	if r := receive(t, sinkFor(t, "with"))[0]; !r.Content || ContentOf(r).Output[0].Parts[0].Content != "answer" {
 		t.Fatalf("content destination got %+v", r)
@@ -269,4 +281,75 @@ func TestTestDestination(t *testing.T) {
 	if res.OK || res.Detail == "" {
 		t.Errorf("unknown kind: %+v", res)
 	}
+}
+
+// What waits in a queue is checked again before it is sent: a change made
+// meanwhile applies to it.
+func TestQueuedRecordsRecheckedAtDelivery(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		change  func(*snapshot.Snapshot)
+		drop    bool
+		content bool
+	}{
+		{"unchanged", func(*snapshot.Snapshot) {}, false, true},
+		{"group no_export", func(s *snapshot.Snapshot) { s.GatewayGroups["g"].DataRule = "no_export" }, true, false},
+		{"group no_content", func(s *snapshot.Snapshot) { s.GatewayGroups["g"].DataRule = "no_content" }, false, false},
+		{"destination metadata only", func(s *snapshot.Snapshot) { s.Destinations[0].ContentMode = "metadata_only" }, false, false},
+		{"policy off", func(s *snapshot.Snapshot) { s.Telemetry.Mode = "off" }, true, false},
+		{"policy without content", func(s *snapshot.Snapshot) {
+			s.Telemetry = snapshot.Telemetry{Mode: "everything"}
+		}, false, false},
+		{"rule removed", func(s *snapshot.Snapshot) { s.Telemetry.Rules = nil }, true, false},
+		{"rule meta", func(s *snapshot.Snapshot) { s.Telemetry.Rules[0].Capture = "meta" }, false, false},
+		{"team out of scope", func(s *snapshot.Snapshot) {
+			s.Destinations[0].Teams = snapshot.Scope{Mode: "except", Values: []string{"A"}}
+		}, true, false},
+		{"group out of scope", func(s *snapshot.Snapshot) {
+			s.Destinations[0].Groups = snapshot.Scope{Mode: "selected", Values: []string{"other"}}
+		}, true, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			mk := func() *snapshot.Snapshot {
+				d := dest("recheck-"+c.name, true)
+				return &snapshot.Snapshot{
+					Telemetry: snapshot.Telemetry{Mode: "by_rule", CaptureContent: true, Rules: []snapshot.TelemetryRule{
+						{ID: "r1", ScopeType: "tag", ScopeValue: "t", Capture: "content", Sample: 100, Enabled: true}}},
+					GatewayGroups: map[string]*snapshot.GatewayGroup{"g": {ID: "g", DataRule: "inherit"}},
+					Destinations:  []*snapshot.Destination{d},
+				}
+			}
+			m := lingerManager(t, mk(), 200*time.Millisecond)
+			m.Write(usage.Event{RequestID: "r", Export: true, CaptureContent: true, GatewayGroupID: "g", TeamID: "A",
+				Tags: []string{"t"}, RuleID: "r1", Output: "secret answer"})
+			next := mk()
+			c.change(next)
+			m.Snapshots.Set(next)
+			m.Reconcile()
+			s := sinkFor(t, "recheck-"+c.name)
+			if c.drop {
+				nothingFor(t, s, 400*time.Millisecond) // past the linger
+				return
+			}
+			r := receive(t, s)[0]
+			if r.Content != c.content || (r.E.Output != "") != c.content {
+				t.Fatalf("content %v output %q, want content %v", r.Content, r.E.Output, c.content)
+			}
+		})
+	}
+}
+
+// Disabling a destination drops what it queued.
+func TestDisableDropsQueue(t *testing.T) {
+	d := dest("disable", false)
+	m := lingerManager(t, &snapshot.Snapshot{Destinations: []*snapshot.Destination{d}}, 200*time.Millisecond)
+	m.Write(usage.Event{RequestID: "r", Export: true})
+	off := *d
+	off.Enabled = false
+	m.Snapshots.Set(&snapshot.Snapshot{Destinations: []*snapshot.Destination{&off}})
+	m.Reconcile()
+	if h, _ := m.HealthOf("disable"); h.Queued != 0 {
+		t.Fatalf("queued %d after disable", h.Queued)
+	}
+	nothingFor(t, sinkFor(t, "disable"), 400*time.Millisecond)
 }

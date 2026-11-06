@@ -87,6 +87,13 @@ func (q *queue) take() []*Record {
 	return batch
 }
 
+// clear drops everything queued.
+func (q *queue) clear() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.items, q.bytes = nil, 0
+}
+
 func (q *queue) depth() (int, int64) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -103,6 +110,9 @@ type worker struct {
 	q    *queue
 	p    *policy
 	st   stats
+	// snaps is the configuration records are checked against before each
+	// export; nil checks only the destination.
+	snaps *snapshot.Holder
 
 	stop    context.CancelFunc
 	done    chan struct{}
@@ -173,6 +183,9 @@ func (w *worker) final() {
 		if len(batch) == 0 {
 			return
 		}
+		if batch = w.admit(batch); len(batch) == 0 {
+			continue
+		}
 		slot := w.sink.Load()
 		if slot.s == nil {
 			return
@@ -190,6 +203,9 @@ func (w *worker) final() {
 func (w *worker) deliver(ctx context.Context, batch []*Record) {
 	first := time.Now()
 	for attempt := 1; ; attempt++ {
+		if batch = w.admit(batch); len(batch) == 0 {
+			return
+		}
 		slot := w.sink.Load()
 		if slot.s == nil {
 			w.st.failed(errors.New(slot.err), &w.st.rejected, len(batch))
@@ -232,6 +248,58 @@ func (w *worker) deliver(ctx context.Context, batch []*Record) {
 			return
 		}
 	}
+}
+
+// admit re-checks records against the configuration as it is now, since it
+// may have changed while they waited: a destination disabled or deleted, a
+// scope narrowed, a group's data rule or the capture policy tightened, a
+// destination's content mode or cap lowered. Records no longer exported are
+// dropped; content no longer allowed is left out.
+func (w *worker) admit(batch []*Record) []*Record {
+	d := w.dest.Load()
+	if !d.Usable() {
+		return nil
+	}
+	var snap *snapshot.Snapshot
+	if w.snaps != nil {
+		snap = w.snaps.Get()
+	}
+	if snap != nil {
+		d = snap.Destination(d.ID)
+		if d == nil || !d.Usable() {
+			return nil
+		}
+	}
+	out := make([]*Record, 0, len(batch))
+	for _, r := range batch {
+		if r = admitRecord(snap, d, r); r != nil {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func admitRecord(snap *snapshot.Snapshot, d *snapshot.Destination, r *Record) *Record {
+	if r.SpanName != "" { // a test span
+		return r
+	}
+	content := r.Content && d.ContentMode == "content"
+	if snap != nil {
+		e := &r.E
+		rule := snap.DataRule(r.Group)
+		dec := snap.Telemetry.Evaluate(e.APIKeyID, e.UserID, e.TeamID, e.Tags, e.RequestID)
+		if rule == "no_export" || !dec.Export || !d.Takes(e.TeamID, r.Group) {
+			return nil
+		}
+		content = content && rule == "inherit" && dec.CaptureContent
+	}
+	switch {
+	case r.Content && !content:
+		return &Record{Item: r.Item.withoutContent()}
+	case content && d.MaxContentBytes < r.MaxContent:
+		return &Record{Item: r.Item, Content: true, MaxContent: d.MaxContentBytes}
+	}
+	return r
 }
 
 // backoff doubles from BackoffMin up to BackoffMax, with ±50% jitter so

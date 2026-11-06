@@ -162,6 +162,16 @@ func (d *Destination) SecretNames() []string {
 	return names
 }
 
+// Destination returns the destination with this id, or nil.
+func (s *Snapshot) Destination(id string) *Destination {
+	for _, d := range s.Destinations {
+		if d.ID == id {
+			return d
+		}
+	}
+	return nil
+}
+
 // Usable reports whether the destination receives traffic.
 func (d *Destination) Usable() bool { return d.Enabled && d.Err == "" }
 
