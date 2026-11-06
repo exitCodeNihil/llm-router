@@ -106,8 +106,14 @@ async fn gateway(model: &str, deployments: &[(&str, &str, &str)]) -> String {
     let mut providers = Vec::new();
     let mut deps = Vec::new();
     for (i, (url, flavor, auth)) in deployments.iter().enumerate() {
-        providers.push(json!({"id": format!("p{i}"), "name": format!("p{i}"), "type": "openai_compatible",
-            "base_url": url, "auth_mode": auth}));
+        let mut p = json!({"id": format!("p{i}"), "name": format!("p{i}"), "type": "openai_compatible",
+            "base_url": url, "auth_mode": auth});
+        if *auth == "anthropic_wif" {
+            // No identity token on this machine, so every exchange fails.
+            p["wif"] = json!({"federation_rule_id": format!("fdrl_{i}"), "organization_id": "o",
+                "service_account_id": "svac_1", "identity_token_file": "/nonexistent/llmr-test-token"});
+        }
+        providers.push(p);
         deps.push(json!({"id": format!("d{i}"), "provider_id": format!("p{i}"), "model_name": model,
             "upstream_name": format!("up{i}"), "api_flavor": flavor}));
     }
@@ -254,5 +260,24 @@ async fn unsupported_route_with_another_deployment() {
         assert_eq!(status, 502);
         let v: Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(v["error"]["code"], "upstream_unavailable");
+    }
+}
+
+/// A provider that can't be reached at all, such as a refused workload identity
+/// exchange, still leaves a usage row on both surfaces.
+#[tokio::test]
+async fn unreachable_provider_is_recorded() {
+    let down = dead_upstream().await;
+    for (path, model) in [("/v1/chat/completions", "wif-oai"), ("/v1/messages", "wif-anth")] {
+        let gw = gateway(model, &[(&down, "anthropic", "anthropic_wif")]).await;
+        let (status, _, raw) = post(
+            format!("{gw}{path}"),
+            json!({"model": model, "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, 500, "{path}: {}", String::from_utf8_lossy(&raw));
+        let events: Vec<_> = usage::take(usize::MAX).into_iter().filter(|e| e.model_name == model).collect();
+        assert_eq!(events.len(), 1, "{path}");
+        assert_eq!((events[0].status_code, events[0].error_code), (500, "internal_error"), "{path}");
     }
 }
