@@ -460,23 +460,15 @@ func (m *Server) destinations(ctx context.Context, id string) ([]destinationView
 		if v.Config == nil {
 			v.Config = map[string]string{}
 		}
-		v.Health = telemetry.Health{ID: v.ID, Name: v.Name, Kind: v.Kind, LastSuccessAt: lastOK,
+		row := telemetry.Health{ID: v.ID, Name: v.Name, Kind: v.Kind, LastSuccessAt: lastOK,
 			LastError: lastErr, LastErrorAt: lastErrAt}
+		var live *telemetry.Health
 		if m.Telemetry != nil {
 			if h, ok := m.Telemetry.HealthOf(v.ID); ok {
-				// The row holds what an earlier process last saw.
-				if h.LastSuccessAt == nil {
-					h.LastSuccessAt = lastOK
-				}
-				if h.LastErrorAt == nil {
-					h.LastError, h.LastErrorAt = lastErr, lastErrAt
-				}
-				v.Health = h
+				live = &h
 			}
 		}
-		if v.Health.Status == "" {
-			v.Health.Status = statusOf(v.Enabled, lastOK, lastErrAt)
-		}
+		v.Health = mergeHealth(v.Enabled, row, live)
 		out = append(out, v)
 	}
 	if err := rows.Err(); err != nil {
@@ -520,7 +512,30 @@ func origin(s string) string {
 	return strings.ToLower(u.Scheme + "://" + u.Host)
 }
 
-// statusOf is a destination's status from its row alone.
+// mergeHealth is what the API shows: the exporter's counters, with the row's
+// last success and error where they are later (after a restart the exporter
+// has seen nothing yet), and the status from those and the row's enabled
+// flag, which is ahead of the exporter's until the config reloads.
+func mergeHealth(enabled bool, row telemetry.Health, live *telemetry.Health) telemetry.Health {
+	h := row
+	if live != nil {
+		h = *live
+		if later(row.LastSuccessAt, h.LastSuccessAt) {
+			h.LastSuccessAt = row.LastSuccessAt
+		}
+		if later(row.LastErrorAt, h.LastErrorAt) {
+			h.LastError, h.LastErrorAt = row.LastError, row.LastErrorAt
+		}
+	}
+	h.Status = statusOf(enabled, h.LastSuccessAt, h.LastErrorAt)
+	return h
+}
+
+// later reports whether a is set and after b.
+func later(a, b *time.Time) bool { return a != nil && (b == nil || a.After(*b)) }
+
+// statusOf is a destination's status from its last success and error: an
+// error older than the last success is over.
 func statusOf(enabled bool, lastOK, lastErrAt *time.Time) string {
 	switch {
 	case !enabled:

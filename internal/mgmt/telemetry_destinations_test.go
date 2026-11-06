@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
 	"github.com/exitcodenihil/llm-router/internal/telemetry"
@@ -95,5 +96,35 @@ func TestDestinationHeaders(t *testing.T) {
 		"secrets":{"secret_key":" sk\n"}}`).destination(nil)
 	if err != nil || d.Secrets["secret_key"] != "sk" {
 		t.Errorf("destination %+v, err %v", d, err)
+	}
+}
+
+func TestMergeHealth(t *testing.T) {
+	at := func(m int) *time.Time {
+		v := time.Date(2026, 11, 6, 12, m, 0, 0, time.UTC)
+		return &v
+	}
+	for _, c := range []struct {
+		name    string
+		enabled bool
+		row     telemetry.Health
+		live    *telemetry.Health
+		want    string
+	}{
+		// After a restart the exporter has seen nothing: the row says how it went.
+		{"restarted healthy", true, telemetry.Health{LastSuccessAt: at(5)}, &telemetry.Health{Status: "no_data"}, "healthy"},
+		{"restarted failing", true, telemetry.Health{LastSuccessAt: at(1), LastError: "x", LastErrorAt: at(5)},
+			&telemetry.Health{Status: "no_data"}, "failing"},
+		// A success after the row's error ends it.
+		{"recovered", true, telemetry.Health{LastError: "x", LastErrorAt: at(5)},
+			&telemetry.Health{LastSuccessAt: at(6), Status: "healthy"}, "healthy"},
+		// Disabled in the row: disabled now, before the exporter reloads.
+		{"just disabled", false, telemetry.Health{LastSuccessAt: at(5)},
+			&telemetry.Health{LastSuccessAt: at(6), Status: "healthy"}, "disabled"},
+		{"no exporter", true, telemetry.Health{}, nil, "no_data"},
+	} {
+		if h := mergeHealth(c.enabled, c.row, c.live); h.Status != c.want {
+			t.Errorf("%s: %+v, want %s", c.name, h, c.want)
+		}
 	}
 }
