@@ -297,14 +297,22 @@ fn push(mut e: Event) {
 /// Queued events, oldest first: at most `max_events`, and no more than about
 /// `max_bytes` once encoded (always at least one).
 pub fn take(max_events: usize, max_bytes: usize) -> Vec<Event> {
+    take_batch(max_events, max_bytes).0
+}
+
+/// As `take`, for a batch to send: its content stays counted against the
+/// budget, moved from the queue to the returned `Sending` without a moment
+/// in which it counts nowhere.
+pub fn take_batch(max_events: usize, max_bytes: usize) -> (Vec<Event>, Sending) {
     let mut q = queue().lock().unwrap();
     let n = batch_len(q.events.iter().map(Event::encoded_size), max_events, max_bytes);
     let batch: Vec<Event> = q.events.drain(..n).collect();
     let freed: usize = batch.iter().filter_map(|e| e.content.as_ref()).map(|c| c.bytes()).sum();
+    SENDING_CONTENT.fetch_add(freed, Ordering::Relaxed);
     q.content -= freed;
     QUEUED_CONTENT.store(q.content, Ordering::Relaxed);
     shrink(&mut q.events);
-    batch
+    (batch, Sending(freed))
 }
 
 /// Content bytes the queue holds.
@@ -360,18 +368,26 @@ impl Event {
 /// Put events back at the front of the queue, in order, ahead of newer ones.
 /// Events that no longer fit are dropped and counted.
 pub fn requeue(events: Vec<Event>) {
+    requeue_batch(events, Sending::default());
+}
+
+/// Put a batch that was being sent back in the queue. Its content stays
+/// counted until the queue counts it, and the room it held is its own to
+/// take back, so new requests can't take it in between.
+pub fn requeue_batch(events: Vec<Event>, sending: Sending) {
     let mut q = queue().lock().unwrap();
     let room = MAX_QUEUED.saturating_sub(q.events.len());
     let dropped = events.len().saturating_sub(room);
-    // what requests in flight reserved, and the batch being sent, keep theirs
+    // what requests in flight reserved, and any other batch being sent, keep theirs
     let budget = CONTENT_BUDGET
         .saturating_sub(RESERVED.load(Ordering::Relaxed))
-        .saturating_sub(SENDING_CONTENT.load(Ordering::Relaxed));
+        .saturating_sub(SENDING_CONTENT.load(Ordering::Relaxed).saturating_sub(sending.0));
     for mut e in events.into_iter().take(room).rev() {
         q.admit_within(&mut e, budget);
         q.events.push_front(e);
     }
     QUEUED_CONTENT.store(q.content, Ordering::Relaxed);
+    drop(sending);
     drop(q);
     if dropped > 0 {
         DROPPED.fetch_add(dropped as u64, Ordering::Relaxed);
@@ -1212,14 +1228,27 @@ pub(crate) mod tests {
         assert_eq!(sending_content(), before);
         assert!(Reservation::take(free + n).is_some(), "acknowledged, its room is free again");
 
-        // A failed sync puts the batch back: released first, it fits.
-        let sending = Sending::of(&events);
-        drop(sending);
+        // Taken from the queue, its content moves to the batch's count.
+        let (others, other_sending) = take_batch(usize::MAX, usize::MAX);
+        requeue_batch(others, other_sending);
+        let queued = queued_content();
         requeue(events);
-        let (mine, rest): (Vec<Event>, Vec<Event>) =
-            take(usize::MAX, usize::MAX).into_iter().partition(|e| e.model_name == "sending-test");
-        requeue(rest);
-        assert!(!mine[0].content.as_ref().unwrap().content_truncated);
+        assert_eq!(queued_content(), queued + n);
+        let (batch, sending) = take_batch(1, usize::MAX);
+        assert_eq!(batch[0].model_name, "sending-test");
+        assert_eq!((queued_content(), sending_content()), (queued, before + n));
+
+        // A failed sync puts it back with the budget otherwise spent: the room
+        // it held is its own, so it keeps its content.
+        let free = CONTENT_BUDGET - queued_content() - sending_content() - reserved_content();
+        let rest_of_budget = Reservation::take(free).unwrap();
+        requeue_batch(batch, sending);
+        assert_eq!((queued_content(), sending_content()), (queued + n, before));
+        drop(rest_of_budget);
+        let (batch, sending) = take_batch(1, usize::MAX);
+        assert!(!batch[0].content.as_ref().unwrap().content_truncated, "kept its content");
+        drop(sending);
+        assert_eq!(sending_content(), before);
     }
 
     /// What is queued holds no more memory than the bytes the budget counts.

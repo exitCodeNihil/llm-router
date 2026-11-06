@@ -303,8 +303,7 @@ impl ControlPlane {
     /// and settle it on success.
     async fn sync_once(&self, s: &mut Syncer) -> bool {
         if s.pending.is_none() {
-            let events = usage::take(MAX_BATCH, s.max_bytes());
-            let sending = usage::Sending::of(&events);
+            let (events, sending) = usage::take_batch(MAX_BATCH, s.max_bytes());
             let (rates, scopes) = limits::freeze();
             s.batch += 1;
             let mem = crate::resources::memory();
@@ -350,8 +349,7 @@ impl ControlPlane {
                     eprintln!("sync: {status}; sending batches of at most {} bytes", s.max_bytes());
                     limits::discard(&batch.scopes);
                     let Frozen { events, sending, .. } = batch.frozen;
-                    drop(sending);
-                    usage::requeue(events);
+                    usage::requeue_batch(events, sending);
                 } else if status == StatusCode::PAYLOAD_TOO_LARGE {
                     // Refused at the smallest batch: resending it as is would
                     // hold back every later event, and the limit counters.
@@ -495,8 +493,6 @@ impl Batch {
     /// and counted. The batch number, cursor and rates stay.
     async fn smaller(mut self) -> Option<Batch> {
         let f = &mut self.frozen;
-        // Recounted below, once the batch has lost what it is about to lose.
-        f.sending = usage::Sending::default();
         let stripped = usage::strip_content(&mut f.events);
         if stripped > 0 {
             eprintln!("sync: 413 at the smallest batch size; sending {stripped} events without their content");
@@ -506,7 +502,10 @@ impl Batch {
                 f.events.len() / 2,
                 f.events.len()
             );
-            usage::requeue(f.events.split_off(f.events.len() / 2));
+            let rest = f.events.split_off(f.events.len() / 2);
+            let moved = usage::Sending::of(&rest);
+            f.sending = usage::Sending::of(&f.events);
+            usage::requeue_batch(rest, moved);
         } else {
             metrics::SYNC_REFUSED_EVENTS.fetch_add(f.events.len() as u64, Ordering::Relaxed);
             eprintln!("sync: 413 for a single event without content; dropping it");
