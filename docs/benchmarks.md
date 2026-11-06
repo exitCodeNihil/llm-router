@@ -277,6 +277,39 @@ table.
 
 A 5-minute soak catches errors under steady load and fast leaks, but not slow growth.
 
+## Rust gateway memory
+
+Measured 6 November 2026 with `./run.sh s11 rgw`. It runs the Rust gateway on 1 vCPU at 80%, then
+120%, of its 30,000 req/s maximum, then leaves it idle for 5 minutes. The raw results of these runs
+are not in the repository.
+
+| | before | after |
+|---|---|---|
+| 5 min at 24,000 req/s: memory | 500 to 900 MiB, peak 1.3 GiB | 150 to 300 MiB, peak 280 MiB |
+| blocking threads at peak | 197 | 3 |
+| 30 min at 24,000 req/s (80%) | – | 115 to 240 MiB, no growth; p99 2.5 to 13 ms |
+| held after the load stops | 300 MiB | 110 to 130 MiB |
+
+The fixes:
+- **Upstream DNS answers are cached.** Before, every new connection looked up DNS on a blocking
+  thread, and each of those threads kept its own allocator heap.
+- **Blocking threads are capped at 16.**
+- **Idle upstream connections are capped at 256.**
+- **The usage queue gives back the capacity a burst grew.**
+- **The allocator returns freed pages at once** (`MIMALLOC_PURGE_DECOMMITS=1` in the image). That
+  halves memory at 80% load: 100 to 110 MiB between peaks, against 175 to 230.
+
+**Still open: past saturation, memory follows the open connections.**
+- At 120% load the gateway falls behind in bursts, and up to 9,000 requests pile up.
+- Memory then spikes to 1.2 to 1.6 GiB. Between spikes it falls back to 170 to 380 MiB, with no
+  upward trend over 30 minutes.
+- In a VM short of memory, a spike to 3 GiB got the gateway killed.
+- Lowering the in-flight cap doesn't bound it: under a 1 GiB limit, with requests in flight capped at
+  3,000, the gateway was still killed. Connections the client keeps open, including ones that got a
+  503, add to it.
+- Until this is fixed, give gateways headroom (1 GiB per 3,000 open connections) and scale out
+  before saturation.
+
 ## Features
 
 Only what this benchmark exercised:

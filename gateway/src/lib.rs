@@ -3,12 +3,16 @@
 //! limit counters with the control plane every couple of seconds.
 
 pub mod body;
+pub mod cloud;
 pub mod config;
 pub mod cp;
+pub mod dns;
 pub mod health;
 pub mod limits;
 pub mod metrics;
+pub mod resources;
 pub mod server;
+pub mod telemetry;
 pub mod translate;
 pub mod upstream;
 pub mod usage;

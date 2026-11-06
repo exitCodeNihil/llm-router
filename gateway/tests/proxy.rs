@@ -231,7 +231,8 @@ async fn unsupported_route_is_the_callers_mistake() {
         assert_eq!(v["error"]["type"], "invalid_request_error", "{model}");
         assert_eq!(v["error"]["code"], "unsupported_route", "{model}");
         assert!(v["error"]["message"].as_str().unwrap().contains("is not supported"), "{model}");
-        let events: Vec<_> = usage::take(usize::MAX).into_iter().filter(|e| e.model_name == model).collect();
+        let events: Vec<_> =
+            usage::take(usize::MAX, usize::MAX).into_iter().filter(|e| e.model_name == model).collect();
         assert_eq!(events.len(), 1, "{model}");
         assert_eq!((events[0].status_code, events[0].error_code), (400, "unsupported_route"), "{model}");
     }
@@ -276,8 +277,31 @@ async fn unreachable_provider_is_recorded() {
         )
         .await;
         assert_eq!(status, 500, "{path}: {}", String::from_utf8_lossy(&raw));
-        let events: Vec<_> = usage::take(usize::MAX).into_iter().filter(|e| e.model_name == model).collect();
+        let events: Vec<_> =
+            usage::take(usize::MAX, usize::MAX).into_iter().filter(|e| e.model_name == model).collect();
         assert_eq!(events.len(), 1, "{path}");
         assert_eq!((events[0].status_code, events[0].error_code), (500, "internal_error"), "{path}");
     }
+}
+
+/// A JWT goes to identity-token verification, not the key lookup; with no
+/// issuers configured it is refused as the control plane's /v1 refuses it.
+#[tokio::test]
+async fn identity_tokens_are_verified_not_looked_up() {
+    let (up, hits) = upstream(Reply { status: 200, flavor: "openai", headers: &[] }).await;
+    let gw = gateway("m", &[(&up, "openai", "none")]).await;
+    for (token, want) in [
+        ("eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJ4In0.c2ln", "invalid identity token: no token issuers configured"),
+        ("not-a-key", "invalid API key"),
+    ] {
+        let req = Request::post(format!("{gw}/v1/chat/completions"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Full::new(Bytes::from(json!({"model": "m", "messages": []}).to_string())))
+            .unwrap();
+        let resp = server::https_client(1).request(req).await.unwrap();
+        assert_eq!(resp.status(), 401, "{token}");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains(want), "{token}: {}", String::from_utf8_lossy(&body));
+    }
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
 }

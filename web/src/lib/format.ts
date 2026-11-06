@@ -56,3 +56,14 @@ export function budgetLabel(v: number | null | undefined, period: string | null 
   if (v == null) return "Unlimited";
   return `${money(v)} / ${period ?? "total"}`;
 }
+
+/** Bytes in binary units, as container limits are set (512 MiB, 2 GiB). */
+export function bytes(v: number): string {
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let i = 0;
+  while (Math.abs(v) >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${i === 0 || v >= 10 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
+}

@@ -3,7 +3,19 @@ image:
   tag: ""            # defaults to appVersion
   pullPolicy: IfNotPresent
 
+# The control plane keeps rate limits, budget counters, live metrics and
+# telemetry export queues in memory, so it runs as one replica. Scale request
+# traffic with gateways (gateway.replicas), which share those limits through
+# it. More than one replica is refused unless allowMultipleReplicas is set,
+# and then each replica enforces limits on its own traffic only.
 replicas: 1
+allowMultipleReplicas: false
+
+# Proxies in front of the console (addresses or CIDR ranges, e.g. your ingress
+# controller's pod range) whose X-Forwarded-For header names the client. Sign-in
+# attempts are rate limited per client, so without this everyone behind the
+# ingress shares one limit. Each proxy must append to X-Forwarded-For.
+trustedProxies: []
 
 databaseUrl: ""      # postgres://user:pass@host:5432/db — or use existingSecret
 adminToken: ""
@@ -65,6 +77,45 @@ gateway:
     requests:
       cpu: 250m
       memory: 128Mi
+  # On scale-in or rollout: keep accepting for preStopSleepSeconds while the pod
+  # leaves the Service (0 turns this off; left out before Kubernetes 1.30), then finish
+  # requests in flight (LLMR_SHUTDOWN_TIMEOUT, 30 s) and upload the last usage.
+  preStopSleepSeconds: 5
+  terminationGracePeriodSeconds: 50
+  # Scale gateways on CPU (needs metrics-server and a CPU request), and
+  # optionally on memory. Gateways scale horizontally; the control plane does
+  # not (see replicas above). A gateway mostly waits on upstreams, and past
+  # saturation its memory grows with its open connections while CPU can stay
+  # low: set a memory limit, and a memory target to scale on it too.
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: null   # e.g. 70, against the memory request
+
+# Prometheus metrics (docs/monitoring.md). Gateways serve /metrics on their
+# traffic port; the control plane serves it on its own port, which the
+# ingress does not route, so the console's host never exposes it.
+metrics:
+  port: 9090         # the control plane's metrics port; 0 serves /metrics on 8080
+  # prometheus.io/scrape, /port and /path annotations on both pods; left out
+  # while podMonitor is on, so no target is scraped twice.
+  podAnnotations: true
+  # PodMonitors for the Prometheus Operator: the control plane and every gateway.
+  podMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}       # e.g. release: kube-prometheus-stack, to match your Prometheus
+  # Alerting rules for the Prometheus Operator.
+  prometheusRule:
+    enabled: false
+    labels: {}
+    # Series these alerts look at; default: namespace="<this release's namespace>".
+    selector: ""
+    gatewayMemoryRatio: 0.85   # of the gateway's memory limit
+    errorRatio: 0.05           # 5xx share of /v1 requests
+    notSyncingSeconds: 30
 
 # Extra env and volumes for the llm-router container.
 extraEnv: []

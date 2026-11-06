@@ -1,0 +1,26 @@
+{
+ "about": "W3C traceparent parsing shared by the Go and Rust gateways. An invalid header is ignored: the request starts a new trace and is exported as usual. sampled is flags & 1, parsed but not acted on: the trace id and parent id are used whatever it says, and the export policy alone decides what is exported.",
+ "cases": [
+  {"header": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", "valid": true, "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "parent_id": "00f067aa0ba902b7", "sampled": true},
+  {"header": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00", "valid": true, "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "parent_id": "00f067aa0ba902b7", "sampled": false},
+  {"header": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-03", "valid": true, "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "parent_id": "00f067aa0ba902b7", "sampled": true},
+  {"header": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-02", "valid": true, "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "parent_id": "00f067aa0ba902b7", "sampled": false},
+  {"header": " 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\t", "valid": true, "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "parent_id": "00f067aa0ba902b7", "sampled": true},
+  {"header": "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", "valid": true, "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "parent_id": "00f067aa0ba902b7", "sampled": true},
+  {"header": "cc-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-what-the-future-holds", "valid": true, "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "parent_id": "00f067aa0ba902b7", "sampled": true},
+  {"header": "", "valid": false},
+  {"header": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra", "valid": false},
+  {"header": "cc-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01x", "valid": false},
+  {"header": "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", "valid": false},
+  {"header": "00-00000000000000000000000000000000-00f067aa0ba902b7-01", "valid": false},
+  {"header": "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01", "valid": false},
+  {"header": "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01", "valid": false},
+  {"header": "00-4bf92f3577b34da6a3ce929d0e0e4736-00F067AA0BA902B7-01", "valid": false},
+  {"header": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0g", "valid": false},
+  {"header": "0g-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", "valid": false},
+  {"header": "00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01", "valid": false},
+  {"header": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b-01", "valid": false},
+  {"header": "00_4bf92f3577b34da6a3ce929d0e0e4736_00f067aa0ba902b7_01", "valid": false},
+  {"header": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7", "valid": false}
+ ]
+}

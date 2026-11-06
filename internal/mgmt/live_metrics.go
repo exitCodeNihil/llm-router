@@ -2,7 +2,6 @@ package mgmt
 
 import (
 	"net/http"
-	"runtime"
 	"time"
 
 	"github.com/exitcodenihil/llm-router/internal/metrics"
@@ -113,31 +112,31 @@ func (m *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 	if selfVer == "" {
 		selfVer = "dev"
 	}
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
-	selfMem := 0.0
-	if ms.Sys > 0 {
-		selfMem = float64(ms.Alloc) / float64(ms.Sys) * 100
-	}
 	selfUptime := int64(0)
 	if !m.Started.IsZero() {
 		selfUptime = int64(time.Since(m.Started).Seconds())
 	}
-	p50 := 0
+	p50, selfP50 := 0, 0
 	if m.Live != nil {
-		p50 = m.Live.OverallP50()
+		p50, selfP50 = m.Live.OverallP50(), m.Live.NodeP50("")
 	}
-	nodes := []map[string]any{{
-		"id": "self", "name": "control-plane", "addr": "", "role": "leader",
-		"version": selfVer, "version_skew": false, "uptime_s": selfUptime,
-		"cpu_pct": 0.0, "mem_pct": round1(selfMem), "rps": round1(m.liveRPS("")),
-		"p50_ms": p50, "last_seen": time.Now().UTC(), "status": "ok",
-	}}
+	self := metrics.NodeMetric{Version: selfVer, UptimeS: selfUptime, CPUPct: metrics.CPUPct()}
+	self.MemBytes, self.MemLimitBytes = metrics.Memory()
+	if m.HTTP != nil {
+		self.OpenConns, self.InFlight = m.HTTP.OpenConnections(), m.HTTP.InFlight()
+	}
+	selfRow := nodeRow(self)
+	for k, v := range map[string]any{"id": "self", "name": "control-plane", "addr": "", "role": "leader",
+		"version_skew": false, "rps": round1(m.liveRPS("")), "p50_ms": selfP50, "last_seen": time.Now().UTC(),
+		"status": "ok"} {
+		selfRow[k] = v
+	}
+	nodes := []map[string]any{selfRow}
 
 	now := time.Now()
 	// Gateway instances sync every 2 s, so a few missed syncs already mean trouble.
 	rows, _ := listRows(r.Context(), m.Store.Pool,
-		`SELECT i.id, i.name, g.name AS group_name, g.region, i.last_seen_at
+		`SELECT i.id, i.name, i.group_id, g.name AS group_name, g.region, i.last_seen_at
 		FROM gateway_instances i JOIN gateway_groups g ON g.id = i.group_id
 		WHERE i.last_seen_at > now() - interval '10 minutes' ORDER BY g.name, i.joined_at`)
 	for _, row := range rows {
@@ -157,12 +156,22 @@ func (m *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 		case now.Sub(lastSeen) > 10*time.Second || skew:
 			status = "warn"
 		}
-		nodes = append(nodes, map[string]any{
-			"id": id, "name": name, "addr": "", "role": "gateway", "group": group, "region": row["region"],
-			"version": nm.Version, "version_skew": skew, "uptime_s": nm.UptimeS,
-			"cpu_pct": round1(nm.CPUPct), "mem_pct": round1(nm.MemPct), "rps": round1(m.liveRPS(id)),
-			"p50_ms": 0, "last_seen": row["last_seen_at"], "status": status,
-		})
+		gw := nodeRow(nm)
+		groupID, _ := row["group_id"].(string)
+		gw["unserved_providers"] = []string{}
+		if m.GatewaySync != nil {
+			gw["unserved_providers"] = m.GatewaySync.UnservedProviders(groupID, nm.Schema)
+		}
+		p50 := 0
+		if m.Live != nil {
+			p50 = m.Live.NodeP50(id)
+		}
+		for k, v := range map[string]any{"id": id, "name": name, "addr": "", "role": "gateway", "group": group,
+			"region": row["region"], "version_skew": skew, "rps": round1(m.liveRPS(id)), "p50_ms": p50,
+			"last_seen": row["last_seen_at"], "status": status} {
+			gw[k] = v
+		}
+		nodes = append(nodes, gw)
 	}
 
 	events := []map[string]any{}
@@ -175,6 +184,30 @@ func (m *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"nodes": nodes, "cluster_events": events})
+}
+
+// nodeRow is the ops part of a node's row on the Gateways page.
+func nodeRow(nm metrics.NodeMetric) map[string]any {
+	return map[string]any{
+		"version": nm.Version, "uptime_s": nm.UptimeS, "cpu_pct": round1(nm.CPUPct), "mem_pct": round1(nm.MemPct()),
+		"mem_bytes": nm.MemBytes, "mem_limit_bytes": nm.MemLimitBytes, "open_connections": nm.OpenConns,
+		"in_flight": nm.InFlight,
+	}
+}
+
+// nodesHistory returns each gateway's last hour of open connections, requests
+// in flight and memory, one sample per step (the peak over the step). Steps
+// without a sync are missing. Per process, like the other live metrics.
+func (m *Server) nodesHistory(w http.ResponseWriter, r *http.Request) {
+	gateways := []metrics.NodeHistory{}
+	if m.NodeStore != nil {
+		gateways = m.NodeStore.History()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"step_s":   int(metrics.HistoryStep.Seconds()),
+		"window_s": int((metrics.HistoryLen * metrics.HistoryStep).Seconds()),
+		"gateways": gateways,
+	})
 }
 
 func (m *Server) liveRPS(id string) float64 {

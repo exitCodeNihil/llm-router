@@ -250,9 +250,11 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 
 	var telemetryRaw []byte
 	if err := b.Pool.QueryRow(ctx, `SELECT value FROM settings WHERE key='telemetry'`).Scan(&telemetryRaw); err == nil {
-		if err := json.Unmarshal(telemetryRaw, &s.Telemetry); err != nil {
-			slog.Error("corrupt telemetry settings; exporter disabled", "err", err)
-		}
+		s.Telemetry = parseTelemetry(telemetryRaw)
+	}
+
+	if err := b.loadDestinations(ctx, s); err != nil {
+		return nil, err
 	}
 
 	rows, err = b.Pool.Query(ctx, `SELECT id, name, region, allowed_teams, data_rule FROM gateway_groups`)
@@ -281,6 +283,51 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// parseTelemetry reads the capture policy. One that can't be read exports
+// nothing: the zero policy would export everything.
+func parseTelemetry(raw []byte) Telemetry {
+	var t Telemetry
+	if err := json.Unmarshal(raw, &t); err != nil {
+		slog.Error("corrupt telemetry settings; export is off until they are saved again", "err", err)
+		return Telemetry{Mode: "off"}
+	}
+	return t
+}
+
+// loadDestinations reads the telemetry destinations. One whose secrets can't
+// be decrypted is kept with Err set, so the console can say why it is idle.
+func (b *Builder) loadDestinations(ctx context.Context, s *Snapshot) error {
+	rows, err := b.Pool.Query(ctx, `
+		SELECT id, name, kind, enabled, endpoint, traces_url, config, secrets_enc, content_mode,
+		       max_content_bytes, team_scope, team_values, group_scope, group_values
+		FROM telemetry_destinations ORDER BY name`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		d := &Destination{}
+		var enc []byte
+		if err := rows.Scan(&d.ID, &d.Name, &d.Kind, &d.Enabled, &d.Endpoint, &d.TracesURL, &d.Config, &enc,
+			&d.ContentMode, &d.MaxContentBytes, &d.Teams.Mode, &d.Teams.Values, &d.Groups.Mode, &d.Groups.Values); err != nil {
+			return err
+		}
+		if len(enc) > 0 {
+			plain, err := Decrypt(b.EncryptionKey, enc)
+			if err == nil {
+				err = json.Unmarshal([]byte(plain), &d.Secrets)
+			}
+			if err != nil {
+				slog.Error("decrypt telemetry destination secrets failed; destination idle", "destination", d.Name, "err", err)
+				d.Err = "secrets can't be decrypted with LLMR_ENCRYPTION_KEY: " + err.Error()
+				d.Secrets = nil
+			}
+		}
+		s.Destinations = append(s.Destinations, d)
+	}
+	return rows.Err()
 }
 
 // loadSpend caches current-period spend per scope for O(1) budget checks.

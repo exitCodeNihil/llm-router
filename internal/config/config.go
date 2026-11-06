@@ -4,6 +4,7 @@ package config
 import (
 	"flag"
 	"fmt"
+	"net/netip"
 	"os"
 	"strings"
 )
@@ -23,6 +24,12 @@ type Config struct {
 	// origin on a sibling hostname receives it. Empty = host-only cookie,
 	// which is right when the IDE differs from the console by port alone.
 	CookieDomain string
+	// TrustedProxies lists the proxies (addresses or CIDR ranges) whose
+	// X-Forwarded-For header names the client, for sign-in rate limits.
+	TrustedProxies []netip.Prefix
+	// MetricsListen serves /metrics on its own listener instead of the main
+	// one ("off": not at all). Empty = on the main listener, like a gateway.
+	MetricsListen string
 }
 
 func Load(args []string) (*Config, error) {
@@ -33,10 +40,16 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&c.IDEListen, "ide-listen", os.Getenv("LLMR_IDE_LISTEN"), "listen address for the workspace IDE proxy")
 	fs.StringVar(&c.IDEOrigin, "ide-origin", os.Getenv("LLMR_IDE_ORIGIN"), "public origin of the IDE listener, e.g. http://localhost:8081")
 	fs.StringVar(&c.CookieDomain, "cookie-domain", os.Getenv("LLMR_COOKIE_DOMAIN"), "session cookie Domain attribute, e.g. .example.com (needed when the IDE origin is a different hostname)")
+	fs.StringVar(&c.MetricsListen, "metrics-listen", os.Getenv("LLMR_METRICS_LISTEN"), "serve /metrics on this address instead of the main listener (off: not at all)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
 	c.AdminToken = os.Getenv("LLMR_ADMIN_TOKEN")
+	trusted, err := parsePrefixes(os.Getenv("LLMR_TRUSTED_PROXIES"))
+	if err != nil {
+		return nil, fmt.Errorf("LLMR_TRUSTED_PROXIES: %w", err)
+	}
+	c.TrustedProxies = trusted
 	c.EncryptionKey = os.Getenv("LLMR_ENCRYPTION_KEY")
 
 	if c.DatabaseURL == "" {
@@ -84,4 +97,30 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// parsePrefixes reads a comma-separated list of addresses or CIDR ranges.
+func parsePrefixes(s string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, f := range strings.Split(s, ",") {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+		if !strings.Contains(f, "/") {
+			a, err := netip.ParseAddr(f)
+			if err != nil {
+				return nil, err
+			}
+			a = a.Unmap()
+			out = append(out, netip.PrefixFrom(a, a.BitLen()))
+			continue
+		}
+		p, err := netip.ParsePrefix(f)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p.Masked())
+	}
+	return out, nil
 }

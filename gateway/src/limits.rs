@@ -131,10 +131,15 @@ pub fn end_config(generation: u64) {
     registry().lock().unwrap().retain(|_, s| s.generation.load(Ordering::Relaxed) == generation);
 }
 
+/// The control plane's clock in unix milliseconds, as of the last sync.
+pub fn cp_now_ms() -> i64 {
+    now_ms() + CLOCK_OFFSET_MS.load(Ordering::Relaxed)
+}
+
 /// The control plane's clock, as of the last sync: minute buckets must agree
 /// across gateways.
 fn clock() -> (i64, f64) {
-    let ms = now_ms() + CLOCK_OFFSET_MS.load(Ordering::Relaxed);
+    let ms = cp_now_ms();
     (ms.div_euclid(60_000), ms.rem_euclid(60_000) as f64 / 60_000.0)
 }
 
@@ -255,6 +260,16 @@ pub fn freeze() -> (Vec<RateDelta>, Vec<Arc<Scope>>) {
     (deltas, scopes)
 }
 
+/// Forget a batch's in-flight counts: it was acknowledged, or the control plane
+/// refused it for good and it will not be sent again.
+pub fn discard(batch: &[Arc<Scope>]) {
+    for s in batch {
+        let mut i = s.inner.lock().unwrap();
+        i.inflight.clear();
+        i.spend_inflight = 0.0;
+    }
+}
+
 /// What the control plane answers a sync with (limits.Counters).
 #[derive(Debug, Default, Deserialize)]
 pub struct Counters {
@@ -276,11 +291,7 @@ pub fn apply(batch: &[Arc<Scope>], c: &Counters) {
     if c.now_ms > 0 {
         CLOCK_OFFSET_MS.store(c.now_ms - now_ms(), Ordering::Relaxed);
     }
-    for s in batch {
-        let mut i = s.inner.lock().unwrap();
-        i.inflight.clear();
-        i.spend_inflight = 0.0;
-    }
+    discard(batch);
     let reg = registry().lock().unwrap();
     for s in reg.values() {
         let mut i = s.inner.lock().unwrap();
@@ -298,11 +309,11 @@ pub fn apply(batch: &[Arc<Scope>], c: &Counters) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // The scope registry and dirty list are process-wide: one test at a time.
-    static SERIAL: Mutex<()> = Mutex::new(());
+    pub(crate) static SERIAL: Mutex<()> = Mutex::new(());
 
     fn key(name: &str, budget: Option<f64>, rpm: Option<i64>) -> Key {
         Key {
@@ -314,6 +325,7 @@ mod tests {
             allowed_models: None,
             expires_at: 0,
             scope: scope(format!("key:{name}"), budget, rpm, None),
+            tags: Vec::new(),
         }
     }
 

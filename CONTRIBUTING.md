@@ -14,8 +14,9 @@ make help      # all targets
 
 `make dev` serves the console on <http://localhost:5173> and the gateway on
 <http://localhost:8080>. Override defaults inline, e.g. `make dev PORT=9000
-LLMR_DATABASE_URL=postgres://…`. `make stack` also starts Zitadel (OIDC) and Langfuse for SSO and
-export work. Container tooling prefers podman and falls back to docker (`ENGINE=docker` to force).
+LLMR_DATABASE_URL=postgres://…`. `make stack` also starts Zitadel (OIDC) for SSO work, and
+`make stack-telemetry` adds Grafana with Tempo and Langfuse v4 for telemetry work; `make verify`'s
+observability suite needs them. Container tooling prefers podman and falls back to docker (`ENGINE=docker` to force).
 
 ## Conventions
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Card } from "@astryxdesign/core/Card";
 import { Grid } from "@astryxdesign/core/Grid";
 import { HStack, VStack } from "@astryxdesign/core/Stack";
@@ -19,22 +19,41 @@ import { SegmentedControl, SegmentedControlItem } from "@astryxdesign/core/Segme
 import { Table, pixel, proportional } from "@astryxdesign/core/Table";
 import type { TableColumn } from "@astryxdesign/core/Table";
 import { Timestamp } from "@astryxdesign/core/Timestamp";
+import { Tooltip } from "@astryxdesign/core/Tooltip";
+import { VisuallyHidden } from "@astryxdesign/core/VisuallyHidden";
 import { useToast } from "@astryxdesign/core/Toast";
 
-import type { Capture, ExportedEvent, RuleScope, TelemetryMode, TelemetryRule } from "../lib/types";
+import type {
+  Capture,
+  DestinationScope,
+  DestinationStatus,
+  ExportedEvent,
+  RuleScope,
+  TelemetryDestination,
+  TelemetryKind,
+  TelemetryMode,
+  TelemetryRule,
+} from "../lib/types";
 import {
+  useDeleteDestination,
+  useDestinations,
+  useGatewayGroups,
   useKeys,
   useObservabilityExported,
   useObservabilityRuleStats,
   useSetTelemetry,
   useTeams,
   useTelemetry,
-  useTestObservability,
+  useTelemetryKinds,
+  useTestDestination,
+  useToggleDestination,
   useUsers,
 } from "../lib/hooks";
 import { int, money } from "../lib/format";
 import { Empty, ErrorState, Loading, Page } from "../components/Page";
-import { IconPlus, IconTrash } from "../components/icons";
+import { Confirm } from "../components/dialogs";
+import { CONTROL_PLANE, DestinationDialog } from "../components/DestinationDialog";
+import { IconEdit, IconPlus, IconTrash } from "../components/icons";
 
 const SCOPES: { value: RuleScope; label: string }[] = [
   { value: "team", label: "Team" },
@@ -43,10 +62,357 @@ const SCOPES: { value: RuleScope; label: string }[] = [
   { value: "tag", label: "Tag" },
 ];
 
+// ── Destinations ────────────────────────────────────────────────
+const STATUS: Record<DestinationStatus, { variant: "success" | "error" | "neutral"; label: string }> = {
+  healthy: { variant: "success", label: "Healthy" },
+  failing: { variant: "error", label: "Failing" },
+  no_data: { variant: "neutral", label: "No data" },
+  disabled: { variant: "neutral", label: "Disabled" },
+};
+
+function hostOf(d: TelemetryDestination) {
+  const u = d.endpoint || d.traces_url;
+  try {
+    return new URL(u).host;
+  } catch {
+    return u;
+  }
+}
+
+/** "All teams", "Platform, Research", "All groups except Control plane". */
+function scopeSummary(s: DestinationScope, noun: string, name: (v: string) => string) {
+  const names = s.values.map(name);
+  const list = names.length <= 2 ? names.join(", ") : `${names.length} ${noun}s`;
+  if (s.mode === "all") return { short: `All ${noun}s`, full: "" };
+  if (s.mode === "selected")
+    return names.length === 0
+      ? { short: `No ${noun}s`, full: "" }
+      : { short: list, full: names.join(", ") };
+  return names.length === 0
+    ? { short: `All ${noun}s`, full: "" }
+    : { short: `All ${noun}s except ${list}`, full: names.join(", ") };
+}
+
+/**
+ * A tooltip over plain text. The Tooltip opens on focus only for a focusable
+ * trigger, so the cell takes a tab stop and a name of its own; the tooltip
+ * then describes it.
+ */
+function CellTip({ content, label, children }: { content: ReactNode; label: string; children: ReactNode }) {
+  return (
+    <Tooltip content={content}>
+      <span tabIndex={0} role="group" aria-label={label} style={{ display: "flex", minWidth: 0, maxWidth: "100%" }}>
+        {children}
+      </span>
+    </Tooltip>
+  );
+}
+
+function StatusCell({ d }: { d: TelemetryDestination }) {
+  // The row's own flag wins: right after a toggle the exporter may still
+  // report the old worker's health until the config reloads. A destination
+  // that can't run (undecryptable secrets) is failing whatever its counters
+  // say.
+  const status: DestinationStatus = !d.enabled ? "disabled" : d.error ? "failing" : d.health.status;
+  const s = STATUS[status] ?? STATUS.no_data;
+  const h = d.health;
+  const dropped = h.dropped.overflow + h.dropped.rejected + h.dropped.expired;
+  const lines = [
+    d.error,
+    h.last_error && `Last error${h.last_error_at ? ` at ${new Date(h.last_error_at).toLocaleString()}` : ""}: ${h.last_error}`,
+    h.last_success_at && `Last delivered at ${new Date(h.last_success_at).toLocaleString()}`,
+    `${int(h.delivered)} delivered, ${int(dropped)} dropped${h.queued ? `, ${int(h.queued)} queued` : ""} since start`,
+  ].filter(Boolean) as string[];
+  return (
+    <CellTip
+      label={`${d.name} status: ${s.label}`}
+      content={<VStack gap={1}>{lines.map((l) => <span key={l}>{l}</span>)}</VStack>}
+    >
+      <HStack gap={1.5} vAlign="center">
+        <StatusDot variant={s.variant} label={s.label} />
+        <Text type="supporting" color={status === "failing" ? undefined : "secondary"}>
+          {s.label}
+        </Text>
+      </HStack>
+    </CellTip>
+  );
+}
+
+function DestinationsCard({ policyCapturesContent }: { policyCapturesContent: boolean }) {
+  const destinations = useDestinations();
+  const kinds = useTelemetryKinds();
+  const teams = useTeams();
+  const groups = useGatewayGroups();
+  const toggleDestination = useToggleDestination();
+  const del = useDeleteDestination();
+  const test = useTestDestination();
+  const showToast = useToast();
+
+  // undefined = closed, null = adding, a destination = editing.
+  const [editing, setEditing] = useState<TelemetryDestination | null | undefined>(undefined);
+  const [deleting, setDeleting] = useState<TelemetryDestination | null>(null);
+  const [toggling, setToggling] = useState<TelemetryDestination | null>(null);
+  const [testing, setTesting] = useState<string | null>(null);
+
+  const kindOf = (name: string): TelemetryKind | undefined => kinds.data?.find((k) => k.name === name);
+  const teamName = (id: string) => teams.data?.find((t) => t.id === id)?.name ?? id;
+  const groupName = (id: string) =>
+    id === CONTROL_PLANE ? "Control plane" : (groups.data?.find((g) => g.id === id)?.name ?? id);
+
+  async function toggle(d: TelemetryDestination) {
+    try {
+      await toggleDestination.mutateAsync({ id: d.id, enabled: !d.enabled });
+      showToast({ body: d.enabled ? `${d.name} disabled` : `${d.name} enabled` });
+    } catch (err) {
+      showToast({ body: err instanceof Error ? err.message : "Failed", type: "error" });
+    }
+  }
+
+  async function runTest(d: TelemetryDestination) {
+    setTesting(d.id);
+    try {
+      const r = await test.mutateAsync({ id: d.id });
+      showToast({
+        body: r.ok ? `${d.name}: test span accepted` : `${d.name}: ${r.status ? `HTTP ${r.status}, ` : ""}${r.detail}`,
+        type: r.ok ? "info" : "error",
+        endContent: r.trace_url ? (
+          <a href={r.trace_url} target="_blank" rel="noreferrer" className="link">
+            <Text type="supporting">Open trace</Text>
+          </a>
+        ) : undefined,
+      });
+    } catch (err) {
+      showToast({ body: err instanceof Error ? err.message : "Failed", type: "error" });
+    } finally {
+      setTesting(null);
+    }
+  }
+
+  const columns: TableColumn<TelemetryDestination & Record<string, unknown>>[] = [
+    {
+      key: "name",
+      header: "Name",
+      width: proportional(1.2),
+      renderCell: (d) => (
+        <Text type="body" weight="medium" maxLines={1}>
+          {d.name}
+        </Text>
+      ),
+    },
+    {
+      key: "kind",
+      header: "Kind",
+      width: pixel(150),
+      renderCell: (d) => {
+        const k = kindOf(d.kind);
+        return (
+          <CellTip content={k?.label ?? d.kind} label={`Kind: ${d.kind}${k?.beta ? ", beta" : ""}`}>
+            <HStack gap={1} vAlign="center">
+              <Badge variant="neutral" label={d.kind} />
+              {k?.beta && <Badge variant="info" label="Beta" />}
+            </HStack>
+          </CellTip>
+        );
+      },
+    },
+    {
+      key: "endpoint",
+      header: "Endpoint",
+      width: proportional(1.2),
+      renderCell: (d) => <Code>{hostOf(d)}</Code>,
+    },
+    {
+      key: "content_mode",
+      header: "Content",
+      width: pixel(104),
+      renderCell: (d) =>
+        d.content_mode === "content" ? (
+          <Badge variant="purple" label="full" />
+        ) : (
+          <Badge variant="neutral" label="metadata" />
+        ),
+    },
+    {
+      key: "scope",
+      header: "Scope",
+      width: proportional(1.4),
+      renderCell: (d) => {
+        const t = scopeSummary(d.team_scope, "team", teamName);
+        const g = scopeSummary(d.group_scope, "group", groupName);
+        const full = [t.full && `Teams: ${t.short}`, g.full && `Groups: ${g.short}`].filter(Boolean).join(" · ");
+        const cell = (
+          <VStack gap={0}>
+            <Text type="supporting" maxLines={1}>
+              {t.short}
+            </Text>
+            <Text type="supporting" color="secondary" maxLines={1}>
+              {g.short}
+            </Text>
+          </VStack>
+        );
+        return full ? (
+          <CellTip content={full} label={`Scope: ${t.short}; ${g.short}`}>
+            {cell}
+          </CellTip>
+        ) : (
+          cell
+        );
+      },
+    },
+    {
+      key: "status",
+      header: "Status",
+      width: pixel(112),
+      renderCell: (d) => <StatusCell d={d} />,
+    },
+    {
+      key: "enabled",
+      header: "Enabled",
+      width: pixel(84),
+      renderCell: (d) => (
+        <Switch
+          label={`${d.enabled ? "Disable" : "Enable"} ${d.name}`}
+          isLabelHidden
+          value={d.enabled}
+          changeAction={() => setToggling(d)}
+        />
+      ),
+    },
+    {
+      key: "actions",
+      header: <VisuallyHidden>Actions</VisuallyHidden>,
+      width: pixel(144),
+      align: "end",
+      renderCell: (d) => (
+        <HStack gap={1} hAlign="end" vAlign="center">
+          <Button
+            label={`Test ${d.name}`}
+            variant="ghost"
+            size="sm"
+            isLoading={testing === d.id}
+            onClick={() => runTest(d)}
+          >
+            Test
+          </Button>
+          <IconButton
+            label={`Edit ${d.name}`}
+            variant="ghost"
+            size="sm"
+            icon={<Icon icon={IconEdit} size="sm" />}
+            onClick={() => setEditing(d)}
+          />
+          <IconButton
+            label={`Delete ${d.name}`}
+            variant="ghost"
+            size="sm"
+            icon={<Icon icon={IconTrash} size="sm" />}
+            onClick={() => setDeleting(d)}
+          />
+        </HStack>
+      ),
+    },
+  ];
+
+  const addButton = (
+    <Button
+      label="Add destination"
+      variant="secondary"
+      icon={<Icon icon={IconPlus} size="sm" />}
+      isDisabled={!kinds.data?.length}
+      onClick={() => setEditing(null)}
+    />
+  );
+
+  return (
+    <Card padding={0}>
+      <VStack gap={0}>
+        <HStack padding={4} hAlign="between" vAlign="center" gap={3} wrap="wrap">
+          <VStack gap={0}>
+            <Heading level={4}>Destinations</Heading>
+            <Text type="supporting" color="secondary">
+              Each destination receives the traffic the capture policy exports, narrowed by its own scope.
+            </Text>
+          </VStack>
+          {(destinations.data?.length ?? 0) > 0 && addButton}
+        </HStack>
+        <Divider />
+        {destinations.isLoading ? (
+          <Loading />
+        ) : destinations.error ? (
+          <ErrorState error={destinations.error} onRetry={() => destinations.refetch()} />
+        ) : (destinations.data?.length ?? 0) === 0 ? (
+          <Empty
+            title="No destinations"
+            description="Add an OpenTelemetry collector or a Langfuse project to start exporting traces."
+            action={addButton}
+          />
+        ) : (
+          <Table
+            data={(destinations.data ?? []) as Array<TelemetryDestination & Record<string, unknown>>}
+            columns={columns}
+            idKey="id"
+            density="balanced"
+            dividers="rows"
+            hasHover
+            textOverflow="truncate"
+          />
+        )}
+      </VStack>
+
+      {editing !== undefined && kinds.data && (
+        <DestinationDialog
+          editing={editing}
+          kinds={kinds.data}
+          policyCapturesContent={policyCapturesContent}
+          onClose={() => setEditing(undefined)}
+        />
+      )}
+
+      <Confirm
+        target={toggling}
+        title={toggling?.enabled ? "Disable destination" : "Enable destination"}
+        description={
+          toggling?.enabled
+            ? `Stop exporting to "${toggling?.name}"? Traces already sent stay there.`
+            : `Start exporting to "${toggling?.name}"? Matching traffic${
+                toggling?.content_mode === "content" ? ", including prompt content where the policy captures it," : ""
+              } is sent to ${toggling ? hostOf(toggling) : ""}.`
+        }
+        actionLabel={toggling?.enabled ? "Disable" : "Enable"}
+        isLoading={toggleDestination.isPending}
+        onCancel={() => setToggling(null)}
+        onConfirm={async () => {
+          if (!toggling) return;
+          await toggle(toggling);
+          setToggling(null);
+        }}
+      />
+
+      <Confirm
+        target={deleting}
+        title="Delete destination"
+        description={`Delete "${deleting?.name}"? Export to it stops and its stored secrets are removed. Traces already sent stay there.`}
+        isLoading={del.isPending}
+        onCancel={() => setDeleting(null)}
+        onConfirm={async () => {
+          if (!deleting) return;
+          try {
+            await del.mutateAsync(deleting.id);
+            showToast({ body: "Destination deleted" });
+          } catch (err) {
+            showToast({ body: err instanceof Error ? err.message : "Failed", type: "error" });
+          }
+          setDeleting(null);
+        }}
+      />
+    </Card>
+  );
+}
+
 export default function Observability() {
   const tel = useTelemetry();
   const save = useSetTelemetry();
-  const test = useTestObservability();
+  const destinations = useDestinations();
   const teams = useTeams();
   const users = useUsers();
   const keys = useKeys();
@@ -54,24 +420,16 @@ export default function Observability() {
   const stats = useObservabilityRuleStats();
   const showToast = useToast();
 
-  // ── Destination ──────────────────────────────────────────────
-  const [host, setHost] = useState("");
-  const [publicKey, setPublicKey] = useState("");
-  const [secretKey, setSecretKey] = useState("");
-  const [enabled, setEnabled] = useState(false);
   const [captureContent, setCaptureContent] = useState(false);
   const [mode, setMode] = useState<TelemetryMode>("everything");
   const [rules, setRules] = useState<TelemetryRule[]>([]);
 
-  // Hydrate once; secret_key always returns empty from the server.
+  // Hydrate once.
   const hydrated = useRef(false);
   useEffect(() => {
-    const t = tel.data?.telemetry;
+    const t = tel.data;
     if (!t || hydrated.current) return;
     hydrated.current = true;
-    setHost(t.host);
-    setPublicKey(t.public_key);
-    setEnabled(t.enabled);
     setCaptureContent(t.capture_content);
     setMode((t.mode || "everything") as TelemetryMode);
     setRules([...t.rules].sort((a, b) => a.order - b.order));
@@ -85,47 +443,6 @@ export default function Observability() {
   const preview = useObservabilityRuleStats(
     scopeValue ? { scope_type: scopeType, scope_value: scopeValue } : undefined,
   );
-
-  function blob(over: Record<string, unknown> = {}, rulesOver?: TelemetryRule[]) {
-    return {
-      type: "langfuse",
-      host: host.trim(),
-      public_key: publicKey.trim(),
-      secret_key: secretKey, // blank keeps the stored secret
-      enabled,
-      capture_content: captureContent,
-      mode,
-      rules: rulesOver ?? rules,
-      ...over,
-    };
-  }
-
-
-  async function saveDestination() {
-    try {
-      // Destination only: the capture policy has its own explicit Apply,
-      // because it decides whether prompt content leaves the gateway.
-      await save.mutateAsync(
-        blob(
-          saved ? { mode: saved.mode || "everything", capture_content: saved.capture_content } : {},
-          saved ? [...saved.rules] : undefined,
-        ),
-      );
-      setSecretKey("");
-      showToast({ body: "Telemetry settings saved" });
-    } catch (err) {
-      showToast({ body: err instanceof Error ? err.message : "Failed", type: "error" });
-    }
-  }
-
-  async function testConnection() {
-    try {
-      const res = await test.mutateAsync(blob());
-      showToast({ body: res.detail || (res.ok ? "Connection OK" : "Connection failed"), type: res.ok ? "info" : "error" });
-    } catch (err) {
-      showToast({ body: err instanceof Error ? err.message : "Failed", type: "error" });
-    }
-  }
 
   const patchRule = (id: string, patch: Partial<TelemetryRule>) =>
     setRules(rules.map((r) => (r.id === id ? { ...r, ...patch } : r)));
@@ -178,13 +495,12 @@ export default function Observability() {
   };
 
   const rpmFor = (id: string) => stats.data?.rules.find((r) => r.rule_id === id)?.matching_rpm ?? 0;
-  const health = tel.data?.health;
 
   // ── Pending policy changes ───────────────────────────────────
   // Capture policy decides whether prompts and completions leave the gateway,
   // so it is edited as a draft and applied explicitly: a mis-click here is a
   // data-egress change, not a display preference.
-  const saved = tel.data?.telemetry;
+  const saved = tel.data;
   const changes = useMemo(() => {
     if (!saved) return [];
     const out: string[] = [];
@@ -226,7 +542,7 @@ export default function Observability() {
 
   async function savePolicy() {
     try {
-      await save.mutateAsync(blob());
+      await save.mutateAsync({ mode, capture_content: captureContent, rules });
       showToast({ body: "Capture policy applied" });
     } catch (err) {
       showToast({ body: err instanceof Error ? err.message : "Failed", type: "error" });
@@ -239,6 +555,16 @@ export default function Observability() {
     setCaptureContent(saved.capture_content);
     setRules([...(saved.rules ?? [])].sort((a, b) => a.order - b.order));
   }
+
+  // Whether the stored policy can let content out at all, for the hint in the
+  // destination dialog.
+  const policyCapturesContent =
+    !!saved &&
+    (saved.mode === "everything"
+      ? saved.capture_content
+      : saved.mode === "by_rule" && saved.rules.some((r) => r.enabled && r.capture === "content"));
+  const anyEnabled = (destinations.data ?? []).some((d) => d.enabled);
+  const failing = (destinations.data ?? []).filter((d) => d.enabled && (d.health.status === "failing" || d.error));
 
   const eventColumns: TableColumn<ExportedEvent & Record<string, unknown>>[] = [
     {
@@ -285,296 +611,243 @@ export default function Observability() {
     <Page
       eyebrow="Operations"
       title="Observability"
-      description="Export request traces to Langfuse. Rules decide which traffic is captured and whether prompt content leaves the gateway."
+      description="Export request traces to OpenTelemetry backends and Langfuse. The capture policy decides what may leave the gateway; each destination then picks its traffic and whether content goes with it."
     >
       <VStack gap={4}>
         {/* Delivery health. The live feed below lists events *selected* for
-            export, which looks identical whether Langfuse accepted them or
-            rejected every one, so failures have to be stated outright. */}
-        {health && health.dropped > 0 && (
+            export, which looks the same whether a destination accepted them
+            or rejected every one, so failures are stated outright. */}
+        {failing.length > 0 && (
           <Banner
             status="error"
-            title={`Langfuse rejected ${int(health.dropped)} event${health.dropped > 1 ? "s" : ""}`}
-            description={`${health.last_error || "export failed"}${
-              health.delivered > 0 ? ` — ${int(health.delivered)} delivered successfully.` : " — nothing has been delivered."
-            } Events listed below were selected for export but did not arrive. Use Test connection to check the host and key pair.`}
+            title={
+              failing.length === 1
+                ? `${failing[0].name} is failing`
+                : `${failing.length} destinations are failing`
+            }
+            description={`${failing
+              .map((d) => `${d.name}: ${d.error || d.health.last_error || "export failed"}`)
+              .join(" · ")} — use Test to check the endpoint and credentials.`}
           />
         )}
-        {health && health.dropped === 0 && health.delivered > 0 && (
-          <Banner
-            status="success"
-            title={`${int(health.delivered)} event${health.delivered === 1 ? "" : "s"} delivered to Langfuse`}
-            description={health.last_ok_at ? `Last successful export at ${new Date(health.last_ok_at).toLocaleTimeString()}.` : undefined}
-          />
-        )}
-        {enabled && mode === "by_rule" && rules.length === 0 && changes.length === 0 && (
+        {anyEnabled && mode === "by_rule" && rules.length === 0 && changes.length === 0 && (
           <Banner
             status="warning"
             title="Export is on, but no rules exist"
-            description="In by-rule mode traffic matching nothing is not exported, so nothing is reaching Langfuse. Add a rule for a team, user or key below, or switch to Everything."
+            description="In by-rule mode traffic matching nothing is not exported, so nothing reaches any destination. Add a rule for a team, user or key below, or switch to Everything."
           />
         )}
 
-        <Grid columns={{ minWidth: 380, repeat: "fit" }} gap={4}>
-          {/* Destination */}
-          <Card>
-            <VStack gap={4}>
-              <HStack hAlign="between" vAlign="center">
-                <Heading level={4}>Destination</Heading>
-                <HStack gap={2} vAlign="center">
-                  <StatusDot
-                    variant={enabled ? "success" : "neutral"}
-                    label={enabled ? "Export enabled" : "Export disabled"}
-                  />
-                  <Badge variant="neutral" label="langfuse" />
-                </HStack>
-              </HStack>
+        <DestinationsCard policyCapturesContent={policyCapturesContent} />
 
-              <TextInput
-                label="Host"
-                value={host}
-                onChange={setHost}
-                placeholder="https://cloud.langfuse.com"
-                isRequired
-              />
-              <TextInput label="Public key" value={publicKey} onChange={setPublicKey} placeholder="pk-lf-…" isRequired />
-              <TextInput
-                label="Secret key"
-                type="password"
-                value={secretKey}
-                onChange={setSecretKey}
-                placeholder={tel.data?.configured ? "•••••••• (leave blank to keep)" : "sk-lf-…"}
-              />
-
-              <Switch
-                label="Enable export"
-                description="Ship trace events to the destination above"
-                value={enabled}
-                onChange={setEnabled}
-              />
-
-              <HStack gap={2} hAlign="end" wrap="wrap">
-                <Button
-                  label="Test connection"
-                  variant="secondary"
-                  isLoading={test.isPending}
-                  onClick={testConnection}
-                  isDisabled={!host.trim()}
-                />
-                <Button
-                  label="Save"
-                  variant="primary"
-                  isLoading={save.isPending}
-                  onClick={saveDestination}
-                  isDisabled={!host.trim() || !publicKey.trim()}
-                />
-              </HStack>
-            </VStack>
-          </Card>
-
-          {/* Capture policy */}
-          <Card>
-            <VStack gap={4}>
+        {/* Capture policy */}
+        <Card>
+          <VStack gap={4}>
+            <VStack gap={0}>
               <Heading level={4}>Capture policy</Heading>
+              <Text type="supporting" color="secondary">
+                Applies before every destination: traffic it does not export reaches none of them, and content it does
+                not capture is never sent.
+              </Text>
+            </VStack>
 
-              <VStack gap={2}>
-                <span className="eyebrow">Mode</span>
-                <SegmentedControl
-                  label="Capture mode"
-                  layout="fill"
-                  value={mode}
-                  onChange={(v) => setMode(v as TelemetryMode)}
-                >
-                  <SegmentedControlItem value="everything" label="Everything" />
-                  <SegmentedControlItem value="by_rule" label="By rule" />
-                  <SegmentedControlItem value="off" label="Off" />
-                </SegmentedControl>
-              </VStack>
+            <VStack gap={2}>
+              <span className="eyebrow">Mode</span>
+              <SegmentedControl
+                label="Capture mode"
+                layout="fill"
+                value={mode}
+                onChange={(v) => setMode(v as TelemetryMode)}
+              >
+                <SegmentedControlItem value="everything" label="Everything" />
+                <SegmentedControlItem value="by_rule" label="By rule" />
+                <SegmentedControlItem value="off" label="Off" />
+              </SegmentedControl>
+            </VStack>
 
-              {mode === "everything" && (
-                <Switch
-                  label="Capture prompt content"
-                  description="Off exports metadata only — no prompts or completions leave the gateway"
-                  value={captureContent}
-                  onChange={setCaptureContent}
-                />
-              )}
+            {mode === "everything" && (
+              <Switch
+                label="Capture prompt content"
+                description="Off exports metadata only: no prompts or completions leave the gateway, whatever a destination asks for"
+                value={captureContent}
+                onChange={setCaptureContent}
+              />
+            )}
 
-              {mode === "off" && (
-                <Banner status="info" title="Export is off" description="No trace events are being produced." />
-              )}
+            {mode === "off" && (
+              <Banner status="info" title="Export is off" description="No trace events are being produced." />
+            )}
 
-              {mode === "by_rule" && (
-                <VStack gap={3}>
+            {mode === "by_rule" && (
+              <VStack gap={3}>
+                <Text type="supporting" color="secondary">
+                  Rules are evaluated in order; the first match wins. Traffic matching nothing is not exported.
+                </Text>
+
+                {rules.length === 0 ? (
                   <Text type="supporting" color="secondary">
-                    Rules are evaluated in order; the first match wins. Traffic matching nothing is not exported.
+                    No rules yet — nothing is being exported.
                   </Text>
-
-                  {rules.length === 0 ? (
-                    <Text type="supporting" color="secondary">
-                      No rules yet — nothing is being exported.
-                    </Text>
-                  ) : (
-                    <VStack gap={2}>
-                      {rules.map((r, i) => (
-                        <VStack key={r.id} gap={2}>
-                          <HStack gap={2} vAlign="center" wrap="wrap">
-                            <Badge variant="neutral" label={`${i + 1}`} />
-                            <Badge variant="blue" label={r.scope_type} />
-                            <Text type="supporting" maxLines={1}>
-                              {scopeLabel(r)}
+                ) : (
+                  <VStack gap={2}>
+                    {rules.map((r, i) => (
+                      <VStack key={r.id} gap={2}>
+                        <HStack gap={2} vAlign="center" wrap="wrap">
+                          <Badge variant="neutral" label={`${i + 1}`} />
+                          <Badge variant="blue" label={r.scope_type} />
+                          <Text type="supporting" maxLines={1}>
+                            {scopeLabel(r)}
+                          </Text>
+                          <Badge
+                            variant={r.capture === "content" ? "purple" : "neutral"}
+                            label={r.capture}
+                          />
+                          <span className="tnum">
+                            <Text type="supporting" color="secondary">
+                              {r.sample}% · ~{int(rpmFor(r.id))} rpm
                             </Text>
-                            <Badge
-                              variant={r.capture === "content" ? "purple" : "neutral"}
-                              label={r.capture}
-                            />
-                            <span className="tnum">
-                              <Text type="supporting" color="secondary">
-                                {r.sample}% · ~{int(rpmFor(r.id))} rpm
-                              </Text>
-                            </span>
-                            <Switch
-                              label={`${r.enabled ? "Disable" : "Enable"} rule ${i + 1}`}
-                              isLabelHidden
-                              value={r.enabled}
-                              changeAction={() => patchRule(r.id, { enabled: !r.enabled })}
-                            />
-                            <Button
-                              label="↑"
-                              variant="ghost"
-                              size="sm"
-                              isDisabled={i === 0}
-                              onClick={() => move(r.id, -1)}
-                            />
-                            <Button
-                              label="↓"
-                              variant="ghost"
-                              size="sm"
-                              isDisabled={i === rules.length - 1}
-                              onClick={() => move(r.id, 1)}
-                            />
-                            <IconButton
-                              label={`Remove rule ${i + 1}`}
-                              variant="ghost"
-                              size="sm"
-                              icon={<Icon icon={IconTrash} size="sm" />}
-                              onClick={() => removeRule(r.id)}
-                            />
-                          </HStack>
-                          {i < rules.length - 1 && <Divider />}
-                        </VStack>
-                      ))}
-                    </VStack>
-                  )}
+                          </span>
+                          <Switch
+                            label={`${r.enabled ? "Disable" : "Enable"} rule ${i + 1}`}
+                            isLabelHidden
+                            value={r.enabled}
+                            changeAction={() => patchRule(r.id, { enabled: !r.enabled })}
+                          />
+                          <Button
+                            label="↑"
+                            variant="ghost"
+                            size="sm"
+                            isDisabled={i === 0}
+                            onClick={() => move(r.id, -1)}
+                          />
+                          <Button
+                            label="↓"
+                            variant="ghost"
+                            size="sm"
+                            isDisabled={i === rules.length - 1}
+                            onClick={() => move(r.id, 1)}
+                          />
+                          <IconButton
+                            label={`Remove rule ${i + 1}`}
+                            variant="ghost"
+                            size="sm"
+                            icon={<Icon icon={IconTrash} size="sm" />}
+                            onClick={() => removeRule(r.id)}
+                          />
+                        </HStack>
+                        {i < rules.length - 1 && <Divider />}
+                      </VStack>
+                    ))}
+                  </VStack>
+                )}
 
-                  <Divider />
-                  <span className="eyebrow">Add rule</span>
-                  <Grid columns={{ minWidth: 160, repeat: "fit" }} gap={3}>
-                    <Selector
-                      label="Applies to"
-                      value={scopeType}
-                      onChange={(v) => {
-                        setScopeType(v as RuleScope);
-                        setScopeValue("");
-                      }}
-                      options={SCOPES}
-                    />
-                    {scopeType === "tag" ? (
-                      <TextInput label="Tag" value={scopeValue} onChange={setScopeValue} placeholder="prod" />
-                    ) : (
-                      <Selector
-                        label="Target"
-                        value={scopeValue}
-                        onChange={setScopeValue}
-                        placeholder="Select…"
-                        hasSearch={scopeOptions.length > 8}
-                        options={scopeOptions}
-                      />
-                    )}
-                    <Selector
-                      label="Capture"
-                      value={draftCapture}
-                      onChange={(v) => setDraftCapture(v as Capture)}
-                      options={[
-                        { value: "meta", label: "Metadata only" },
-                        { value: "content", label: "Full content" },
-                      ]}
-                    />
-                  </Grid>
-
-                  <Slider
-                    label={`Sample rate — ${draftSample}%`}
-                    value={draftSample}
-                    onChange={setDraftSample}
-                    min={1}
-                    max={100}
-                    step={1}
+                <Divider />
+                <span className="eyebrow">Add rule</span>
+                <Grid columns={{ minWidth: 160, repeat: "fit" }} gap={3}>
+                  <Selector
+                    label="Applies to"
+                    value={scopeType}
+                    onChange={(v) => {
+                      setScopeType(v as RuleScope);
+                      setScopeValue("");
+                    }}
+                    options={SCOPES}
                   />
-
-                  {preview.data?.preview && (
-                    <Text type="supporting" color="secondary">
-                      This rule currently matches ~{int(preview.data.preview.matching_rpm)} requests/min.
-                    </Text>
+                  {scopeType === "tag" ? (
+                    <TextInput label="Tag" value={scopeValue} onChange={setScopeValue} placeholder="prod" />
+                  ) : (
+                    <Selector
+                      label="Target"
+                      value={scopeValue}
+                      onChange={setScopeValue}
+                      placeholder="Select…"
+                      hasSearch={scopeOptions.length > 8}
+                      options={scopeOptions}
+                    />
                   )}
+                  <Selector
+                    label="Capture"
+                    value={draftCapture}
+                    onChange={(v) => setDraftCapture(v as Capture)}
+                    options={[
+                      { value: "meta", label: "Metadata only" },
+                      { value: "content", label: "Full content" },
+                    ]}
+                  />
+                </Grid>
 
-                  <HStack hAlign="end">
+                <Slider
+                  label={`Sample rate — ${draftSample}%`}
+                  value={draftSample}
+                  onChange={setDraftSample}
+                  min={1}
+                  max={100}
+                  step={1}
+                />
+
+                {preview.data?.preview && (
+                  <Text type="supporting" color="secondary">
+                    This rule currently matches ~{int(preview.data.preview.matching_rpm)} requests/min.
+                  </Text>
+                )}
+
+                <HStack hAlign="end">
+                  <Button
+                    label="Add rule"
+                    variant="secondary"
+                    icon={<Icon icon={IconPlus} size="sm" />}
+                    onClick={addRule}
+                    isDisabled={!scopeValue.trim()}
+                  />
+                </HStack>
+              </VStack>
+            )}
+
+            {/* Pending changes: what will change, and how much traffic it touches. */}
+            {changes.length > 0 && (
+              <>
+                <Divider />
+                <VStack gap={3}>
+                  <Banner
+                    status="warning"
+                    title={`${changes.length} unsaved change${changes.length > 1 ? "s" : ""}`}
+                    description={
+                      mode === "off"
+                        ? "Nothing will be exported once applied."
+                        : affected < 1
+                          ? `No traffic in the last minute to size this against. ${
+                              mode === "everything"
+                                ? captureContent
+                                  ? "All requests will be exported, including prompt content."
+                                  : "All requests will be exported, metadata only."
+                                : "Only traffic matching a rule will be exported."
+                            }`
+                          : `Once applied, ~${int(affected)} requests/min will be exported${
+                              mode === "everything" && captureContent ? ", including prompt content" : ""
+                            }.`
+                    }
+                  />
+                  <VStack gap={1}>
+                    {changes.map((c) => (
+                      <Text key={c} type="supporting" color="secondary">
+                        · {c}
+                      </Text>
+                    ))}
+                  </VStack>
+                  <HStack gap={2} hAlign="end">
+                    <Button label="Discard" variant="ghost" onClick={discardPolicy} />
                     <Button
-                      label="Add rule"
-                      variant="secondary"
-                      icon={<Icon icon={IconPlus} size="sm" />}
-                      onClick={addRule}
-                      isDisabled={!scopeValue.trim()}
+                      label="Apply policy"
+                      variant="primary"
+                      isLoading={save.isPending}
+                      onClick={savePolicy}
                     />
                   </HStack>
                 </VStack>
-              )}
-
-              {/* Pending changes: what will change, and how much traffic it touches. */}
-              {changes.length > 0 && (
-                <>
-                  <Divider />
-                  <VStack gap={3}>
-                    <Banner
-                      status="warning"
-                      title={`${changes.length} unsaved change${changes.length > 1 ? "s" : ""}`}
-                      description={
-                        mode === "off"
-                          ? "Nothing will be exported once applied."
-                          : affected < 1
-                            ? `No traffic in the last minute to size this against. ${
-                                mode === "everything"
-                                  ? captureContent
-                                    ? "All requests will be exported, including prompt content."
-                                    : "All requests will be exported, metadata only."
-                                  : "Only traffic matching a rule will be exported."
-                              }`
-                            : `Once applied, ~${int(affected)} requests/min will be exported${
-                                mode === "everything" && captureContent ? ", including prompt content" : ""
-                              }.`
-                      }
-                    />
-                    <VStack gap={1}>
-                      {changes.map((c) => (
-                        <Text key={c} type="supporting" color="secondary">
-                          · {c}
-                        </Text>
-                      ))}
-                    </VStack>
-                    <HStack gap={2} hAlign="end">
-                      <Button label="Discard" variant="ghost" onClick={discardPolicy} />
-                      <Button
-                        label="Apply policy"
-                        variant="primary"
-                        isLoading={save.isPending}
-                        onClick={savePolicy}
-                      />
-                    </HStack>
-                  </VStack>
-                </>
-              )}
-            </VStack>
-          </Card>
-        </Grid>
+              </>
+            )}
+          </VStack>
+        </Card>
 
         {/* Live export feed */}
         <Card padding={0}>
@@ -591,7 +864,7 @@ export default function Observability() {
             ) : (exported.data?.length ?? 0) === 0 ? (
               <Empty
                 title="Nothing exported yet"
-                description="Once traffic matches your capture policy, events appear here."
+                description="Events appear here once traffic the capture policy lets out is exported to a destination."
               />
             ) : (
               <Table

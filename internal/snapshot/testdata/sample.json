@@ -1,0 +1,513 @@
+{
+ "algorithm": "bucket = FNV-1a 64-bit over the UTF-8 bytes of rule_id + \":\" + request_id, modulo 100; sampled = sample >= 100 || (sample > 0 && bucket < sample)",
+ "fnv1a64": {
+  "offset_basis": "0xcbf29ce484222325",
+  "prime": "0x100000001b3"
+ },
+ "cases": [
+  {
+   "rule_id": "r1",
+   "request_id": "req_00000000000000000000000001",
+   "sample": 0,
+   "bucket": 72,
+   "sampled": false
+  },
+  {
+   "rule_id": "r1",
+   "request_id": "req_00000000000000000000000001",
+   "sample": 1,
+   "bucket": 72,
+   "sampled": false
+  },
+  {
+   "rule_id": "r1",
+   "request_id": "req_00000000000000000000000001",
+   "sample": 25,
+   "bucket": 72,
+   "sampled": false
+  },
+  {
+   "rule_id": "r1",
+   "request_id": "req_00000000000000000000000001",
+   "sample": 50,
+   "bucket": 72,
+   "sampled": false
+  },
+  {
+   "rule_id": "r1",
+   "request_id": "req_00000000000000000000000001",
+   "sample": 99,
+   "bucket": 72,
+   "sampled": true
+  },
+  {
+   "rule_id": "r1",
+   "request_id": "req_00000000000000000000000001",
+   "sample": 100,
+   "bucket": 72,
+   "sampled": true
+  },
+  {
+   "rule_id": "r1",
+   "request_id": "req_00000000000000000000000002",
+   "sample": 0,
+   "bucket": 5,
+   "sampled": false
+  },
+  {
+   "rule_id": "r1",
+   "request_id": "req_00000000000000000000000002",
+   "sample": 1,
+   "bucket": 5,
+   "sampled": false
+  },
+  {
+   "rule_id": "r1",
+   "request_id": "req_00000000000000000000000002",
+   "sample": 25,
+   "bucket": 5,
+   "sampled": true
+  },
+  {
+   "rule_id": "r1",
+   "request_id": "req_00000000000000000000000002",
+   "sample": 50,
+   "bucket": 5,
+   "sampled": true
+  },
+  {
+   "rule_id": "r1",
+   "request_id": "req_00000000000000000000000002",
+   "sample": 99,
+   "bucket": 5,
+   "sampled": true
+  },
+  {
+   "rule_id": "r1",
+   "request_id": "req_00000000000000000000000002",
+   "sample": 100,
+   "bucket": 5,
+   "sampled": true
+  },
+  {
+   "rule_id": "rule-a",
+   "request_id": "req_0f3a9c",
+   "sample": 0,
+   "bucket": 94,
+   "sampled": false
+  },
+  {
+   "rule_id": "rule-a",
+   "request_id": "req_0f3a9c",
+   "sample": 1,
+   "bucket": 94,
+   "sampled": false
+  },
+  {
+   "rule_id": "rule-a",
+   "request_id": "req_0f3a9c",
+   "sample": 25,
+   "bucket": 94,
+   "sampled": false
+  },
+  {
+   "rule_id": "rule-a",
+   "request_id": "req_0f3a9c",
+   "sample": 50,
+   "bucket": 94,
+   "sampled": false
+  },
+  {
+   "rule_id": "rule-a",
+   "request_id": "req_0f3a9c",
+   "sample": 99,
+   "bucket": 94,
+   "sampled": true
+  },
+  {
+   "rule_id": "rule-a",
+   "request_id": "req_0f3a9c",
+   "sample": 100,
+   "bucket": 94,
+   "sampled": true
+  },
+  {
+   "rule_id": "6b0f2c1e-3c51-4c8e-9a4f-2d7e1b9c0a11",
+   "request_id": "req_9d2b7c1e4a5f6b3c8d0e1f2a3b4c5d6e",
+   "sample": 0,
+   "bucket": 45,
+   "sampled": false
+  },
+  {
+   "rule_id": "6b0f2c1e-3c51-4c8e-9a4f-2d7e1b9c0a11",
+   "request_id": "req_9d2b7c1e4a5f6b3c8d0e1f2a3b4c5d6e",
+   "sample": 1,
+   "bucket": 45,
+   "sampled": false
+  },
+  {
+   "rule_id": "6b0f2c1e-3c51-4c8e-9a4f-2d7e1b9c0a11",
+   "request_id": "req_9d2b7c1e4a5f6b3c8d0e1f2a3b4c5d6e",
+   "sample": 25,
+   "bucket": 45,
+   "sampled": false
+  },
+  {
+   "rule_id": "6b0f2c1e-3c51-4c8e-9a4f-2d7e1b9c0a11",
+   "request_id": "req_9d2b7c1e4a5f6b3c8d0e1f2a3b4c5d6e",
+   "sample": 50,
+   "bucket": 45,
+   "sampled": true
+  },
+  {
+   "rule_id": "6b0f2c1e-3c51-4c8e-9a4f-2d7e1b9c0a11",
+   "request_id": "req_9d2b7c1e4a5f6b3c8d0e1f2a3b4c5d6e",
+   "sample": 99,
+   "bucket": 45,
+   "sampled": true
+  },
+  {
+   "rule_id": "6b0f2c1e-3c51-4c8e-9a4f-2d7e1b9c0a11",
+   "request_id": "req_9d2b7c1e4a5f6b3c8d0e1f2a3b4c5d6e",
+   "sample": 100,
+   "bucket": 45,
+   "sampled": true
+  },
+  {
+   "rule_id": "",
+   "request_id": "req_x",
+   "sample": 0,
+   "bucket": 80,
+   "sampled": false
+  },
+  {
+   "rule_id": "",
+   "request_id": "req_x",
+   "sample": 1,
+   "bucket": 80,
+   "sampled": false
+  },
+  {
+   "rule_id": "",
+   "request_id": "req_x",
+   "sample": 25,
+   "bucket": 80,
+   "sampled": false
+  },
+  {
+   "rule_id": "",
+   "request_id": "req_x",
+   "sample": 50,
+   "bucket": 80,
+   "sampled": false
+  },
+  {
+   "rule_id": "",
+   "request_id": "req_x",
+   "sample": 99,
+   "bucket": 80,
+   "sampled": true
+  },
+  {
+   "rule_id": "",
+   "request_id": "req_x",
+   "sample": 100,
+   "bucket": 80,
+   "sampled": true
+  },
+  {
+   "rule_id": "r1",
+   "request_id": "",
+   "sample": 0,
+   "bucket": 30,
+   "sampled": false
+  },
+  {
+   "rule_id": "r1",
+   "request_id": "",
+   "sample": 1,
+   "bucket": 30,
+   "sampled": false
+  },
+  {
+   "rule_id": "r1",
+   "request_id": "",
+   "sample": 25,
+   "bucket": 30,
+   "sampled": false
+  },
+  {
+   "rule_id": "r1",
+   "request_id": "",
+   "sample": 50,
+   "bucket": 30,
+   "sampled": true
+  },
+  {
+   "rule_id": "r1",
+   "request_id": "",
+   "sample": 99,
+   "bucket": 30,
+   "sampled": true
+  },
+  {
+   "rule_id": "r1",
+   "request_id": "",
+   "sample": 100,
+   "bucket": 30,
+   "sampled": true
+  },
+  {
+   "rule_id": "tëam-ünicode",
+   "request_id": "req_ü",
+   "sample": 0,
+   "bucket": 79,
+   "sampled": false
+  },
+  {
+   "rule_id": "tëam-ünicode",
+   "request_id": "req_ü",
+   "sample": 1,
+   "bucket": 79,
+   "sampled": false
+  },
+  {
+   "rule_id": "tëam-ünicode",
+   "request_id": "req_ü",
+   "sample": 25,
+   "bucket": 79,
+   "sampled": false
+  },
+  {
+   "rule_id": "tëam-ünicode",
+   "request_id": "req_ü",
+   "sample": 50,
+   "bucket": 79,
+   "sampled": false
+  },
+  {
+   "rule_id": "tëam-ünicode",
+   "request_id": "req_ü",
+   "sample": 99,
+   "bucket": 79,
+   "sampled": true
+  },
+  {
+   "rule_id": "tëam-ünicode",
+   "request_id": "req_ü",
+   "sample": 100,
+   "bucket": 79,
+   "sampled": true
+  },
+  {
+   "rule_id": "r2",
+   "request_id": "req_abcdef",
+   "sample": 0,
+   "bucket": 71,
+   "sampled": false
+  },
+  {
+   "rule_id": "r2",
+   "request_id": "req_abcdef",
+   "sample": 1,
+   "bucket": 71,
+   "sampled": false
+  },
+  {
+   "rule_id": "r2",
+   "request_id": "req_abcdef",
+   "sample": 25,
+   "bucket": 71,
+   "sampled": false
+  },
+  {
+   "rule_id": "r2",
+   "request_id": "req_abcdef",
+   "sample": 50,
+   "bucket": 71,
+   "sampled": false
+  },
+  {
+   "rule_id": "r2",
+   "request_id": "req_abcdef",
+   "sample": 99,
+   "bucket": 71,
+   "sampled": true
+  },
+  {
+   "rule_id": "r2",
+   "request_id": "req_abcdef",
+   "sample": 100,
+   "bucket": 71,
+   "sampled": true
+  },
+  {
+   "rule_id": "r2",
+   "request_id": "req_abcdeg",
+   "sample": 0,
+   "bucket": 60,
+   "sampled": false
+  },
+  {
+   "rule_id": "r2",
+   "request_id": "req_abcdeg",
+   "sample": 1,
+   "bucket": 60,
+   "sampled": false
+  },
+  {
+   "rule_id": "r2",
+   "request_id": "req_abcdeg",
+   "sample": 25,
+   "bucket": 60,
+   "sampled": false
+  },
+  {
+   "rule_id": "r2",
+   "request_id": "req_abcdeg",
+   "sample": 50,
+   "bucket": 60,
+   "sampled": false
+  },
+  {
+   "rule_id": "r2",
+   "request_id": "req_abcdeg",
+   "sample": 99,
+   "bucket": 60,
+   "sampled": true
+  },
+  {
+   "rule_id": "r2",
+   "request_id": "req_abcdeg",
+   "sample": 100,
+   "bucket": 60,
+   "sampled": true
+  },
+  {
+   "rule_id": "r3",
+   "request_id": "req_1",
+   "sample": 0,
+   "bucket": 80,
+   "sampled": false
+  },
+  {
+   "rule_id": "r3",
+   "request_id": "req_1",
+   "sample": 1,
+   "bucket": 80,
+   "sampled": false
+  },
+  {
+   "rule_id": "r3",
+   "request_id": "req_1",
+   "sample": 25,
+   "bucket": 80,
+   "sampled": false
+  },
+  {
+   "rule_id": "r3",
+   "request_id": "req_1",
+   "sample": 50,
+   "bucket": 80,
+   "sampled": false
+  },
+  {
+   "rule_id": "r3",
+   "request_id": "req_1",
+   "sample": 99,
+   "bucket": 80,
+   "sampled": true
+  },
+  {
+   "rule_id": "r3",
+   "request_id": "req_1",
+   "sample": 100,
+   "bucket": 80,
+   "sampled": true
+  },
+  {
+   "rule_id": "r3",
+   "request_id": "req_2",
+   "sample": 0,
+   "bucket": 13,
+   "sampled": false
+  },
+  {
+   "rule_id": "r3",
+   "request_id": "req_2",
+   "sample": 1,
+   "bucket": 13,
+   "sampled": false
+  },
+  {
+   "rule_id": "r3",
+   "request_id": "req_2",
+   "sample": 25,
+   "bucket": 13,
+   "sampled": true
+  },
+  {
+   "rule_id": "r3",
+   "request_id": "req_2",
+   "sample": 50,
+   "bucket": 13,
+   "sampled": true
+  },
+  {
+   "rule_id": "r3",
+   "request_id": "req_2",
+   "sample": 99,
+   "bucket": 13,
+   "sampled": true
+  },
+  {
+   "rule_id": "r3",
+   "request_id": "req_2",
+   "sample": 100,
+   "bucket": 13,
+   "sampled": true
+  },
+  {
+   "rule_id": "r3",
+   "request_id": "req_3",
+   "sample": 0,
+   "bucket": 2,
+   "sampled": false
+  },
+  {
+   "rule_id": "r3",
+   "request_id": "req_3",
+   "sample": 1,
+   "bucket": 2,
+   "sampled": false
+  },
+  {
+   "rule_id": "r3",
+   "request_id": "req_3",
+   "sample": 25,
+   "bucket": 2,
+   "sampled": true
+  },
+  {
+   "rule_id": "r3",
+   "request_id": "req_3",
+   "sample": 50,
+   "bucket": 2,
+   "sampled": true
+  },
+  {
+   "rule_id": "r3",
+   "request_id": "req_3",
+   "sample": 99,
+   "bucket": 2,
+   "sampled": true
+  },
+  {
+   "rule_id": "r3",
+   "request_id": "req_3",
+   "sample": 100,
+   "bucket": 2,
+   "sampled": true
+  }
+ ]
+}

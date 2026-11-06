@@ -243,36 +243,97 @@ export interface TelemetryRule {
   enabled: boolean;
 }
 
-// Delivery outcome from the in-process exporter. Distinct from the live feed,
-// which lists events *selected* for export: a rejected key still fills the feed.
-export interface TelemetryHealth {
-  delivered: number;
-  dropped: number;
-  last_ok_at?: string;
-  last_error?: string;
-  last_error_at?: string;
+// Capture policy (GET/PUT /api/settings/telemetry). It decides what may be
+// exported at all; each destination then filters by its own scope and
+// content mode.
+export interface TelemetryPolicy {
+  mode: TelemetryMode | ""; // "" == everything
+  capture_content: boolean;
+  rules: TelemetryRule[];
 }
 
-export interface TelemetrySettings {
-  configured: boolean;
-  health?: TelemetryHealth;
-  /** Langfuse trace URL prefix; append a request_id. Absent when export is off. */
-  trace_base_url?: string;
-  telemetry?: {
-    type: "langfuse";
-    host: string;
-    public_key: string;
-    secret_key: string;
-    enabled: boolean;
-    capture_content: boolean;
-    mode: TelemetryMode | ""; // "" == everything
-    rules: TelemetryRule[];
-    // legacy scope fields — removed on the backend, kept optional so the old
-    // Telemetry.tsx card keeps compiling until the Observability page lands.
-    scope?: "all" | "tags" | "teams";
-    scope_tags?: string[];
-    scope_team_ids?: string[];
-  };
+// ── Telemetry destinations (/api/telemetry/*) ───────────────────
+export interface TelemetryKind {
+  name: string;
+  label: string;
+  beta: boolean;
+  /** Write-only fields of the kind; values never come back. */
+  secret_fields: string[];
+}
+
+export type ScopeMode = "all" | "selected" | "except";
+export interface DestinationScope {
+  mode: ScopeMode;
+  values: string[];
+}
+export type ContentMode = "metadata_only" | "content";
+export type DestinationStatus = "healthy" | "failing" | "no_data" | "disabled";
+
+export interface DestinationHealth {
+  status: DestinationStatus;
+  queued: number;
+  queued_bytes: number;
+  delivered: number;
+  dropped: { overflow: number; rejected: number; expired: number };
+  last_success_at: string | null;
+  last_error: string;
+  last_error_at: string | null;
+}
+
+export interface TelemetryDestination {
+  id: string;
+  name: string;
+  kind: string;
+  enabled: boolean;
+  endpoint: string;
+  traces_url: string;
+  config: Record<string, string>;
+  /** Which of the kind's secret fields are stored. */
+  secret_names: string[];
+  /** Names of the extra request headers; values are write-only. */
+  headers: string[];
+  content_mode: ContentMode;
+  max_content_bytes: number;
+  team_scope: DestinationScope;
+  group_scope: DestinationScope;
+  created_at: string;
+  updated_at: string;
+  health: DestinationHealth;
+  /** Why the destination can't run, e.g. undecryptable secrets. */
+  error?: string;
+  /** Trace link template containing {trace_id}; "" when there is none. */
+  trace_url: string;
+}
+
+/** Body of create, replace and test. */
+export interface DestinationInput {
+  /** Test only: the saved destination whose secrets fill in the draft. */
+  id?: string;
+  name: string;
+  kind: string;
+  enabled: boolean;
+  endpoint: string;
+  traces_url: string;
+  config: Record<string, string>;
+  /** Blank or missing keeps the stored value. */
+  secrets?: Record<string, string>;
+  /**
+   * The complete set: a stored header left out is deleted, one listed
+   * without a value keeps its stored value. Omitted keeps them all.
+   */
+  headers?: { name: string; value?: string }[];
+  content_mode: ContentMode;
+  max_content_bytes: number;
+  team_scope: DestinationScope;
+  group_scope: DestinationScope;
+}
+
+export interface DestinationTestResult {
+  ok: boolean;
+  /** HTTP status of a failed export. */
+  status?: number;
+  detail: string;
+  trace_url?: string;
 }
 
 // ── Live metrics (GET /api/metrics/live, admin) ──────────────────
@@ -359,6 +420,8 @@ export interface RequestRow {
   ttft_ms: number | null;
   /** List value when the request itself was free (subscription pass-through). */
   notional_cost_usd: number | null;
+  /** OTel trace id; null on rows from before 0.3.0. */
+  trace_id: string | null;
 }
 export interface RequestFilters {
   limit?: number;
@@ -389,10 +452,6 @@ export interface DeploymentReq {
 }
 
 // ── Observability ────────────────────────────────────────────────
-export interface ObservabilityTest {
-  ok: boolean;
-  detail: string;
-}
 export interface ExportedEvent {
   ts: string;
   key_name: string;
@@ -431,9 +490,18 @@ export interface Node {
   region?: string;
   version: string;
   version_skew: boolean;
+  /** Providers this gateway leaves out because it is older than 0.3. */
+  unserved_providers?: string[];
   uptime_s: number;
+  /** CPU use against the node's CPU allowance. */
   cpu_pct: number;
+  /** Memory in use against the limit; 0 without a limit. */
   mem_pct: number;
+  mem_bytes: number;
+  /** 0: no memory limit. */
+  mem_limit_bytes: number;
+  open_connections: number;
+  in_flight: number;
   rps: number;
   p50_ms: number;
   last_seen: string | null;
@@ -447,6 +515,28 @@ export interface ClusterEvent {
 export interface NodesResponse {
   nodes: Node[];
   cluster_events: ClusterEvent[];
+}
+
+// ── Gateway history (GET /api/nodes/history, admin) ──────────────
+/** The peak of each value over one step. */
+export interface NodeSample {
+  ts: number; // unix seconds, the start of the step
+  open_connections: number;
+  in_flight: number;
+  mem_bytes: number;
+  mem_limit_bytes: number;
+}
+export interface NodeHistory {
+  id: string;
+  name: string;
+  group: string;
+  /** Oldest first; steps without a sync are missing. */
+  samples: NodeSample[];
+}
+export interface NodesHistoryResponse {
+  step_s: number;
+  window_s: number;
+  gateways: NodeHistory[];
 }
 
 export interface UsageSummary {
@@ -478,6 +568,7 @@ export interface UsageByModel {
 export interface UsageRecent {
   ts: string;
   request_id: string;
+  trace_id: string | null;
   model_name: string;
   api_key_id: string | null;
   user_id: string | null;

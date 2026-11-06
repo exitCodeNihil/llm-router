@@ -15,6 +15,8 @@ import type {
   ChatSummary,
   Deployment,
   DeploymentReq,
+  DestinationInput,
+  DestinationTestResult,
   GatewayGroup,
   ExportedEvent,
   FlowEdgeRow,
@@ -22,7 +24,7 @@ import type {
   Me,
   Node,
   NodesResponse,
-  ObservabilityTest,
+  NodesHistoryResponse,
   Price,
   Provider,
   RequestFilters,
@@ -32,7 +34,9 @@ import type {
   SsoSettings,
   Team,
   TeamMember,
-  TelemetrySettings,
+  TelemetryDestination,
+  TelemetryKind,
+  TelemetryPolicy,
   TimeseriesPoint,
   TokenIssuer,
   UsageByModel,
@@ -60,8 +64,8 @@ export function useMe() {
 }
 
 // ── Generic mutation helper: run, then invalidate query keys ─────
-function useInvalidatingMutation<V>(
-  fn: (v: V) => Promise<unknown>,
+function useInvalidatingMutation<V, R = unknown>(
+  fn: (v: V) => Promise<R>,
   invalidate: QueryKey[],
 ) {
   const qc = useQueryClient();
@@ -447,27 +451,77 @@ export const useSetSso = () =>
     [["sso"]],
   );
 
-// ── Telemetry settings ──────────────────────────────────────────
+// ── Telemetry capture policy ────────────────────────────────────
 export function useTelemetry(enabled = true) {
   return useQuery({
     queryKey: ["telemetry"],
     enabled,
     queryFn: async () => {
-      const d = await api.get<TelemetrySettings>("/api/settings/telemetry");
-      // Legacy telemetry blobs predate the rules engine — default rules/mode so
-      // every consumer (Observability page, Keys trace badges) can iterate safely.
-      if (d.telemetry) {
-        d.telemetry.rules = d.telemetry.rules ?? [];
-        d.telemetry.mode = d.telemetry.mode || "everything";
-      }
+      const d = await api.get<TelemetryPolicy>("/api/settings/telemetry");
+      d.rules = d.rules ?? [];
+      d.mode = d.mode || "everything";
       return d;
     },
   });
 }
 export const useSetTelemetry = () =>
   useInvalidatingMutation(
-    (b: Record<string, unknown>) => api.put("/api/settings/telemetry", b),
+    (b: TelemetryPolicy) => api.put("/api/settings/telemetry", b),
     [["telemetry"]],
+  );
+
+// ── Telemetry destinations ──────────────────────────────────────
+export function useTelemetryKinds() {
+  return useQuery({
+    queryKey: ["telemetry-kinds"],
+    queryFn: () => api.get<TelemetryKind[]>("/api/telemetry/kinds"),
+    staleTime: 5 * 60_000,
+  });
+}
+export function useDestinations(enabled = true) {
+  return useQuery({
+    queryKey: ["telemetry-destinations"],
+    enabled,
+    queryFn: async () =>
+      (await api.get<TelemetryDestination[]>("/api/telemetry/destinations")).map((d) => ({
+        ...d,
+        config: d.config ?? {},
+        secret_names: d.secret_names ?? [],
+        headers: d.headers ?? [],
+        team_scope: { mode: d.team_scope?.mode || "all", values: d.team_scope?.values ?? [] },
+        group_scope: { mode: d.group_scope?.mode || "all", values: d.group_scope?.values ?? [] },
+      })),
+    // Health moves as exports succeed or fail.
+    refetchInterval: 10_000,
+  });
+}
+export const useCreateDestination = () =>
+  useInvalidatingMutation(
+    (b: DestinationInput) => api.post<{ id: string }>("/api/telemetry/destinations", b),
+    [["telemetry-destinations"]],
+  );
+export const useUpdateDestination = () =>
+  useInvalidatingMutation(
+    ({ id, ...b }: DestinationInput & { id: string }) => api.put(`/api/telemetry/destinations/${id}`, b),
+    [["telemetry-destinations"]],
+  );
+export const useToggleDestination = () =>
+  useInvalidatingMutation(
+    ({ id, enabled }: { id: string; enabled: boolean }) =>
+      api.patch(`/api/telemetry/destinations/${id}`, { enabled }),
+    [["telemetry-destinations"]],
+  );
+export const useDeleteDestination = () =>
+  useInvalidatingMutation(
+    (id: string) => api.del(`/api/telemetry/destinations/${id}`),
+    [["telemetry-destinations"]],
+  );
+// Always HTTP 200 for an export outcome; check `ok`.
+export const useTestDestination = () =>
+  useInvalidatingMutation(
+    (b: Partial<DestinationInput> & { id?: string }) =>
+      api.post<DestinationTestResult>("/api/telemetry/destinations/test", b),
+    [["telemetry-destinations"]],
   );
 
 // ── Token issuers (cloud token auth) ────────────────────────────
@@ -780,6 +834,10 @@ export function useNodes() {
           uptime_s: num(n.uptime_s),
           cpu_pct: num(n.cpu_pct),
           mem_pct: num(n.mem_pct),
+          mem_bytes: num(n.mem_bytes),
+          mem_limit_bytes: num(n.mem_limit_bytes),
+          open_connections: num(n.open_connections),
+          in_flight: num(n.in_flight),
           rps: num(n.rps),
           p50_ms: num(n.p50_ms),
         })) as Node[],
@@ -789,6 +847,22 @@ export function useNodes() {
     refetchInterval: 10_000,
   });
 }
+// Each gateway's last hour, one sample per step (control-plane memory).
+export function useNodesHistory() {
+  return useQuery({
+    queryKey: ["nodes-history"],
+    queryFn: async () => {
+      const r = await api.get<NodesHistoryResponse>("/api/nodes/history");
+      return {
+        step_s: num(r.step_s) || 10,
+        window_s: num(r.window_s) || 3600,
+        gateways: r.gateways ?? [],
+      } satisfies NodesHistoryResponse;
+    },
+    refetchInterval: 10_000,
+  });
+}
+
 // cluster_events ride the /api/nodes response — no separate hook. Read
 // `useNodes().data?.cluster_events`.
 
@@ -835,14 +909,6 @@ export function useObservabilityRuleStats(preview?: {
       } satisfies RuleStats;
     },
     refetchInterval: 5_000,
-  });
-}
-
-// ── Observability: test connection (always HTTP 200; check `ok`) ──
-export function useTestObservability() {
-  return useMutation({
-    mutationFn: (b: Record<string, unknown>) =>
-      api.post<ObservabilityTest>("/api/observability/test", b),
   });
 }
 

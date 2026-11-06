@@ -185,7 +185,8 @@ impl Sse {
     }
 
     fn finish_usage(&mut self) {
-        if let Some(e) = self.emit.take() {
+        if let Some(mut e) = self.emit.take() {
+            e.set_output(self.transform.take_output());
             e.send(200, "", self.transform.usage(), self.ttft_ms);
         }
     }

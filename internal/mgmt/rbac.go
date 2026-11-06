@@ -68,8 +68,17 @@ func (m *Server) resolveCaller(r *http.Request) *Caller {
 // requireAuth admits any authenticated caller; requireAdmin only global admins.
 func (m *Server) requireAuth(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A bearer token here can only be the admin token: guesses are
+		// limited like passwords.
+		bearer := strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if bearer && m.TokenGuard != nil && m.TokenGuard.AdminTokenBlocked(w, r) {
+			return
+		}
 		c := m.resolveCaller(r)
 		if c == nil {
+			if bearer && m.TokenGuard != nil {
+				m.TokenGuard.AdminTokenFailed(r)
+			}
 			httpError(w, http.StatusUnauthorized, "authentication required")
 			return
 		}

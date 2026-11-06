@@ -19,11 +19,11 @@ import Providers from "./pages/Providers";
 import Models from "./pages/Models";
 import ModelsAvailable from "./pages/ModelsAvailable";
 import Pricing from "./pages/Pricing";
-import Gateways from "./pages/Gateways";
 import Settings from "./pages/Settings";
-// Both pull in the chart bundle too.
+// These pull in the chart bundle too.
 const Analytics = lazy(() => import("./pages/Analytics"));
 const Requests = lazy(() => import("./pages/Requests"));
+const Gateways = lazy(() => import("./pages/Gateways"));
 import Account from "./pages/Account";
 import Chat from "./pages/chat";
 import Workspaces from "./pages/Workspaces";

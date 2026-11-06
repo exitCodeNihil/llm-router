@@ -1,0 +1,30 @@
+name: E2E
+
+# Exports spans to a real Grafana LGTM (Tempo) and a real Langfuse v4 and reads
+# them back. Nightly and on demand: the stack takes a few minutes to start.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  telemetry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Start Grafana LGTM and Langfuse v4
+        working-directory: deploy
+        run: |
+          docker compose -f docker-compose.dev.yml --profile otel --profile langfuse up -d \
+            otel-lgtm langfuse langfuse-worker
+          for i in $(seq 1 90); do
+            curl -sf localhost:3001/api/public/health >/dev/null && curl -sf localhost:3200/ready >/dev/null && break
+            sleep 5
+          done
+      - run: go test -tags e2e -count=1 -v ./internal/telemetry/e2e
+      - if: failure()
+        working-directory: deploy
+        run: docker compose -f docker-compose.dev.yml --profile otel --profile langfuse logs --tail 200 otel-lgtm langfuse langfuse-worker

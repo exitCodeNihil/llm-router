@@ -1,3 +1,6 @@
+{{- if and (gt (int .Values.replicas) 1) (not .Values.allowMultipleReplicas) }}
+{{- fail "replicas > 1 splits rate limits, budgets, live metrics and telemetry queues across processes, so each replica enforces only part of them. Scale traffic with gateway groups (gateway.replicas) instead, or set allowMultipleReplicas=true to accept that." }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -12,6 +15,12 @@ spec:
   template:
     metadata:
       labels: *labels
+      {{- if and .Values.metrics.podAnnotations (not .Values.metrics.podMonitor.enabled) }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.metrics.port | default 8080 | quote }}
+        prometheus.io/path: /metrics
+      {{- end }}
     spec:
       {{- $ws := .Values.workspaces.enabled }}
       serviceAccountName: {{ include "llm-router.serviceAccountName" . }}
@@ -20,7 +29,12 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
-            - containerPort: 8080
+            - name: http
+              containerPort: 8080
+            {{- if .Values.metrics.port }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+            {{- end }}
             {{- if $ws }}
             - name: ide
               containerPort: 8081
@@ -42,6 +56,14 @@ spec:
             - name: LLMR_COOKIE_DOMAIN
               value: {{ . | quote }}
             {{- end }}
+            {{- end }}
+            {{- if .Values.metrics.port }}
+            - name: LLMR_METRICS_LISTEN
+              value: ":{{ .Values.metrics.port }}"
+            {{- end }}
+            {{- with .Values.trustedProxies }}
+            - name: LLMR_TRUSTED_PROXIES
+              value: {{ join "," . | quote }}
             {{- end }}
             {{- if .Values.anthropicIdentity.enabled }}
             {{- include "llm-router.anthropicIdentityEnv" . | nindent 12 }}

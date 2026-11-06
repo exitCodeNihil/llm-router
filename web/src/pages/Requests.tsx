@@ -19,12 +19,14 @@ import { Timestamp } from "@astryxdesign/core/Timestamp";
 import { Center } from "@astryxdesign/core/Center";
 import { Toolbar } from "@astryxdesign/core/Toolbar";
 
-import type { RequestFilters, RequestRow } from "../lib/types";
+import { DropdownMenu } from "@astryxdesign/core/DropdownMenu";
+
+import type { RequestFilters, RequestRow, TelemetryDestination } from "../lib/types";
 import {
   useMe,
   useKeys,
   useRequests,
-  useTelemetry,
+  useDestinations,
   useUsageByModel,
 } from "../lib/hooks";
 import { compact, int, money } from "../lib/format";
@@ -32,6 +34,21 @@ import { Empty, ErrorState, Loading, Page } from "../components/Page";
 import { TagsInput } from "../components/forms";
 
 type StatusOpt = "all" | "ok" | "err";
+
+/**
+ * Trace links for a row, one per enabled destination that has a link
+ * template. Rows from before 0.3.0 have no trace id; the old Langfuse
+ * exporter used the request id as the trace id, so only a Langfuse
+ * destination can still link those.
+ */
+function traceLinks(dests: TelemetryDestination[], r: RequestRow) {
+  const out: { name: string; url: string }[] = [];
+  for (const d of dests) {
+    const id = r.trace_id ?? (d.kind === "langfuse" ? r.request_id : null);
+    if (id) out.push({ name: d.name, url: d.trace_url.replaceAll("{trace_id}", encodeURIComponent(id)) });
+  }
+  return out;
+}
 
 export default function Requests() {
   // Seeded from the query string so "view matching requests" on the analytics
@@ -76,8 +93,11 @@ export default function Requests() {
   };
 
   const req = useRequests(filters);
-  const tel = useTelemetry(!!me?.is_admin);
-  const traceBase = tel.data?.trace_base_url;
+  const destinations = useDestinations(!!me?.is_admin);
+  const linked = useMemo(
+    () => (destinations.data ?? []).filter((d) => d.enabled && d.trace_url),
+    [destinations.data],
+  );
   const models = useUsageByModel(7);
   const keys = useKeys();
 
@@ -167,24 +187,45 @@ export default function Requests() {
           money(r.cost_usd, { precise: true })
         ),
     },
-    ...(traceBase
+    ...(linked.length > 0
       ? [
           {
             key: "trace",
             header: "Trace",
             width: pixel(64),
             align: "end" as const,
-            renderCell: (r: RequestRow) => (
-              <a
-                href={traceBase + r.request_id}
-                target="_blank"
-                rel="noreferrer"
-                className="link"
-                title={`Open ${r.request_id} in Langfuse`}
-              >
-                <Text type="supporting">open</Text>
-              </a>
-            ),
+            renderCell: (r: RequestRow) => {
+              const links = traceLinks(linked, r);
+              if (links.length === 0)
+                return (
+                  <Text type="supporting" color="secondary">
+                    —
+                  </Text>
+                );
+              if (links.length === 1)
+                return (
+                  <a
+                    href={links[0].url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="link"
+                    title={`Open the trace in ${links[0].name}`}
+                  >
+                    <Text type="supporting">open</Text>
+                  </a>
+                );
+              return (
+                <DropdownMenu
+                  button={{ label: "open", variant: "ghost", size: "sm" }}
+                  hasChevron={false}
+                  menuWidth={200}
+                  items={links.map((l) => ({
+                    label: l.name,
+                    onClick: () => window.open(l.url, "_blank", "noreferrer"),
+                  }))}
+                />
+              );
+            },
           },
         ]
       : []),

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Card } from "@astryxdesign/core/Card";
 import { VisuallyHidden } from "@astryxdesign/core/VisuallyHidden";
 import { HStack, VStack } from "@astryxdesign/core/Stack";
@@ -9,8 +9,10 @@ import { Icon } from "@astryxdesign/core/Icon";
 import { Badge } from "@astryxdesign/core/Badge";
 import { Code } from "@astryxdesign/core/Code";
 import { StatusDot } from "@astryxdesign/core/StatusDot";
+import { Tooltip } from "@astryxdesign/core/Tooltip";
 import { ProgressBar } from "@astryxdesign/core/ProgressBar";
 import { Divider } from "@astryxdesign/core/Divider";
+import { Grid } from "@astryxdesign/core/Grid";
 import { Table, pixel, proportional } from "@astryxdesign/core/Table";
 import type { TableColumn } from "@astryxdesign/core/Table";
 import { TextInput } from "@astryxdesign/core/TextInput";
@@ -20,18 +22,20 @@ import { CodeBlock } from "@astryxdesign/core/CodeBlock";
 import { Timestamp } from "@astryxdesign/core/Timestamp";
 import { useToast } from "@astryxdesign/core/Toast";
 
-import type { DataRule, GatewayGroup, Node } from "../lib/types";
+import type { DataRule, GatewayGroup, Node, NodesHistoryResponse } from "../lib/types";
 import {
   useCreateGatewayGroup,
   useDeleteGatewayGroup,
   useGatewayGroups,
   useNodes,
+  useNodesHistory,
   useRotateGatewayToken,
   useTeams,
   useUpdateGatewayGroup,
 } from "../lib/hooks";
-import { int } from "../lib/format";
+import { bytes, int } from "../lib/format";
 import { Empty, ErrorState, Loading, Page } from "../components/Page";
+import { ChartCard, SERIES_COLORS, SeriesLines, chart } from "../components/charts";
 import { Confirm, FormActions, FormDialog, SecretDialog } from "../components/dialogs";
 import { IconEdit, IconKey, IconPlus, IconTrash } from "../components/icons";
 
@@ -43,6 +47,20 @@ function uptime(seconds: number): string {
   if (d) return `${d}d ${h}h`;
   if (h) return `${h}h ${m}m`;
   return `${m}m`;
+}
+
+// A gateway older than 0.3 isn't sent Vertex or Entra providers, so their
+// models fail there until it is upgraded.
+function UnservedBadge({ node }: { node: Node }) {
+  const names = node.unserved_providers ?? [];
+  const text = `${node.name} is older than 0.3 and can't serve ${names.join(", ")}. Requests for their models fail on it until it is upgraded.`;
+  return (
+    <Tooltip content={text}>
+      <span tabIndex={0} role="group" aria-label={text} style={{ display: "inline-flex" }}>
+        <Badge variant="warning" label={`skips ${names.length} provider${names.length === 1 ? "" : "s"}`} />
+      </span>
+    </Tooltip>
+  );
 }
 
 // ── Live cluster (self + peers) ─────────────────────────────────
@@ -70,6 +88,7 @@ function ClusterTable() {
               {n.role === "gateway" && <Badge variant="neutral" label={n.region ? `${n.group} · ${n.region}` : (n.group ?? "gateway")} />}
             </HStack>
             {n.addr && <Code>{n.addr}</Code>}
+            {!!n.unserved_providers?.length && <UnservedBadge node={n} />}
           </VStack>
         </HStack>
       ),
@@ -77,7 +96,7 @@ function ClusterTable() {
     {
       key: "version",
       header: "Version",
-      width: pixel(130),
+      width: pixel(110),
       renderCell: (n) => (
         <HStack gap={1.5} vAlign="center">
           <Text type="supporting">{n.version || "—"}</Text>
@@ -85,34 +104,55 @@ function ClusterTable() {
         </HStack>
       ),
     },
-    { key: "rps", header: "RPS", width: pixel(80), align: "end", renderCell: (n) => int(n.rps) },
+    { key: "rps", header: "RPS", width: pixel(60), align: "end", renderCell: (n) => int(n.rps) },
     {
       key: "p50_ms",
       header: "p50",
+      width: pixel(80),
+      align: "end",
+      renderCell: (n) => (n.p50_ms ? `${int(n.p50_ms)} ms` : "—"),
+    },
+    {
+      key: "open_connections",
+      header: "Connections",
       width: pixel(100),
       align: "end",
-      renderCell: (n) => `${int(n.p50_ms)} ms`,
+      renderCell: (n) => int(n.open_connections),
     },
+    { key: "in_flight", header: "In flight", width: pixel(80), align: "end", renderCell: (n) => int(n.in_flight) },
     {
       key: "cpu_pct",
       header: "CPU",
-      width: pixel(110),
+      width: pixel(90),
       renderCell: (n) => (
         <ProgressBar value={n.cpu_pct} max={100} label={`CPU ${Math.round(n.cpu_pct)}%`} isLabelHidden />
       ),
     },
     {
-      key: "mem_pct",
+      key: "mem_bytes",
       header: "Memory",
-      width: pixel(110),
-      renderCell: (n) => (
-        <ProgressBar value={n.mem_pct} max={100} label={`Memory ${Math.round(n.mem_pct)}%`} isLabelHidden />
-      ),
+      width: pixel(150),
+      renderCell: (n) =>
+        n.mem_limit_bytes > 0 ? (
+          <VStack gap={1}>
+            <Text type="supporting" maxLines={1}>
+              {bytes(n.mem_bytes)} / {bytes(n.mem_limit_bytes)}
+            </Text>
+            <ProgressBar
+              value={n.mem_pct}
+              max={100}
+              label={`Memory ${Math.round(n.mem_pct)}% of the limit`}
+              isLabelHidden
+            />
+          </VStack>
+        ) : (
+          <Text type="supporting">{n.mem_bytes ? bytes(n.mem_bytes) : "—"}</Text>
+        ),
     },
     {
       key: "uptime_s",
       header: "Uptime",
-      width: pixel(96),
+      width: pixel(80),
       align: "end",
       renderCell: (n) => uptime(n.uptime_s),
     },
@@ -150,6 +190,117 @@ function ClusterTable() {
   );
 }
 
+// ── Each gateway's last hour ────────────────────────────────────
+const ALL = "";
+
+function clock(ts: number): string {
+  return new Date(ts * 1000).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+/** One row per step over the window, a column per gateway and value; null where a gateway did not sync. */
+function historyRows(h: NodesHistoryResponse, ids: string[]) {
+  const step = h.step_s;
+  const end = Math.floor(Date.now() / 1000 / step) * step;
+  const bySample = ids.map((id) => {
+    const g = h.gateways.find((x) => x.id === id);
+    return new Map((g?.samples ?? []).map((s) => [s.ts, s]));
+  });
+  const rows: Array<Record<string, unknown>> = [];
+  for (let ts = end - h.window_s + step; ts <= end; ts += step) {
+    const row: Record<string, unknown> = { label: clock(ts) };
+    bySample.forEach((m, i) => {
+      const s = m.get(ts);
+      row[`c${i}`] = s ? s.open_connections : null;
+      row[`f${i}`] = s ? s.in_flight : null;
+      row[`m${i}`] = s ? s.mem_bytes : null;
+      row[`l${i}`] = s && s.mem_limit_bytes > 0 ? s.mem_limit_bytes : null;
+    });
+    rows.push(row);
+  }
+  return rows;
+}
+
+function GatewayHistory() {
+  const history = useNodesHistory();
+  const [picked, setSelected] = useState(ALL);
+  const gateways = history.data?.gateways ?? [];
+  // A gateway that was scaled in drops out of the history: fall back to all.
+  const selected = gateways.some((g) => g.id === picked) ? picked : ALL;
+  const shown = selected === ALL ? gateways : gateways.filter((g) => g.id === selected);
+  const ids = shown.map((g) => g.id);
+  const key = ids.join(",");
+  const rows = useMemo(
+    () => (history.data ? historyRows(history.data, key ? key.split(",") : []) : []),
+    [history.data, key],
+  );
+  const one = shown.length === 1;
+  // By place among all gateways sorted by id, so neighbours get distinct hues
+  // and a gateway keeps its colour while the set stays the same, whichever
+  // one is picked. A lone gateway takes the accent.
+  const byId = gateways.map((g) => g.id).sort();
+  const color = (id: string) =>
+    gateways.length === 1 ? chart.accent : SERIES_COLORS[byId.indexOf(id) % SERIES_COLORS.length];
+  const series = (prefix: string) =>
+    shown.map((g, i) => ({
+      key: `${prefix}${i}`,
+      name: one ? g.name : `${g.group} / ${g.name}`,
+      color: color(g.id),
+    }));
+  const memory = one
+    ? [...series("m"), { key: "l0", name: "Limit", color: chart.crit, isDashed: true }]
+    : series("m");
+
+  if (history.isLoading) return <Loading />;
+  if (history.error) return <ErrorState error={history.error} onRetry={() => history.refetch()} />;
+
+  return (
+    <VStack gap={3}>
+      <HStack hAlign="between" vAlign="end" gap={3} wrap="wrap">
+        <VStack gap={0.5}>
+          <Heading level={4}>Last hour</Heading>
+          <Text type="supporting" color="secondary">
+            The peak of every 10 seconds, as each gateway reports it when it syncs. Kept in this control plane's memory.
+          </Text>
+        </VStack>
+        {gateways.length > 1 && (
+          <div style={{ minWidth: 240 }}>
+            <Selector
+              label="Gateway"
+              value={selected}
+              onChange={setSelected}
+              options={[
+                { value: ALL, label: "All gateways" },
+                ...gateways.map((g) => ({ value: g.id, label: `${g.group} / ${g.name}` })),
+              ]}
+              hasSearch={gateways.length > 8}
+            />
+          </div>
+        )}
+      </HStack>
+      {gateways.length === 0 ? (
+        <Card>
+          <Empty
+            title="No gateway history yet"
+            description="Gateways that sync with this control plane appear here within seconds."
+          />
+        </Card>
+      ) : (
+        <Grid columns={{ minWidth: 320, repeat: "fit" }} gap={4}>
+          <ChartCard title="Open connections" height={200}>
+            <SeriesLines data={rows} xKey="label" series={series("c")} formatValue={int} />
+          </ChartCard>
+          <ChartCard title="In flight" height={200}>
+            <SeriesLines data={rows} xKey="label" series={series("f")} formatValue={int} />
+          </ChartCard>
+          <ChartCard title="Memory" height={200}>
+            <SeriesLines data={rows} xKey="label" series={memory} formatValue={bytes} />
+          </ChartCard>
+        </Grid>
+      )}
+    </VStack>
+  );
+}
+
 function ClusterEvents() {
   const nodes = useNodes();
   const events = nodes.data?.cluster_events ?? [];
@@ -184,7 +335,7 @@ function ClusterEvents() {
 
 // ── Gateway groups ──────────────────────────────────────────────
 const DATA_RULES: { value: DataRule; label: string }[] = [
-  { value: "inherit", label: "Follow the telemetry settings" },
+  { value: "inherit", label: "Follow the capture policy" },
   { value: "no_content", label: "Never capture prompts or responses" },
   { value: "no_export", label: "Never export" },
 ];
@@ -338,7 +489,7 @@ function GatewayGroups({ onNew }: { onNew: () => void }) {
       renderCell: (g) =>
         g.data_rule === "inherit" ? (
           <Text type="supporting" color="secondary">
-            Settings
+            Capture policy
           </Text>
         ) : (
           <Badge variant="warning" label={g.data_rule === "no_export" ? "never exported" : "no content"} />
@@ -456,6 +607,7 @@ export default function Gateways() {
     >
       <VStack gap={4}>
         <ClusterTable />
+        <GatewayHistory />
         <GatewayGroups onNew={newGroup} />
         <ClusterEvents />
       </VStack>

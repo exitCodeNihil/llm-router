@@ -63,3 +63,22 @@ func TestLiveRollingWindow(t *testing.T) {
 		t.Error("node rps must expire after window")
 	}
 }
+
+// Each autoscaled pod is a new gateway id: the ones that stopped serving are
+// forgotten rather than kept for the life of the process.
+func TestLiveForgetsGoneGateways(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	l := NewLive()
+	l.now = func() time.Time { return now }
+	l.Write(usage.Event{GatewayID: "old", LatencyMS: 5})
+	now = now.Add(31 * time.Minute)
+	l.Write(usage.Event{GatewayID: "new", LatencyMS: 5})
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.nodes["old"] != nil || l.nodeLat["old"] != nil {
+		t.Error("a gateway silent for 31 minutes must be forgotten")
+	}
+	if l.nodes["new"] == nil {
+		t.Error("a serving gateway must stay")
+	}
+}

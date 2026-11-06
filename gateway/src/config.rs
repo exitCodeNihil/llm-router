@@ -15,7 +15,7 @@ use crate::health::{self, Health};
 use crate::limits::{self, Scope};
 
 /// The wire schema this gateway speaks (gwsync.schemaVersion).
-pub const SCHEMA: i64 = 1;
+pub const SCHEMA: i64 = 2;
 
 // ---- wire ---------------------------------------------------------------------------------
 
@@ -36,6 +36,32 @@ pub struct Wire {
     pub deployments: Vec<WireDeployment>,
     #[serde(default)]
     pub prices: HashMap<String, Price>,
+    /// Identity-token issuers (schema 2).
+    #[serde(default)]
+    pub issuers: Vec<Issuer>,
+    /// Hex SHA-256 of a lowercased email → user id (schema 2).
+    #[serde(default)]
+    pub emails: HashMap<String, String>,
+    /// The capture policy and this group's content scopes (schema 2).
+    #[serde(default)]
+    pub telemetry: Option<crate::telemetry::WireTelemetry>,
+}
+
+/// An identity-token issuer (gwsync.Issuer).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Issuer {
+    pub url: String,
+    pub audience: String,
+    #[serde(default)]
+    pub email_claim: String,
+    #[serde(default, rename = "match")]
+    pub match_claims: HashMap<String, String>,
+    #[serde(default)]
+    pub map_to_team: String,
+    /// Whether a caller with no user may be created; only set when the group
+    /// serves the team new users join.
+    #[serde(default)]
+    pub auto_create: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -62,6 +88,8 @@ pub struct WireKey {
     pub tpm_limit: Option<i64>,
     #[serde(default)]
     pub expires_at: i64,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +102,10 @@ pub struct WireUser {
     pub budget_usd: Option<f64>,
     pub rpm_limit: Option<i64>,
     pub tpm_limit: Option<i64>,
+    #[serde(default)]
+    pub team_ids: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,6 +115,8 @@ pub struct WireTeam {
     pub budget_usd: Option<f64>,
     pub rpm_limit: Option<i64>,
     pub tpm_limit: Option<i64>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +188,8 @@ pub struct Team {
     pub id: String,
     pub allowed_models: Policy,
     pub scope: Option<Arc<Scope>>,
+    /// For the telemetry policy's tag rules, as are a user's and a key's.
+    pub tags: Vec<String>,
 }
 
 pub struct User {
@@ -163,6 +199,8 @@ pub struct User {
     /// The member's share of a team's budget, by team id.
     pub memberships: HashMap<String, Arc<Scope>>,
     pub scope: Option<Arc<Scope>>,
+    pub team_ids: Vec<String>,
+    pub tags: Vec<String>,
 }
 
 pub struct Key {
@@ -174,6 +212,7 @@ pub struct Key {
     pub allowed_models: Policy,
     pub expires_at: i64,
     pub scope: Option<Arc<Scope>>,
+    pub tags: Vec<String>,
 }
 
 impl Key {
@@ -232,7 +271,12 @@ pub enum AuthMode {
     OAuthPassthrough,
     /// Exchanges this gateway's identity token for short-lived Anthropic tokens.
     AnthropicWif,
-    /// Needs a cloud token the gateway can't mint yet (Entra, GCP).
+    /// An Entra ID token for this gateway's own Azure identity.
+    Entra,
+    /// A Google token: the provider's service account key, or this gateway's
+    /// application default credentials.
+    Gcp,
+    /// An auth mode this gateway doesn't know.
     Unsupported,
 }
 
@@ -245,7 +289,11 @@ pub struct Provider {
     pub api_version: String,
     /// The credential header, built once: (name, value).
     pub auth_header: Option<(http::HeaderName, HeaderValue)>,
-    pub wif: Option<Arc<crate::wif::Wif>>,
+    /// A short-lived Authorization header, fetched per request (AnthropicWif, Entra, Gcp).
+    pub token: Option<Arc<dyn crate::cloud::token::Bearer>>,
+    /// Vertex only.
+    pub project: String,
+    pub location: String,
 }
 
 pub struct Deployment {
@@ -301,6 +349,12 @@ pub struct Config {
     /// Exact names in order, for /v1/models.
     pub names: Vec<String>,
     pub prices: HashMap<String, Price>,
+    pub teams: HashMap<String, Arc<Team>>,
+    pub issuers: Vec<Issuer>,
+    /// SHA-256 of a lowercased email → the user, for identity-token callers.
+    pub emails: HashMap<[u8; 32], Arc<User>>,
+    pub telemetry: crate::telemetry::Policy,
+    pub data_rule: crate::telemetry::DataRule,
 }
 
 /// What a requested model name resolves to.
@@ -321,7 +375,10 @@ impl Config {
             .into_iter()
             .map(|t| {
                 let scope = limits::scope(format!("team:{}", t.id), t.budget_usd, t.rpm_limit, t.tpm_limit);
-                (t.id.clone(), Arc::new(Team { id: t.id, allowed_models: policy(t.allowed_models), scope }))
+                (
+                    t.id.clone(),
+                    Arc::new(Team { id: t.id, allowed_models: policy(t.allowed_models), scope, tags: t.tags }),
+                )
             })
             .collect();
         let users: HashMap<String, Arc<User>> = w
@@ -343,10 +400,13 @@ impl Config {
                     team_models: policy(u.team_models),
                     memberships,
                     scope,
+                    team_ids: u.team_ids,
+                    tags: u.tags,
                 };
                 (u.id, Arc::new(user))
             })
             .collect();
+        let emails = w.emails.iter().filter_map(|(hash, id)| Some((unhex32(hash)?, users.get(id)?.clone()))).collect();
         let mut keys = HashMap::with_capacity(w.keys.len());
         for k in w.keys {
             let Some(hash) = unhex32(&k.hash) else { continue };
@@ -364,6 +424,7 @@ impl Config {
                 allowed_models: policy(k.allowed_models),
                 expires_at: k.expires_at,
                 scope,
+                tags: k.tags,
             };
             keys.insert(hash, Arc::new(key));
         }
@@ -411,7 +472,20 @@ impl Config {
         }
         patterns.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         names.sort();
-        Ok(Config { version: w.version, group: w.group, keys, models, patterns, names, prices: w.prices })
+        Ok(Config {
+            version: w.version,
+            data_rule: crate::telemetry::DataRule::parse(&w.group.data_rule),
+            telemetry: crate::telemetry::Policy::from_wire(w.telemetry),
+            group: w.group,
+            keys,
+            models,
+            patterns,
+            names,
+            prices: w.prices,
+            teams,
+            issuers: w.issuers,
+            emails,
+        })
     }
 
     /// Resolve a requested model (snapshot.Resolve): an exact name wins, else
@@ -472,6 +546,8 @@ fn provider(p: WireProvider) -> Provider {
         "api_key" => AuthMode::ApiKey,
         "oauth_passthrough" => AuthMode::OAuthPassthrough,
         "anthropic_wif" if p.wif.is_some() => AuthMode::AnthropicWif,
+        "entra" => AuthMode::Entra,
+        "gcp_adc" | "gcp_sa" => AuthMode::Gcp,
         _ => AuthMode::Unsupported,
     };
     let auth_header = match auth_mode {
@@ -488,8 +564,25 @@ fn provider(p: WireProvider) -> Provider {
         "anthropic" if p.base_url.is_empty() => "https://api.anthropic.com".to_string(),
         _ => p.base_url.trim_end_matches('/').to_string(),
     };
-    let wif = p.wif.filter(|_| auth_mode == AuthMode::AnthropicWif).map(|w| crate::wif::state(&base_url, w));
-    Provider { id: p.id, name: p.name, kind, base_url, auth_mode, api_version: p.api_version, auth_header, wif }
+    let token: Option<Arc<dyn crate::cloud::token::Bearer>> = match p.auth_mode.as_str() {
+        "anthropic_wif" => p.wif.map(|w| crate::wif::state(&base_url, w) as _),
+        "entra" => Some(crate::cloud::entra::shared()),
+        "gcp_adc" => Some(crate::cloud::gcp::adc()),
+        "gcp_sa" => Some(crate::cloud::gcp::service_account(&p.name, &p.api_key)),
+        _ => None,
+    };
+    Provider {
+        id: p.id,
+        name: p.name,
+        kind,
+        base_url,
+        auth_mode,
+        api_version: p.api_version,
+        auth_header,
+        token,
+        project: p.project,
+        location: p.location,
+    }
 }
 
 fn unhex32(s: &str) -> Option<[u8; 32]> {

@@ -27,6 +27,8 @@ import (
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
 	"github.com/exitcodenihil/llm-router/internal/store"
 	"github.com/exitcodenihil/llm-router/internal/telemetry"
+	"github.com/exitcodenihil/llm-router/internal/telemetry/langfuse"
+	"github.com/exitcodenihil/llm-router/internal/telemetry/otlp"
 	"github.com/exitcodenihil/llm-router/internal/usage"
 	"github.com/exitcodenihil/llm-router/internal/workspace"
 )
@@ -99,6 +101,13 @@ func run() error {
 		}
 	}
 
+	// Before the first snapshot, so a pre-0.3.0 Langfuse config is already
+	// a destination when exporting starts.
+	if err := telemetry.MigrateLegacy(ctx, st.Pool, cfg.EncryptionKey); err != nil {
+		return err
+	}
+	telemetry.Register(otlp.Kind{}, langfuse.Kind{})
+
 	builder := &snapshot.Builder{Pool: st.Pool, EncryptionKey: cfg.EncryptionKey}
 	first, err := builder.Build(ctx)
 	if err != nil {
@@ -113,26 +122,31 @@ func run() error {
 	}
 	go writer.Run(ctx)
 	recorder := telemetry.NewRecorder()
-	lf := telemetry.NewLangfuse(func() snapshot.Telemetry {
-		if s := holder.Get(); s != nil {
-			return s.Telemetry
-		}
-		return snapshot.Telemetry{}
-	})
-	lf.Recorder = recorder
-	go lf.Run(ctx)
+	exporter := telemetry.NewManager(holder, st.Pool)
+	exporter.Recorder = recorder
+	// Stopped only once the HTTP server has drained, so the events of the
+	// last requests are in the queues it flushes.
+	exportCtx, stopExport := context.WithCancel(context.Background())
+	defer stopExport()
+	exportDone := make(chan struct{})
+	go func() {
+		exporter.Run(exportCtx)
+		close(exportDone)
+	}()
 	live := metrics.NewLive()
 	nodeStore := metrics.NewNodeStore()
+	httpm := metrics.NewHTTP()
+	promReg := newMetrics(httpm, nodeStore, writer, exporter)
 	events := &metrics.Events{}
 	go watchConfigEpoch(ctx, holder, events)
-	gw.Usage = usage.MultiWriter{writer, lf, live}
+	gw.Usage = usage.MultiWriter{writer, exporter, live}
 	gw.CloudAuth = auth.NewCloudValidator(st.Pool).Validate
 
 	if cfg.AdminToken == "" {
 		slog.Warn("LLMR_ADMIN_TOKEN is not set; bootstrap admin login is disabled")
 	}
 	mg := &mgmt.Server{Store: st, AdminToken: cfg.AdminToken, EncryptionKey: cfg.EncryptionKey,
-		Snapshots: holder, Live: live, NodeStore: nodeStore, Events: events, Recorder: recorder, Exporter: lf,
+		Snapshots: holder, Live: live, NodeStore: nodeStore, HTTP: httpm, Events: events, Recorder: recorder, Telemetry: exporter,
 		Gateway: gw, Version: version, Started: time.Now(), IDEOrigin: cfg.IDEOrigin}
 	mg.Register(mux)
 	go mg.SyncWorkspaceModels(ctx)
@@ -153,12 +167,18 @@ func run() error {
 	} else {
 		slog.Warn("LLMR_IDE_ORIGIN is not set: workspace IDEs share the console origin; set LLMR_IDE_LISTEN/LLMR_IDE_ORIGIN in production")
 	}
-	(&console.Auth{Store: st, EncryptionKey: cfg.EncryptionKey, CookieDomain: cfg.CookieDomain}).Register(mux)
-	(&gwsync.Server{Store: st, Snapshots: holder, Limits: lim, Export: usage.MultiWriter{lf, live}, Nodes: nodeStore,
-		Key: auth.DeriveKey("llmr-gw-session", cfg.EncryptionKey)}).Register(mux)
+	consoleAuth := &console.Auth{Store: st, EncryptionKey: cfg.EncryptionKey, CookieDomain: cfg.CookieDomain,
+		TrustedProxies: cfg.TrustedProxies}
+	consoleAuth.Register(mux)
+	mg.TokenGuard = consoleAuth
+	gwSync := &gwsync.Server{Store: st, Snapshots: holder, Limits: lim, Export: usage.MultiWriter{exporter, live}, Nodes: nodeStore,
+		Key: auth.DeriveKey("llmr-gw-session", cfg.EncryptionKey)}
+	gwSync.Register(mux)
+	mg.GatewaySync = gwSync
 	mux.Handle("/", console.SPA())
 
 	gw.Register(mux)
+	serveMetrics(ctx, cfg.MetricsListen, mux, promReg)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
@@ -166,19 +186,29 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           gateway.Logging(mgmt.CSRFGuard(mux)),
+		Handler:           gateway.Logging(httpm.Middleware(mgmt.CSRFGuard(mux))),
 		ReadHeaderTimeout: 10 * time.Second,
+		ConnState:         httpm.ConnState,
 	}
+	drained := make(chan struct{})
 	go func() {
 		<-ctx.Done()
 		shCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		srv.Shutdown(shCtx)
+		close(drained)
 	}()
 
 	slog.Info("llm-router listening", "addr", cfg.Listen)
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		return err
+	}
+	<-drained
+	stopExport()
+	select {
+	case <-exportDone:
+	case <-time.After(7 * time.Second):
+		slog.Warn("telemetry export did not finish flushing before exit")
 	}
 	return nil
 }

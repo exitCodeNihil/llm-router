@@ -1,0 +1,139 @@
+{{- $m := .Values.metrics }}
+{{- if $m.podMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ .Release.Name }}-llm-router
+  labels:
+    app.kubernetes.io/name: llm-router
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    {{- with $m.podMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: llm-router
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  podMetricsEndpoints:
+    - port: {{ if $m.port }}metrics{{ else }}http{{ end }}
+      path: /metrics
+      interval: {{ $m.podMonitor.interval }}
+{{- if .Values.gateway.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ .Release.Name }}-llm-router-gateway
+  labels:
+    app.kubernetes.io/name: llm-router-gateway
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    {{- with $m.podMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: llm-router-gateway
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: {{ $m.podMonitor.interval }}
+{{- end }}
+{{- end }}
+{{- if $m.prometheusRule.enabled }}
+{{- $r := $m.prometheusRule }}
+{{- $sel := $r.selector | default (printf "namespace=%q" .Release.Namespace) }}
+{{- if $m.podMonitor.enabled }}
+---
+{{- end }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ .Release.Name }}-llm-router
+  labels:
+    app.kubernetes.io/name: llm-router
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    {{- with $r.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: llm-router
+      rules:
+        - alert: LLMRouterControlPlaneDown
+          expr: absent(llmr_build_info{runtime="control_plane",{{ $sel }}})
+          for: 5m
+          labels: {severity: critical}
+          annotations:
+            summary: The llm-router control plane is down or not being scraped
+            description: No llm-router control plane has been scraped for 5 minutes. Gateways keep serving from their last config, but budgets and usage are not synced.
+        - alert: LLMRouterGatewayNotSyncing
+          expr: llmr_gateway_last_sync_age_seconds{ {{- $sel -}} } > {{ $r.notSyncingSeconds }}
+          for: 1m
+          labels: {severity: warning}
+          annotations:
+            summary: "Gateway {{ "{{ $labels.group }}/{{ $labels.gateway }}" }} has not synced for {{ "{{ $value | humanizeDuration }}" }}"
+            description: A gateway that stopped syncing stops getting config and budget updates, and its usage is not recorded. It went away without shutting down, or cannot reach the control plane.
+        - alert: LLMRouterGatewaySyncFailing
+          expr: rate(llmr_sync_failures_total{ {{- $sel -}} }[5m]) > 0
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: "{{ "{{ $labels.pod }}" }} fails to sync with the control plane"
+            description: The gateway's syncs with the control plane have been failing for 10 minutes; see its logs.
+        # From each gateway's own /metrics, so it fires while the control plane
+        # is down too. Needs a memory limit on the gateway.
+        - alert: LLMRouterGatewayMemoryHigh
+          expr: |
+            (llmr_memory_bytes{ {{- $sel -}} } / llmr_memory_limit_bytes{ {{- $sel -}} })
+              * on (instance) group_left llmr_build_info{runtime="gateway",{{ $sel }}} > {{ $r.gatewayMemoryRatio }}
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "Gateway {{ "{{ $labels.instance }}" }} uses {{ "{{ $value | humanizePercentage }}" }} of its memory limit"
+            description: Past saturation a gateway's memory grows with its open connections until it is killed. Add gateways or lower LLMR_MAX_IN_FLIGHT.
+        - alert: LLMRouterRequestsShed
+          expr: rate(llmr_shed_total{ {{- $sel -}} }[5m]) > 0
+          for: 2m
+          labels: {severity: warning}
+          annotations:
+            summary: "{{ "{{ $labels.pod }}" }} refuses requests: too many in flight"
+            description: The gateway answers 503 because more requests are in flight than LLMR_MAX_IN_FLIGHT. Add gateways.
+        - alert: LLMRouterHighErrorRate
+          expr: |
+            sum(rate(llmr_requests_total{code="5xx",route!~"api|gw_sync|other",{{ $sel }}}[5m]))
+              / sum(rate(llmr_requests_total{route!~"api|gw_sync|other",{{ $sel }}}[5m])) > {{ $r.errorRatio }}
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: "{{ "{{ $value | humanizePercentage }}" }} of /v1 requests fail with 5xx"
+            description: Upstreams are failing or unreachable; see the Requests page for which deployments.
+        - alert: LLMRouterGatewayNotReady
+          expr: llmr_ready{ {{- $sel -}} } == 0
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "Gateway {{ "{{ $labels.instance }}" }} has not been ready for 5 minutes"
+            description: It has no config or has not synced with the control plane since it started; see its logs.
+        - alert: LLMRouterUsageDropped
+          expr: increase(llmr_usage_dropped_total{ {{- $sel -}} }[10m]) > 0
+          labels: {severity: warning}
+          annotations:
+            summary: "{{ "{{ $labels.pod }}" }} dropped usage events"
+            description: The usage queue was full, so some requests are missing from usage, spend and budgets.
+        - alert: LLMRouterTelemetryDestinationFailing
+          expr: max by (destination) (llmr_telemetry_destination_failing{ {{- $sel -}} }) > 0
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: "Telemetry destination {{ "{{ $labels.destination }}" }} is failing"
+            description: Exports to this destination have been failing for 10 minutes; see Observability.
+        - alert: LLMRouterTelemetrySpansDropped
+          expr: sum by (destination, reason) (increase(llmr_telemetry_destination_dropped_total{ {{- $sel -}} }[10m])) > 0
+          labels: {severity: info}
+          annotations:
+            summary: "Telemetry destination {{ "{{ $labels.destination }}" }} dropped spans ({{ "{{ $labels.reason }}" }})"
+            description: "overflow: the queue was full; rejected: the destination refused them; expired: it was unreachable for 10 minutes."
+{{- end }}

@@ -168,12 +168,14 @@ def row(rid):
     return {"prompt": int(p), "completion": int(c), "cached": int(r), "write_5m": int(w5), "write_1h": int(w1), "cost": float(usd)}
 
 
-def langfuse(rid):
-    req = urllib.request.Request(f"{LF}/api/public/traces/{rid}", headers={"Authorization": "Basic " + LF_AUTH})
+def langfuse(trace_id):
+    # Langfuse v4 serves observations by trace id; its trace API is gone.
+    url = f"{LF}/api/public/v2/observations?fields=core,basic,model,usage&traceId={trace_id}"
+    req = urllib.request.Request(url, headers={"Authorization": "Basic " + LF_AUTH})
     for _ in range(8):
         try:
             with urllib.request.urlopen(req, timeout=20) as f:
-                gens = [o for o in json.loads(f.read()).get("observations", []) if o.get("type") == "GENERATION"]
+                gens = [o for o in json.loads(f.read()).get("data", []) if o.get("type") == "GENERATION"]
                 if gens:
                     return gens[0]
         except urllib.error.HTTPError:
@@ -195,12 +197,12 @@ def main():
                 sent.append(None)
                 continue
             u = messages_usage(text, stream) if path == "/v1/messages" else chat_usage(text, stream)
-            sent.append((gw, model, kind, headers.get("X-Request-Id"), truth(model, u)))
+            sent.append((gw, model, kind, headers.get("X-Request-Id"), headers.get("X-Llmr-Trace-Id"), truth(model, u)))
     time.sleep(12)  # usage writes and gateway syncs
     bad = sent.count(None)
     checked = 0
     for s in filter(None, sent):
-        gw, model, kind, rid, want = s
+        gw, model, kind, rid, trace_id, want = s
         have = row(rid)
         problems = []
         if have is None:
@@ -212,11 +214,11 @@ def main():
             if abs(have["cost"] - want["cost"]) > 1e-9:
                 problems.append(f"cost {have['cost']:.8f} != {want['cost']:.8f}")
             if LF:
-                g = langfuse(rid)
+                g = langfuse(trace_id)
                 if g is None:
                     problems.append("no Langfuse generation")
-                elif g.get("promptTokens") != have["prompt"] or g.get("completionTokens") != have["completion"] or abs((g.get("calculatedTotalCost") or 0) - have["cost"]) > 1e-9:
-                    problems.append(f"Langfuse {g.get('promptTokens')}/{g.get('completionTokens')}/{g.get('calculatedTotalCost')}")
+                elif g.get("inputUsage") != have["prompt"] or g.get("outputUsage") != have["completion"] or abs((g.get("totalCost") or 0) - have["cost"]) > 1e-9:
+                    problems.append(f"Langfuse {g.get('inputUsage')}/{g.get('outputUsage')}/{g.get('totalCost')}")
         checked += 1
         if problems:
             bad += 1
