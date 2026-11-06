@@ -29,6 +29,7 @@ type Record struct {
 	*Item
 	Content    bool // the destination gets the captured content
 	MaxContent int  // bytes of content, at most
+	queued     time.Time
 }
 
 // recordOverhead is roughly what a span without content weighs, encoded.

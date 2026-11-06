@@ -112,12 +112,28 @@ func TestDeliverHonoursRetryAfter(t *testing.T) {
 }
 
 func TestDeliverGivesUp(t *testing.T) {
-	retry := &ExportError{Retryable: true, Status: 500}
-	s := &fakeSink{got: make(chan []*Record, 10), errs: []error{retry, retry, retry, retry, retry, retry, retry}}
+	// The age limit binds, not a count of attempts: an outage of a few
+	// minutes is retried through.
+	retry := &ExportError{Retryable: true, Status: 503}
+	errs := make([]error, 30)
+	for i := range errs {
+		errs[i] = retry
+	}
+	s := &fakeSink{got: make(chan []*Record, 10), errs: errs}
 	w := testWorker(fastPolicy(), s)
 	w.deliver(context.Background(), []*Record{rec("a"), rec("b")})
-	if s.calls != 6 {
-		t.Fatalf("tried %d times, want 6", s.calls)
+	if s.calls != 31 || w.health().Delivered != 2 {
+		t.Fatalf("tried %d times, health %+v", s.calls, w.health())
+	}
+
+	// A record queued MaxAge ago gets one more try, then is given up.
+	s = &fakeSink{got: make(chan []*Record, 10), errs: []error{retry, retry}}
+	w = testWorker(fastPolicy(), s)
+	old := rec("old")
+	old.queued = time.Now().Add(-defaultPolicy.MaxAge)
+	w.deliver(context.Background(), []*Record{rec("new"), old})
+	if s.calls != 1 {
+		t.Fatalf("tried %d times, want 1", s.calls)
 	}
 	if h := w.health(); h.Dropped.Expired != 2 || h.Status != "failing" {
 		t.Fatalf("health %+v", h)

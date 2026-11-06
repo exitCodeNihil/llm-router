@@ -21,14 +21,14 @@ type policy struct {
 	Linger     time.Duration // longest a record waits for its batch to fill
 	BackoffMin time.Duration
 	BackoffMax time.Duration
-	// A batch is given up after MaxAttempts tries or MaxAge after the first.
-	MaxAttempts int
-	MaxAge      time.Duration
+	// A batch is retried until its oldest record has been queued MaxAge, so
+	// an outage of a few minutes loses nothing the queue can hold.
+	MaxAge time.Duration
 }
 
 var defaultPolicy = policy{
 	MaxItems: 20000, MaxBytes: 64 << 20, BatchSpans: 512, BatchBytes: 4 << 20, Linger: 2 * time.Second,
-	BackoffMin: time.Second, BackoffMax: 30 * time.Second, MaxAttempts: 6, MaxAge: 10 * time.Minute,
+	BackoffMin: time.Second, BackoffMax: 30 * time.Second, MaxAge: 10 * time.Minute,
 }
 
 // queue is a destination's backlog. Full, it drops its oldest records: fresh
@@ -45,6 +45,9 @@ func newQueue(p *policy) *queue { return &queue{notify: make(chan struct{}, 1), 
 
 // push adds r and returns how many old records it pushed out.
 func (q *queue) push(r *Record) int {
+	if r.queued.IsZero() {
+		r.queued = time.Now()
+	}
 	q.mu.Lock()
 	q.items = append(q.items, r)
 	q.bytes += int64(r.Size())
@@ -212,7 +215,12 @@ func (w *worker) final() {
 // deliver sends a batch, retrying what may succeed later, halving it when the
 // backend says it is too large, and dropping it when it can't succeed.
 func (w *worker) deliver(ctx context.Context, batch []*Record) {
-	first := time.Now()
+	oldest := time.Now()
+	for _, r := range batch {
+		if !r.queued.IsZero() && r.queued.Before(oldest) {
+			oldest = r.queued
+		}
+	}
 	for attempt := 1; ; attempt++ {
 		if batch = w.admit(batch); len(batch) == 0 {
 			return
@@ -247,7 +255,7 @@ func (w *worker) deliver(ctx context.Context, batch []*Record) {
 			return
 		}
 		wait := max(w.backoff(attempt), xe.RetryAfter)
-		if attempt >= w.p.MaxAttempts || time.Since(first)+wait > w.p.MaxAge {
+		if time.Since(oldest)+wait > w.p.MaxAge {
 			w.st.failed(err, &w.st.expired, len(batch))
 			slog.Warn("telemetry export gave up", "destination", w.dest.Load().Name, "spans", len(batch),
 				"attempts", attempt, "err", err)
@@ -308,13 +316,16 @@ func admitRecord(snap *snapshot.Snapshot, d *snapshot.Destination, r *Record) *R
 		}
 		content = content && rule == "inherit" && dec.CaptureContent
 	}
+	c := *r
 	switch {
 	case r.Content && !content:
-		return &Record{Item: r.Item.withoutContent()}
+		c.Item, c.Content, c.MaxContent = r.Item.withoutContent(), false, 0
 	case content && d.MaxContentBytes < r.MaxContent:
-		return &Record{Item: r.Item, Content: true, MaxContent: d.MaxContentBytes}
+		c.MaxContent = d.MaxContentBytes
+	default:
+		return r
 	}
-	return r
+	return &c
 }
 
 // backoff doubles from BackoffMin up to BackoffMax, with ±50% jitter so
