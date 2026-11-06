@@ -175,3 +175,31 @@ func TestNotionalUsesTheCatalogForWildcards(t *testing.T) {
 		t.Errorf("pass-through must stay unpriced: %v %v", cost, unpriced)
 	}
 }
+
+// Claude in Microsoft Foundry bills at Anthropic's own rates, and Vertex's
+// global endpoint lists the current models at the same rates, so every
+// current model has a row on each platform matching its anthropic/ row.
+func TestCurrentClaudeModelsArePricedOnEveryPlatform(t *testing.T) {
+	var catalog map[string]seedEntry
+	if err := json.Unmarshal(seedJSON, &catalog); err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range []string{"claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"} {
+		want, ok := catalog["anthropic/"+model]
+		if !ok {
+			t.Fatalf("anthropic/%s missing", model)
+		}
+		for _, platform := range []string{"azure/", "gcp/"} {
+			got, ok := catalog[platform+model]
+			if !ok {
+				t.Errorf("%s%s missing: deployments using it would be recorded as unpriced", platform, model)
+				continue
+			}
+			wj, _ := json.Marshal(want)
+			gj, _ := json.Marshal(got)
+			if string(wj) != string(gj) {
+				t.Errorf("%s%s = %s, anthropic/ %s", platform, model, gj, wj)
+			}
+		}
+	}
+}

@@ -1,4 +1,8 @@
 {
+  "azure/claude-fable-5-1": {"input_per_1m": 10.0, "output_per_1m": 50.0, "cached_input_per_1m": 0.25},
+  "azure/claude-opus-5-5": {"input_per_1m": 4.0, "output_per_1m": 20.0, "cached_input_per_1m": 0.2},
+  "azure/claude-sonnet-5-5": {"input_per_1m": 2.0, "output_per_1m": 10.0, "cached_input_per_1m": 0.1},
+  "azure/claude-haiku-5-5": {"input_per_1m": 0.1, "output_per_1m": 0.5, "cached_input_per_1m": 0.01, "long_prompt_tokens": 100000, "long_prompt_multiplier": 5.0},
   "azure/claude-opus-4-8": {"input_per_1m": 5.0, "output_per_1m": 25.0, "cached_input_per_1m": 0.5},
   "azure/claude-opus-4-7": {"input_per_1m": 5.0, "output_per_1m": 25.0, "cached_input_per_1m": 0.5},
   "azure/claude-opus-4-5": {"input_per_1m": 5.0, "output_per_1m": 25.0, "cached_input_per_1m": 0.5},
@@ -19,6 +23,9 @@
   "azure/text-embedding-3-small": {"input_per_1m": 0.02, "output_per_1m": 0.0},
   "azure/text-embedding-3-large": {"input_per_1m": 0.13, "output_per_1m": 0.0},
   "azure/text-embedding-ada-002": {"input_per_1m": 0.1, "output_per_1m": 0.0},
+  "gcp/claude-opus-5-5": {"input_per_1m": 4.0, "output_per_1m": 20.0, "cached_input_per_1m": 0.2},
+  "gcp/claude-sonnet-5-5": {"input_per_1m": 2.0, "output_per_1m": 10.0, "cached_input_per_1m": 0.1},
+  "gcp/claude-haiku-5-5": {"input_per_1m": 0.1, "output_per_1m": 0.5, "cached_input_per_1m": 0.01, "long_prompt_tokens": 100000, "long_prompt_multiplier": 5.0},
   "gcp/claude-fable-5-1": {"input_per_1m": 10.0, "output_per_1m": 50.0, "cached_input_per_1m": 0.25},
   "gcp/claude-fable-5": {"input_per_1m": 10.0, "output_per_1m": 50.0, "cached_input_per_1m": 1.0},
   "gcp/claude-opus-5": {"input_per_1m": 5.0, "output_per_1m": 25.0, "cached_input_per_1m": 0.5},
