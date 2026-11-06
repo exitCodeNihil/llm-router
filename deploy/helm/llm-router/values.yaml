@@ -3,7 +3,13 @@ image:
   tag: ""            # defaults to appVersion
   pullPolicy: IfNotPresent
 
+# The control plane keeps rate limits, budget counters, live metrics and
+# telemetry export queues in memory, so it runs as one replica. Scale request
+# traffic with gateways (gateway.replicas), which share those limits through
+# it. More than one replica is refused unless allowMultipleReplicas is set,
+# and then each replica enforces limits on its own traffic only.
 replicas: 1
+allowMultipleReplicas: false
 
 databaseUrl: ""      # postgres://user:pass@host:5432/db — or use existingSecret
 adminToken: ""

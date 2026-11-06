@@ -1,3 +1,6 @@
+{{- if and (gt (int .Values.replicas) 1) (not .Values.allowMultipleReplicas) }}
+{{- fail "replicas > 1 splits rate limits, budgets, live metrics and telemetry queues across processes, so each replica enforces only part of them. Scale traffic with gateway groups (gateway.replicas) instead, or set allowMultipleReplicas=true to accept that." }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
