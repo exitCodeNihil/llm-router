@@ -160,12 +160,13 @@ func TestNodeStoreSeriesAndStaleness(t *testing.T) {
 	if out := scrape(t, s); strings.Contains(out, "gw-9") || !strings.Contains(out, "gw-1") {
 		t.Errorf("a gateway that left goes at once, the others stay:\n%s", out)
 	}
-	now = now.Add(5 * time.Minute) // everyone silent
+	now = now.Add(10 * time.Minute) // everyone silent
+	if out := scrape(t, s); !strings.Contains(out, `llmr_gateway_last_sync_age_seconds{group="eu",gateway="gw-1"}`) {
+		t.Errorf("a silent gateway stays, so its not-syncing alert keeps firing:\n%s", out)
+	}
+	now = now.Add(25 * time.Minute)
 	if out := scrape(t, s); strings.Contains(out, "gateway=") {
 		t.Errorf("stale gateways must go:\n%s", out)
-	}
-	if _, ok := s.Get("a"); !ok {
-		t.Error("the Gateways page still lists a silent gateway for a while")
 	}
 }
 

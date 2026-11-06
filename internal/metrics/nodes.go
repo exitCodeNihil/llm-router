@@ -37,12 +37,12 @@ const (
 	HistoryStep = 10 * time.Second
 	HistoryLen  = 360
 	// A gateway that stopped syncing without saying it was leaving is
-	// reported for staleAfter (so it can be alerted on), one that left for
-	// leftAfter. A gateway gone longer than forgetAfter is forgotten, and so
-	// is its history.
-	staleAfter  = 5 * time.Minute
+	// reported for staleAfter, so its not-syncing alert keeps firing; one
+	// that left for leftAfter. A gateway gone longer than forgetAfter is
+	// forgotten, and so is its history.
+	staleAfter  = 30 * time.Minute
 	leftAfter   = 15 * time.Second
-	forgetAfter = 10 * time.Minute // as long as the Gateways page lists it
+	forgetAfter = staleAfter
 )
 
 // Sample is the peak of each value over one HistoryStep.
