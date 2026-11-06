@@ -10,6 +10,9 @@ OpenAI-compatible server.
 - Works with Claude Code, Cursor, OpenCode, pi and any SDK.
 - Virtual API keys, teams, budgets, rate limits and SSO, with usage and cost for every request.
 - Cheapest-first routing with failover across backends that share a model name.
+- Request traces to any OpenTelemetry backend and Langfuse, per team and gateway group, with or
+  without prompts ([observability](docs/observability.md)); Prometheus metrics and alerts for the
+  router itself ([monitoring](docs/monitoring.md)).
 - Runs Claude Code on your claude.ai subscription and records it without holding a credential.
 - Optional per-user dev workspaces (VS Code and a coding agent), and Rust gateways you run behind a
   load balancer, in other regions or per team, all configured from one place.
