@@ -30,7 +30,34 @@ pub trait TokenSource: Send + Sync + 'static {
     fn what(&self) -> &str;
     /// Gets a new token. `usable` says the current one still works, so the source
     /// may answer `NotYet` when it has nothing new to offer.
-    fn fetch(&self, usable: bool) -> impl Future<Output = Result<Fetched, String>> + Send;
+    fn fetch(&self, usable: bool) -> impl Future<Output = Result<Fetched, FetchError>> + Send;
+}
+
+/// Why a token couldn't be got. The request that needed it is told `public`;
+/// the log gets `detail`, which may name credential files or carry what the
+/// token endpoint answered.
+#[derive(Debug)]
+pub struct FetchError {
+    pub public: String,
+    pub detail: String,
+}
+
+impl FetchError {
+    pub fn new(public: impl Into<String>, detail: impl Into<String>) -> FetchError {
+        FetchError { public: public.into(), detail: detail.into() }
+    }
+
+    /// Both, after `prefix: `.
+    pub fn context(self, prefix: &str) -> FetchError {
+        FetchError { public: format!("{prefix}: {}", self.public), detail: format!("{prefix}: {}", self.detail) }
+    }
+}
+
+/// An error that is safe to show as it is.
+impl From<String> for FetchError {
+    fn from(s: String) -> FetchError {
+        FetchError { public: s.clone(), detail: s }
+    }
 }
 
 pub enum Fetched {
@@ -210,8 +237,8 @@ async fn refresh<S: TokenSource>(inner: &Inner<S>, r: &mut Refresh) -> Result<He
                 _ => Err(format!("{}: no new token yet", inner.source.what())),
             }
         }
-        Err(message) => {
-            eprintln!("{} failed: {message}", inner.source.what());
+        Err(FetchError { public: message, detail }) => {
+            eprintln!("{} failed: {detail}", inner.source.what());
             r.failures += 1;
             r.last_err = Some(message.clone());
             inner.next_try.store(millis(now + backoff(r.failures)), Ordering::Relaxed);
@@ -247,7 +274,7 @@ mod tests {
         fn what(&self) -> &str {
             "fake token request"
         }
-        async fn fetch(&self, usable: bool) -> Result<Fetched, String> {
+        async fn fetch(&self, usable: bool) -> Result<Fetched, FetchError> {
             self.usable.lock().unwrap().push(usable);
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             match self.replies[n.min(self.replies.len() - 1)] {
@@ -255,7 +282,7 @@ mod tests {
                     HeaderValue::from_str(&format!("Bearer t{n}")).unwrap(),
                     Duration::from_secs(secs),
                 )),
-                Err(e) => Err(e.to_string()),
+                Err(e) => Err(FetchError::new(e, format!("{e} (with detail)"))),
             }
         }
     }
@@ -290,6 +317,13 @@ mod tests {
         // 10 s left: too close to send, so this request waits for a new one.
         assert_eq!(t.bearer().await.unwrap(), "Bearer t1");
         assert_eq!(calls(&t), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failure_shows_the_request_no_detail() {
+        let t = Fake::token(vec![Err("refused")]);
+        assert_eq!(t.bearer().await.unwrap_err(), "refused");
+        assert_eq!(t.bearer().await.unwrap_err(), "refused", "nor while backing off");
     }
 
     #[tokio::test]

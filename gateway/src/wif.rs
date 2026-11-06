@@ -13,7 +13,7 @@ use http::{HeaderValue, Request, StatusCode, header};
 use http_body_util::{BodyExt, Full, Limited};
 use serde::Deserialize;
 
-use crate::cloud::token::{Fetched, RefreshingToken, TokenSource, millis};
+use crate::cloud::token::{FetchError, Fetched, RefreshingToken, TokenSource, millis};
 
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_ASSERTION: usize = 16 << 10; // Anthropic's limit
@@ -61,7 +61,7 @@ impl TokenSource for Exchange {
         "anthropic workload identity exchange"
     }
 
-    async fn fetch(&self, usable: bool) -> Result<Fetched, String> {
+    async fn fetch(&self, usable: bool) -> Result<Fetched, FetchError> {
         let assertion = self.source.identity_token(&self.cfg.identity_token_file).await?;
         let hash = hash_token(&assertion);
         // The file hasn't rotated yet. Sending it again would only be refused as a

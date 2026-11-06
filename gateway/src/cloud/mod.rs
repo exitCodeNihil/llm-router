@@ -13,6 +13,8 @@ use bytes::Bytes;
 use http::{HeaderValue, Request, StatusCode};
 use http_body_util::{BodyExt, Full, Limited};
 
+use token::FetchError;
+
 /// How long a token request may take.
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -44,13 +46,19 @@ fn chain(e: &dyn std::error::Error) -> String {
 
 /// The Authorization header and lifetime from an OAuth token response, or why
 /// there is none. Entra's managed identity endpoints send numbers as strings, and
-/// some only an absolute expiry.
+/// some only an absolute expiry. A refusal shows the status and OAuth error code;
+/// the description, or a body that isn't OAuth's, is only logged.
 pub(crate) fn bearer_from(
     status: StatusCode,
     v: &serde_json::Value,
     text: &str,
-) -> Result<(HeaderValue, Duration), String> {
+) -> Result<(HeaderValue, Duration), FetchError> {
     if status != StatusCode::OK {
+        let code = v["error"].as_str().filter(|e| e.len() <= 64 && e.bytes().all(|c| c.is_ascii_graphic()));
+        let public = match code {
+            Some(e) => format!("{}: {e}", status.as_u16()),
+            None => status.as_u16().to_string(),
+        };
         let detail = match (v["error"].as_str(), v["error_description"].as_str()) {
             (Some(e), Some(d)) => format!("{e}: {}", d.lines().next().unwrap_or("")),
             (Some(e), None) => e.to_string(),
@@ -59,7 +67,7 @@ pub(crate) fn bearer_from(
                 None => text.to_string(),
             },
         };
-        return Err(format!("{}: {detail}", status.as_u16()));
+        return Err(FetchError::new(public, format!("{}: {detail}", status.as_u16())));
     }
     let num = |v: &serde_json::Value| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()));
     let lifetime = num(&v["expires_in"])
@@ -69,8 +77,8 @@ pub(crate) fn bearer_from(
     match (token, lifetime) {
         (Some(t), Some(secs)) => HeaderValue::try_from(format!("Bearer {t}"))
             .map(|h| (h, Duration::from_secs(secs)))
-            .map_err(|_| "the token response holds an unusable token".into()),
-        _ => Err("the token response holds no usable token".into()),
+            .map_err(|_| "the token response holds an unusable token".to_string().into()),
+        _ => Err("the token response holds no usable token".to_string().into()),
     }
 }
 
@@ -254,8 +262,14 @@ mod tests {
             "",
         )
         .unwrap_err();
-        assert_eq!(err, "400: invalid_client: AADSTS7000215: bad secret.");
-        assert_eq!(bearer_from(StatusCode::NOT_FOUND, &serde_json::Value::Null, "nope").unwrap_err(), "404: nope");
+        assert_eq!(err.public, "400: invalid_client");
+        assert_eq!(err.detail, "400: invalid_client: AADSTS7000215: bad secret.");
+        // A body that isn't an OAuth error is never shown, only logged.
+        let err = bearer_from(StatusCode::NOT_FOUND, &serde_json::Value::Null, "nope").unwrap_err();
+        assert_eq!((err.public.as_str(), err.detail.as_str()), ("404", "404: nope"));
+        let err =
+            bearer_from(StatusCode::FORBIDDEN, &serde_json::json!({"error": {"message": "inner"}}), "").unwrap_err();
+        assert_eq!((err.public.as_str(), err.detail.as_str()), ("403", "403: inner"));
     }
 
     #[test]

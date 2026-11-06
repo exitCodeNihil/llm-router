@@ -18,7 +18,7 @@ use bytes::Bytes;
 use http::{Request, header};
 use http_body_util::Full;
 
-use super::token::{Bearer, Fetched, RefreshingToken, Refused, TokenSource};
+use super::token::{Bearer, FetchError, Fetched, RefreshingToken, Refused, TokenSource};
 use super::{bearer_from, call, form, https_or_loopback, read_small};
 
 /// The scope the control plane asks for too.
@@ -97,7 +97,7 @@ impl Entra {
         format!("{}/{tenant}/oauth2/v2.0/token", self.authority)
     }
 
-    fn request(&self) -> Result<Request<Full<Bytes>>, String> {
+    fn request(&self) -> Result<Request<Full<Bytes>>, FetchError> {
         let post = |url: String, body: String| {
             Request::post(url)
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -115,7 +115,8 @@ impl Entra {
             ),
             Method::Federated { tenant, client_id, file } => {
                 // Read on every request: the kubelet rotates it.
-                let assertion = read_small(file, MAX_ASSERTION)?;
+                let assertion = read_small(file, MAX_ASSERTION)
+                    .map_err(|e| FetchError::new("AZURE_FEDERATED_TOKEN_FILE can't be read", e))?;
                 post(
                     self.token_url(tenant),
                     form(&[
@@ -146,7 +147,7 @@ impl Entra {
                     .body(Full::new(Bytes::new()))
             }
         };
-        req.map_err(|e| e.to_string())
+        req.map_err(|e| FetchError::from(e.to_string()))
     }
 
     fn kind(&self) -> &'static str {
@@ -164,10 +165,12 @@ impl TokenSource for Entra {
         "entra token request"
     }
 
-    async fn fetch(&self, _usable: bool) -> Result<Fetched, String> {
-        let wrap = |e: String| format!("entra token ({}): {e}", self.kind());
+    async fn fetch(&self, _usable: bool) -> Result<Fetched, FetchError> {
+        let what = format!("entra token ({})", self.kind());
+        let wrap = |e: FetchError| e.context(&what);
         let req = self.request().map_err(wrap)?;
-        let (status, v, text) = call(req).await.map_err(wrap)?;
+        let (status, v, text) =
+            call(req).await.map_err(|e| wrap(FetchError::new("the token endpoint did not answer", e)))?;
         let (header, lifetime) = bearer_from(status, &v, &text).map_err(wrap)?;
         Ok(Fetched::Token(header, lifetime))
     }
@@ -314,7 +317,28 @@ mod tests {
         ])
         .unwrap();
         let err = RefreshingToken::new(e).bearer().await.unwrap_err();
-        assert!(err.contains("client secret") && err.contains("401") && err.contains("AADSTS7000215"), "{err}");
-        assert!(!err.contains("hunter2") && !err.contains("Trace ID"), "{err}");
+        assert_eq!(err, "entra token (client secret): 401: invalid_client");
+        // The description is for the log.
+        let err = entra(&[
+            ("AZURE_AUTHORITY_HOST", &url),
+            ("AZURE_TENANT_ID", "t"),
+            ("AZURE_CLIENT_ID", "c"),
+            ("AZURE_CLIENT_SECRET", "hunter2"),
+        ])
+        .unwrap()
+        .fetch(false)
+        .await
+        .err()
+        .unwrap();
+        assert!(err.detail.contains("AADSTS7000215") && !err.detail.contains("hunter2"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_token_file_path_is_only_logged() {
+        let path = "/nonexistent/llmr-test/azure-identity-token";
+        let e = entra(&[("AZURE_TENANT_ID", "t"), ("AZURE_CLIENT_ID", "c"), ("AZURE_FEDERATED_TOKEN_FILE", path)]);
+        let err = e.unwrap().fetch(false).await.err().unwrap();
+        assert!(!err.public.contains(path) && err.public.contains("AZURE_FEDERATED_TOKEN_FILE"), "{err:?}");
+        assert!(err.detail.contains(path), "{err:?}");
     }
 }

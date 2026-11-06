@@ -23,7 +23,7 @@ use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::pem::PemObject;
 use serde::Deserialize;
 
-use super::token::{Bearer, Fetched, RefreshingToken, Refused, TokenSource};
+use super::token::{Bearer, FetchError, Fetched, RefreshingToken, Refused, TokenSource};
 use super::{b64url, bearer_from, call, form, https_or_loopback, read_small};
 
 const SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
@@ -132,24 +132,24 @@ impl ServiceAccount {
         Ok(format!("{signed}.{}", b64url(&sig)))
     }
 
-    async fn token(&self) -> Result<(HeaderValue, Duration), String> {
+    async fn token(&self) -> Result<(HeaderValue, Duration), FetchError> {
         let assertion = self.assertion(crate::now_ms() as u64 / 1000)?;
         let body = form(&[("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"), ("assertion", &assertion)]);
         post(&self.token_uri, body).await
     }
 }
 
-async fn post(url: &str, body: String) -> Result<(HeaderValue, Duration), String> {
+async fn post(url: &str, body: String) -> Result<(HeaderValue, Duration), FetchError> {
     let req = Request::post(url)
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body(Full::new(Bytes::from(body)))
         .map_err(|e| e.to_string())?;
-    let (status, v, text) = call(req).await?;
+    let (status, v, text) = call(req).await.map_err(|e| FetchError::new("the token endpoint did not answer", e))?;
     bearer_from(status, &v, &text)
 }
 
 impl Creds {
-    async fn token(&self) -> Result<(HeaderValue, Duration), String> {
+    async fn token(&self) -> Result<(HeaderValue, Duration), FetchError> {
         match self {
             Creds::ServiceAccount(sa) => sa.token().await,
             Creds::AuthorizedUser { client_id, client_secret, refresh_token, token_uri } => {
@@ -173,8 +173,8 @@ impl TokenSource for Key {
         "google token request"
     }
 
-    async fn fetch(&self, _usable: bool) -> Result<Fetched, String> {
-        let (h, d) = self.0.token().await.map_err(|e| format!("google token (service account key): {e}"))?;
+    async fn fetch(&self, _usable: bool) -> Result<Fetched, FetchError> {
+        let (h, d) = self.0.token().await.map_err(|e| e.context("google token (service account key)"))?;
         Ok(Fetched::Token(h, d))
     }
 }
@@ -205,7 +205,7 @@ impl Adc {
         parse(&read_small(path, MAX_FILE)?, true).map_err(|e| format!("{path}: {e}"))
     }
 
-    async fn metadata(&self) -> Result<(HeaderValue, Duration), String> {
+    async fn metadata(&self) -> Result<(HeaderValue, Duration), FetchError> {
         let url = format!(
             "{}/computeMetadata/v1/instance/service-accounts/default/token?{}",
             self.metadata,
@@ -216,11 +216,10 @@ impl Adc {
             .body(Full::new(Bytes::new()))
             .map_err(|e| e.to_string())?;
         let (status, v, text) = call(req).await.map_err(|e| {
-            format!(
-                "no credentials: GOOGLE_APPLICATION_CREDENTIALS isn't set and the metadata server didn't answer ({e})"
-            )
+            let none = "no credentials: GOOGLE_APPLICATION_CREDENTIALS isn't set and the metadata server didn't answer";
+            FetchError::new(none, format!("{none} ({e})"))
         })?;
-        bearer_from(status, &v, &text).map_err(|e| format!("metadata server: {e}"))
+        bearer_from(status, &v, &text).map_err(|e| e.context("metadata server"))
     }
 }
 
@@ -229,10 +228,16 @@ impl TokenSource for Adc {
         "google token request"
     }
 
-    async fn fetch(&self, _usable: bool) -> Result<Fetched, String> {
-        let wrap = |e: String| format!("google application default credentials: {e}");
+    async fn fetch(&self, _usable: bool) -> Result<Fetched, FetchError> {
+        let wrap = |e: FetchError| e.context("google application default credentials");
+        // The file's path, and what is wrong with it, are only logged.
         let (h, d) = match self.file() {
-            Some(path) => self.creds(path).map_err(wrap)?.token().await.map_err(|e| wrap(format!("{path}: {e}")))?,
+            Some(path) => self
+                .creds(path)
+                .map_err(|e| wrap(FetchError::new("the credentials file is unusable", e)))?
+                .token()
+                .await
+                .map_err(|e| wrap(FetchError::new(e.public, format!("{path}: {}", e.detail))))?,
             None => self.metadata().await.map_err(wrap)?,
         };
         Ok(Fetched::Token(h, d))
@@ -420,7 +425,8 @@ mod tests {
         let ext = r#"{"type":"external_account","audience":"x","token_url":"https://sts.googleapis.com/v1/token"}"#;
         let a = adc(&[("GOOGLE_APPLICATION_CREDENTIALS", &file("adc-ext", ext))]);
         let Err(err) = a.fetch(false).await else { panic!() };
-        assert!(err.contains("external_account") && err.contains("aren't supported"), "{err}");
+        assert!(err.detail.contains("external_account") && err.detail.contains("aren't supported"), "{err:?}");
+        assert_eq!(err.public, "google application default credentials: the credentials file is unusable");
     }
 
     #[tokio::test]
@@ -460,8 +466,24 @@ mod tests {
         let Creds::ServiceAccount(sa) = parse(&key_json(PKCS8, &format!("{url}/token")), false).unwrap() else {
             panic!()
         };
-        let err = RefreshingToken::new(Key(*sa)).bearer().await.unwrap_err();
-        assert!(err.contains("400: invalid_grant: Invalid JWT Signature."), "{err}");
-        assert!(!err.contains("PRIVATE KEY"), "{err}");
+        let key = Key(*sa);
+        let detail = key.fetch(false).await.err().unwrap().detail;
+        assert!(detail.contains("400: invalid_grant: Invalid JWT Signature."), "{detail}");
+        let err = RefreshingToken::new(key).bearer().await.unwrap_err();
+        assert_eq!(err, "google token (service account key): 400: invalid_grant");
+        assert!(!err.contains("PRIVATE KEY") && !detail.contains("PRIVATE KEY"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn adc_shows_no_paths_or_bodies() {
+        let (url, _) = mock::server(HashMap::from([("/token", (502, "<html>upstream secret</html>".into()))])).await;
+        let path = file("adc-bad", &key_json(PKCS8, &format!("{url}/token")));
+        let a = adc(&[("GOOGLE_APPLICATION_CREDENTIALS", &path)]);
+        let err = a.fetch(false).await.err().unwrap();
+        assert_eq!(err.public, "google application default credentials: 502");
+        assert!(err.detail.contains(&path) && err.detail.contains("upstream secret"), "{err:?}");
+        let missing = "/nonexistent/llmr-test/adc.json";
+        let err = adc(&[("GOOGLE_APPLICATION_CREDENTIALS", missing)]).fetch(false).await.err().unwrap();
+        assert!(!err.public.contains(missing) && err.detail.contains(missing), "{err:?}");
     }
 }
