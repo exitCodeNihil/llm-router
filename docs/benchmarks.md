@@ -280,8 +280,8 @@ A 5-minute soak catches errors under steady load and fast leaks, but not slow gr
 ## Rust gateway memory
 
 Measured 6 November 2026 with `./run.sh s11 rgw`. It runs the Rust gateway on 1 vCPU at 80%, then
-120%, of its 30,000 req/s maximum, then leaves it idle for 5 minutes. Results are in
-`bench/results/2026-11-06-soak2` to `-soak5`.
+120%, of its 30,000 req/s maximum, then leaves it idle for 5 minutes. The raw results of these runs
+are not in the repository.
 
 | | before | after |
 |---|---|---|

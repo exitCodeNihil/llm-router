@@ -149,7 +149,7 @@ For llm-router itself (the gateways have [their own](#gateways)):
 | `LLMR_ENCRYPTION_KEY` | Encrypts provider keys and signs sessions; 16+ characters, required |
 | `LLMR_ADMIN_TOKEN` | Bootstrap admin token, 12+ characters (optional) |
 | `LLMR_LISTEN` | Listen address, default `:8080` |
-| `LLMR_TRUSTED_PROXIES` | Comma-separated addresses or CIDR ranges of proxies whose `X-Forwarded-For` names the client. Console sign-in is limited to 20 attempts a minute per client address (IPv6 per /64) and 5 failures per 15 minutes per email and address. Each proxy must append to `X-Forwarded-For` |
+| `LLMR_TRUSTED_PROXIES` | Comma-separated addresses or CIDR ranges of proxies whose `X-Forwarded-For` names the client. Console sign-in is limited to 20 attempts a minute per client address (IPv6 per /64) and 5 failures per 15 minutes per email and address; wrong admin tokens on the API to 5 per 15 minutes per address. Each proxy must append to `X-Forwarded-For` |
 | `LLMR_SEED_CLAUDE_SUBSCRIPTION` | `1` adds the [subscription pass-through](clients.md#on-your-claudeai-subscription) provider and models |
 | `LLMR_IDE_LISTEN`, `LLMR_IDE_ORIGIN`, `LLMR_COOKIE_DOMAIN` | [Workspace IDE](workspaces.md) listener, its public origin, and the session cookie domain when it is another hostname |
 | `LLMR_METRICS_LISTEN` | Serve `/metrics` on this address (e.g. `:9090`) instead of the main listener; `off` turns it off. See [Monitoring](monitoring.md) |
@@ -172,7 +172,28 @@ Placeholder secrets such as `change-me` are refused. Generate them with `openssl
   answering upstream's `anthropic-ratelimit-*` and `x-ratelimit-*` headers. On a shared provider
   key those describe that key's quota, not the caller's.
 - **Upgrades**: pull the new tag and restart. Migrations apply on start and only go forward, so
-  back up Postgres first.
+  back up Postgres first. Upgrade the control plane before the gateways.
+
+### Upgrading to 0.3
+
+- **Order**: the control plane first, then gateways. 0.2 gateways keep working with a 0.3 control
+  plane (without Vertex AI, Entra ID, identity tokens or prompt capture); a 0.3 gateway can't join a
+  0.2 control plane.
+- **Telemetry**: Langfuse settings move to a destination on first start, and the telemetry API
+  changes. Langfuse Cloud turns off the API 0.2 used on 16 November 2026. See
+  [Observability](observability.md#upgrading-from-02).
+- **Metrics**: the control plane now serves `/metrics`, unauthenticated, on 8080 unless
+  `LLMR_METRICS_LISTEN` moves it (the chart and `deploy/docker-compose.yml` put it on 9090, which
+  they don't expose). See [Monitoring](monitoring.md).
+- **Identity token issuers** must use https (http only on localhost). An existing http issuer keeps
+  working on the control plane but is refused by 0.3 gateways: change it to https.
+- **Helm**: more than one control-plane replica is refused unless `allowMultipleReplicas=true`, and
+  gateways now get a 50-second termination grace period and, on Kubernetes 1.30 or later, a 5-second
+  pre-stop sleep (`gateway.terminationGracePeriodSeconds`, `gateway.preStopSleepSeconds`).
+- **Sign-in limits** count per client address. Behind a proxy or ingress set `LLMR_TRUSTED_PROXIES`
+  (chart: `trustedProxies`), or every client shares the proxy's limit.
+- **Prices**: Claude Sonnet 5.5 cache reads are corrected to $0.20 per million tokens; catalog
+  prices you edited are kept.
 
 ### Langfuse in Compose
 
@@ -196,7 +217,7 @@ UI URL `http://localhost:3001`, public key `pk-lf-llm-router`, secret key `LANGF
 
 - Managed Postgres with backups.
 - `LLMR_ENCRYPTION_KEY` in a secret manager and backed up. Rotating it means re-entering provider
-  keys and signing everyone out.
+  keys and telemetry destination secrets, and signing everyone out.
 - TLS in front of 8080.
 - `/metrics` off the public listener (`LLMR_METRICS_LISTEN`; the chart does it), and the
   [alerts](monitoring.md#alerts) wired to someone. Give gateways a memory limit.

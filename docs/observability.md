@@ -29,8 +29,9 @@ Two layers decide what leaves, and a request is exported to a destination only w
      when the policy captured them, cut to the destination's size cap (64 KiB by default). A span
      whose content was cut has `llmr.content.truncated` set.
 
-A gateway group's data rule is applied on top: **No export** keeps its traffic out of every
-destination, and **No content** sends metadata only, whatever the destinations ask for.
+A gateway group's data rule (on **Gateways**) is applied on top: **Never export** keeps its traffic
+out of every destination, and **Never capture prompts or responses** sends metadata only, whatever
+the destinations ask for. **Follow the capture policy** adds nothing.
 
 Content is captured only when at least one destination in scope wants it, and is never stored in
 Postgres. A change to the policy, a destination or a data rule also applies to spans still queued
@@ -93,13 +94,24 @@ start and end time and these attributes:
 - **Outcome:** `http.response.status_code`, `error.type`, `server.address`, `user.id`.
 - **llm-router:** `llmr.request.id`, `llmr.key.id`, `llmr.team.id`, `llmr.gateway.group.id`,
   `llmr.gateway.instance.id`, `llmr.provider.id`, `llmr.deployment.id`, `llmr.cost.usd`,
-  `llmr.cost.basis`, `llmr.attempts`, `llmr.ttft_ms`, `llmr.inference_geo`, `llmr.speed`,
-  `llmr.rule.id`, `llmr.content.truncated`.
+  `llmr.cost.unpriced` (no price is known for the model), `llmr.cost.notional_usd` (what
+  subscription pass-through traffic would have cost at list prices), `llmr.cost.basis`,
+  `llmr.usage.cache_write_1h.input_tokens`, `llmr.attempts`, `llmr.ttft_ms`, `llmr.inference_geo`,
+  `llmr.speed`, `llmr.rule.id`, `llmr.content.truncated`.
+
+`llmr.cost.basis` is the version of the pricing rules the cost was computed with: `1` is 0.3's,
+which prices cache writes, long prompts, US-only inference and fast mode the way Anthropic bills
+them (since 0.2.1). Requests recorded before 0.3 carry none; those from before 0.2.1 are
+under-reported for Claude models that used those features, and can't be repriced.
 
 Langfuse gets the same span with Langfuse's own attributes for the generation, usage, cost, input
 and output.
 
 ## Delivery
+
+llm-router sends spans to whatever URL an admin enters, from the control plane's network, and shows
+the start of an error response in the console. Only admins can add destinations, the same trust as
+a provider's base URL.
 
 Each destination has its own queue, so a slow or failing one never holds up the others or the
 requests themselves. Spans are sent in batches of up to 512, at least every 2 seconds.
@@ -132,6 +144,8 @@ docker compose -f docker-compose.dev.yml --profile otel --profile langfuse up -d
   at http://localhost:3001, login `admin@example.com` / `Password1!`.
 
 ## Upgrading from 0.2
+
+See also [Upgrading to 0.3](deploy.md#upgrading-to-03) for the rest of the release.
 
 - Langfuse settings from 0.2 move to a Langfuse destination named `Langfuse` on first start, with
   full content, so what was exported before still is. Its secret key is encrypted with

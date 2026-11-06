@@ -5,7 +5,7 @@ replica) and the gateways (`llm-router-gateway`, as many as you run). Both serve
 at `/metrics`, and the console's **Gateways** page shows each gateway's last hour without any of it.
 
 The number that matters most is a gateway's memory against its container's limit. Past saturation
-a gateway's memory grows with its open client connections, about 150 to 300 KB each (see
+a gateway's memory grows with its open client connections, about 150 to 350 KB each (see
 [benchmarks](benchmarks.md#rust-gateway-memory)), until the container is killed. Watch open
 connections and memory together, and add gateways before CPU runs out.
 

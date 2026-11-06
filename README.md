@@ -129,6 +129,8 @@ docker run -d --name llm-router --network llmr -p 8080:8080 -p 8081:8081 \
 | [Connect your tools](docs/clients.md) | Claude Code (subscription or other providers), Cursor, SDKs |
 | [Keys, teams and access](docs/access.md) | Budgets, model policy, SSO, cloud identity tokens |
 | [Deploying](docs/deploy.md) | Compose, TLS, Kubernetes, gateways, configuration |
+| [Observability](docs/observability.md) | Request traces to OpenTelemetry backends and Langfuse |
+| [Monitoring](docs/monitoring.md) | Prometheus metrics, alerts and a Grafana dashboard for the router |
 | [Workspaces](docs/workspaces.md) | Per-user VS Code containers |
 
 ## Contributing

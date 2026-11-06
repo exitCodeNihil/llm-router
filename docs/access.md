@@ -52,6 +52,9 @@ locally against the issuer's published keys. Add one under **Settings → Add is
 | Google Cloud | `gcp` | `https://accounts.google.com` | any, e.g. `https://router.example.com` |
 | Other OIDC | `oidc` | your issuer | your `aud` |
 
+The issuer URL must use https (plain http only for `localhost`), and so must the key set it
+publishes: the control plane and every gateway fetch keys from it.
+
 For Entra, set `accessTokenAcceptedVersion: 2` in the app registration manifest and **Email claim**
 to `preferred_username`. For OIDC machine tokens with no email, point **Email claim** at a stable
 claim such as `client_id`. Callers are matched to a gateway user by that claim; unknown users are
