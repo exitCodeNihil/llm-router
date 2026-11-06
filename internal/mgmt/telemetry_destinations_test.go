@@ -68,3 +68,32 @@ func TestStoredSecretsBoundToHost(t *testing.T) {
 		}
 	}
 }
+
+// Header names are compared in any case; values and secrets are trimmed.
+func TestDestinationHeaders(t *testing.T) {
+	stored := &snapshot.Destination{Kind: "otlp", Endpoint: "https://otel.example.com",
+		Secrets: map[string]string{"header:X-Org": "acme"}}
+	if _, err := draft(t, `{"name":"a","kind":"otlp","endpoint":"https://otel.example.com",
+		"headers":[{"name":"X-A","value":"1"},{"name":"x-a","value":"2"}]}`).destination(nil); err == nil ||
+		!strings.Contains(err.Error(), "twice") {
+		t.Errorf("duplicate header: %v", err)
+	}
+	d, err := draft(t, `{"name":"a","kind":"otlp","endpoint":"https://otel.example.com",
+		"headers":[{"name":"x-org"},{"name":"X-B","value":"  b  "}]}`).destination(stored)
+	if err != nil || d.Secrets["header:x-org"] != "acme" || d.Secrets["header:X-B"] != "b" || len(d.Secrets) != 2 {
+		t.Fatalf("destination %+v, err %v", d, err)
+	}
+	if _, err := draft(t, `{"name":"a","kind":"otlp","endpoint":"https://otel.example.com",
+		"headers":[{"name":"X-B","value":"b\r\nX-Evil: 1"}]}`).destination(nil); err == nil {
+		t.Error("a header value with CR LF was accepted")
+	}
+	if _, err := draft(t, `{"name":"a","kind":"langfuse","endpoint":"https://cloud.langfuse.com","config":{"public_key":"pk"},
+		"secrets":{"secret_key":"sk"},"headers":[{"name":"authorization","value":"x"}]}`).destination(nil); err == nil {
+		t.Error("a lowercase Authorization header was accepted for Langfuse")
+	}
+	d, err = draft(t, `{"name":"a","kind":"langfuse","endpoint":"https://cloud.langfuse.com","config":{"public_key":"pk"},
+		"secrets":{"secret_key":" sk\n"}}`).destination(nil)
+	if err != nil || d.Secrets["secret_key"] != "sk" {
+		t.Errorf("destination %+v, err %v", d, err)
+	}
+}

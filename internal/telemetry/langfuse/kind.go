@@ -62,8 +62,11 @@ func (Kind) Validate(d *snapshot.Destination) error {
 			return err
 		}
 	}
-	if _, ok := d.Headers()["Authorization"]; ok {
+	if otlp.HasHeader(d, "Authorization") {
 		return errors.New("the Authorization header is set from the key pair")
+	}
+	if otlp.HasHeader(d, "x-langfuse-ingestion-version") {
+		return errors.New("the x-langfuse-ingestion-version header is set by llm-router")
 	}
 	return nil
 }

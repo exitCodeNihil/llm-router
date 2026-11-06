@@ -103,7 +103,7 @@ func (req *destinationRequest) destination(stored *snapshot.Destination) (*snaps
 		return v, nil
 	}
 	for _, name := range k.SecretFields() {
-		v := req.Secrets[name]
+		v := strings.TrimSpace(req.Secrets[name])
 		if v == "" {
 			var err error
 			if v, err = keep(name); err != nil {
@@ -130,13 +130,24 @@ func (req *destinationRequest) destination(stored *snapshot.Destination) (*snaps
 			}
 		}
 	} else {
+		seen := map[string]bool{}
 		for _, h := range *req.Headers {
 			name := strings.TrimSpace(h.Name)
+			if seen[strings.ToLower(name)] {
+				return nil, fmt.Errorf("header %s is listed twice", name)
+			}
+			seen[strings.ToLower(name)] = true
 			key := snapshot.HeaderSecretPrefix + name
-			v := h.Value
+			v := strings.TrimSpace(h.Value)
 			if v == "" {
+				from := key // the stored header of this name, in any case
+				for k := range old {
+					if strings.EqualFold(k, key) {
+						from = k
+					}
+				}
 				var err error
-				if v, err = keep(key); err != nil {
+				if v, err = keep(from); err != nil {
 					return nil, err
 				}
 			}

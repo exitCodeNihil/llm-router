@@ -154,13 +154,16 @@ func TestValidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, mod := range map[string]func(*snapshot.Destination){
-		"no host":       func(d *snapshot.Destination) { d.Endpoint = "" },
-		"no public key": func(d *snapshot.Destination) { delete(d.Config, ConfigPublicKey) },
-		"no secret":     func(d *snapshot.Destination) { delete(d.Secrets, SecretKey) },
-		"bad ui url":    func(d *snapshot.Destination) { d.Config[ConfigUIURL] = "langfuse" },
-		"host userinfo": func(d *snapshot.Destination) { d.Endpoint = "https://pk:sk@cloud.langfuse.com" },
-		"ui userinfo":   func(d *snapshot.Destination) { d.Config[ConfigUIURL] = "https://a:b@langfuse.example.com" },
-		"own auth":      func(d *snapshot.Destination) { d.Secrets["header:Authorization"] = "x" },
+		"no host":               func(d *snapshot.Destination) { d.Endpoint = "" },
+		"no public key":         func(d *snapshot.Destination) { delete(d.Config, ConfigPublicKey) },
+		"no secret":             func(d *snapshot.Destination) { delete(d.Secrets, SecretKey) },
+		"bad ui url":            func(d *snapshot.Destination) { d.Config[ConfigUIURL] = "langfuse" },
+		"host userinfo":         func(d *snapshot.Destination) { d.Endpoint = "https://pk:sk@cloud.langfuse.com" },
+		"ui userinfo":           func(d *snapshot.Destination) { d.Config[ConfigUIURL] = "https://a:b@langfuse.example.com" },
+		"own auth":              func(d *snapshot.Destination) { d.Secrets["header:Authorization"] = "x" },
+		"own auth, lowercase":   func(d *snapshot.Destination) { d.Secrets["header:authorization"] = "x" },
+		"ingestion version":     func(d *snapshot.Destination) { d.Secrets["header:X-Langfuse-Ingestion-Version"] = "3" },
+		"secret with a newline": func(d *snapshot.Destination) { d.Secrets[SecretKey] = "sk\nx" },
 	} {
 		d := ok()
 		mod(d)

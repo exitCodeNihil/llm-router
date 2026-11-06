@@ -127,6 +127,13 @@ func TestKindValidate(t *testing.T) {
 		{snapshot.Destination{Endpoint: "https://user:pass@x"}, false},
 		{snapshot.Destination{Endpoint: "https://x", TracesURL: "https://token@x/v1/traces"}, false},
 		{snapshot.Destination{Endpoint: "https://x", Config: map[string]string{"trace_link": "https://u:p@grafana/{trace_id}"}}, false},
+		// Header names in any case; values that can't split a request.
+		{snapshot.Destination{Endpoint: "https://x", Secrets: map[string]string{"header:content-TYPE": "a"}}, false},
+		{snapshot.Destination{Endpoint: "https://x", Secrets: map[string]string{"header:X-A": "a", "header:x-a": "b"}}, false},
+		{snapshot.Destination{Endpoint: "https://x", Secrets: map[string]string{"header:X-A": "a\r\nX-Injected: 1"}}, false},
+		{snapshot.Destination{Endpoint: "https://x", Secrets: map[string]string{"header:X-A": "a\x00"}}, false},
+		{snapshot.Destination{Endpoint: "https://x", Secrets: map[string]string{"header:X-A": " a"}}, false},
+		{snapshot.Destination{Endpoint: "https://x", Secrets: map[string]string{"header:X-A": "a\tb"}}, true},
 	} {
 		if err := (Kind{}).Validate(&c.d); (err == nil) != c.ok {
 			t.Errorf("%+v: %v", c.d, err)

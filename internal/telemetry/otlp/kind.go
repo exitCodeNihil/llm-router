@@ -85,12 +85,49 @@ func ValidateCommon(d *snapshot.Destination) error {
 			return err
 		}
 	}
-	for name := range d.Headers() {
+	seen := map[string]bool{}
+	for name, v := range d.Headers() {
 		if err := CheckHeader(name); err != nil {
 			return err
 		}
+		if seen[strings.ToLower(name)] {
+			return fmt.Errorf("header %s is listed twice", name)
+		}
+		seen[strings.ToLower(name)] = true
+		if err := CheckValue("header "+name, v); err != nil {
+			return err
+		}
+	}
+	for k, v := range d.Secrets {
+		if !strings.HasPrefix(k, snapshot.HeaderSecretPrefix) {
+			if err := CheckValue(strings.ReplaceAll(k, "_", " "), v); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+// CheckValue accepts a header or secret value: trimmed, and without control
+// characters but tab, which could split or corrupt the request's headers.
+func CheckValue(what, v string) error {
+	if v != strings.TrimSpace(v) {
+		return fmt.Errorf("%s has leading or trailing spaces", what)
+	}
+	if strings.ContainsFunc(v, func(r rune) bool { return (r < ' ' && r != '\t') || r == 0x7f }) {
+		return fmt.Errorf("%s contains a control character", what)
+	}
+	return nil
+}
+
+// HasHeader reports whether d sets header name, in any case.
+func HasHeader(d *snapshot.Destination, name string) bool {
+	for h := range d.Headers() {
+		if strings.EqualFold(h, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // CheckURL accepts an absolute http or https URL without credentials in it.
