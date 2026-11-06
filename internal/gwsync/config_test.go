@@ -48,9 +48,10 @@ func fixture() *snapshot.Snapshot {
 			},
 			"gpt-b": {{ID: "d-b", Provider: pb, ModelName: "gpt-b", UpstreamName: "b"}},
 		},
-		Prices:    map[string]snapshot.Price{"gpt-a": {InputPer1M: 1, OutputPer1M: 2}},
-		Spend:     map[string]snapshot.Spend{"team:B": {USD: 3}},
-		Telemetry: snapshot.Telemetry{Enabled: true, SecretKey: "lf-secret"},
+		Prices: map[string]snapshot.Price{"gpt-a": {InputPer1M: 1, OutputPer1M: 2}},
+		Spend:  map[string]snapshot.Spend{"team:B": {USD: 3}},
+		Destinations: []*snapshot.Destination{{Name: "lf", Kind: "langfuse", Enabled: true,
+			Secrets: map[string]string{"secret_key": "lf-secret"}}},
 	}
 }
 

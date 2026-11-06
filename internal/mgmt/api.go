@@ -48,15 +48,12 @@ type Server struct {
 	HTTP      *metrics.HTTP // the control plane's own listener
 	Events    *metrics.Events
 	Recorder  *telemetry.Recorder
-	// Exporter reports delivery health; nil when no exporter runs in-process.
-	Exporter interface{ Health() telemetry.Health }
-
-	// Cached Langfuse trace URL prefix, keyed by host+public key.
-	traceMu    sync.Mutex
-	traceCache map[string]string
-	Gateway    *gateway.Server // chat playground bridge into the data plane
-	Version    string          // control-plane build version
-	Started    time.Time       // control-plane process start
+	// Telemetry reports destination health and trace links; nil when no
+	// exporter runs in-process.
+	Telemetry *telemetry.Manager
+	Gateway   *gateway.Server // chat playground bridge into the data plane
+	Version   string          // control-plane build version
+	Started   time.Time       // control-plane process start
 }
 
 func (m *Server) Register(mux *http.ServeMux) {
@@ -179,7 +176,6 @@ func (m *Server) Register(mux *http.ServeMux) {
 	mux.Handle("GET /api/nodes", h(m.listNodes))
 	mux.Handle("GET /api/nodes/history", h(m.nodesHistory))
 
-	mux.Handle("POST /api/observability/test", h(m.observabilityTest))
 	mux.Handle("GET /api/observability/exported", h(m.observabilityExported))
 	mux.Handle("GET /api/observability/rules/stats", h(m.observabilityRulesStats))
 }

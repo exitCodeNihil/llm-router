@@ -318,32 +318,26 @@ func (m *Server) putSSO(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// --- telemetry settings ---
+// --- telemetry capture policy ---
 
+// getTelemetry returns the capture policy. Destinations are under
+// /api/telemetry/destinations.
 func (m *Server) getTelemetry(w http.ResponseWriter, r *http.Request) {
+	cfg := snapshot.Telemetry{Mode: "everything"}
 	var raw []byte
-	err := m.Store.Pool.QueryRow(r.Context(), `SELECT value FROM settings WHERE key='telemetry'`).Scan(&raw)
-	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"configured": false})
-		return
+	if err := m.Store.Pool.QueryRow(r.Context(), `SELECT value FROM settings WHERE key='telemetry'`).Scan(&raw); err == nil {
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			httpError(w, http.StatusInternalServerError, "corrupt telemetry config")
+			return
+		}
 	}
-	var cfg snapshot.Telemetry
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		httpError(w, http.StatusInternalServerError, "corrupt telemetry config")
-		return
+	if cfg.Mode == "" {
+		cfg.Mode = "everything"
 	}
-	// Resolved before the secret is cleared: the project lookup authenticates
-	// with it, and blanking first left the link silently unavailable.
-	traceBase := m.traceBaseURL(r.Context(), cfg)
-	cfg.SecretKey = "" // never round-trip the secret
-	out := map[string]any{"configured": true, "telemetry": cfg}
-	if traceBase != "" {
-		out["trace_base_url"] = traceBase
+	if cfg.Rules == nil {
+		cfg.Rules = []snapshot.TelemetryRule{}
 	}
-	if m.Exporter != nil {
-		out["health"] = m.Exporter.Health()
-	}
-	writeJSON(w, http.StatusOK, out)
+	writeJSON(w, http.StatusOK, cfg)
 }
 
 func (m *Server) putTelemetry(w http.ResponseWriter, r *http.Request) {
@@ -351,21 +345,9 @@ func (m *Server) putTelemetry(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if cfg.Type == "" {
-		cfg.Type = "langfuse"
-	}
-	if cfg.Enabled && (cfg.Host == "" || cfg.PublicKey == "") {
-		httpError(w, http.StatusBadRequest, "host and public_key are required when enabled")
+	if err := checkPolicy(&cfg); err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
 		return
-	}
-	if cfg.SecretKey == "" {
-		var raw []byte
-		if err := m.Store.Pool.QueryRow(r.Context(), `SELECT value FROM settings WHERE key='telemetry'`).Scan(&raw); err == nil {
-			var old snapshot.Telemetry
-			if json.Unmarshal(raw, &old) == nil {
-				cfg.SecretKey = old.SecretKey
-			}
-		}
 	}
 	val, _ := json.Marshal(cfg)
 	if _, err := m.Store.Pool.Exec(r.Context(), `
@@ -374,8 +356,40 @@ func (m *Server) putTelemetry(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	m.bump(r.Context()) // snapshot reload applies the exporter config live
+	m.bump(r.Context()) // the snapshot reload applies it live
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// checkPolicy validates a capture policy and fills in defaults.
+func checkPolicy(cfg *snapshot.Telemetry) error {
+	switch cfg.Mode {
+	case "":
+		cfg.Mode = "everything"
+	case "everything", "by_rule", "off":
+	default:
+		return fmt.Errorf("mode must be everything, by_rule or off")
+	}
+	if cfg.Rules == nil {
+		cfg.Rules = []snapshot.TelemetryRule{}
+	}
+	for i := range cfg.Rules {
+		rule := &cfg.Rules[i]
+		if rule.ID == "" {
+			rule.ID = uuid.NewString()
+		}
+		switch rule.ScopeType {
+		case "team", "user", "key", "tag":
+		default:
+			return fmt.Errorf("rule %d: scope_type must be team, user, key or tag", i+1)
+		}
+		if rule.Capture != "content" && rule.Capture != "meta" {
+			return fmt.Errorf("rule %d: capture must be content or meta", i+1)
+		}
+		if rule.Sample < 0 || rule.Sample > 100 {
+			return fmt.Errorf("rule %d: sample must be 0 to 100", i+1)
+		}
+	}
+	return nil
 }
 
 // --- usage dashboards ---

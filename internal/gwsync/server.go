@@ -341,7 +341,10 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request, p peer) {
 		if usage.Sanitize(&e) > 0 {
 			fixed++
 		}
-		e.GatewayID = instance
+		e.GatewayID, e.GatewayGroupID = instance, group
+		if e.TraceID == "" {
+			e.TraceID = usage.TraceIDFor(e.RequestID) // gateways before 0.3.0 send none
+		}
 		events = append(events, e)
 	}
 	if dropped > 0 {
@@ -514,8 +517,9 @@ func (s *Server) record(r *http.Request, instance string, batch int64, events []
 }
 
 // export hands an uploaded event to the exporters, deciding here whether it is
-// exported and with what content: the telemetry rules and their credentials
-// stay on the control plane, and the group's data rule can only take away.
+// exported and with what content: the control plane stays authoritative for
+// the policy, and the group's data rule can only take away. Destinations
+// then apply their own scopes to e.GatewayGroupID.
 func (s *Server) export(snap *snapshot.Snapshot, g *snapshot.GatewayGroup, enc *encoded, e usage.Event) {
 	if s.Export == nil {
 		return
@@ -530,12 +534,12 @@ func (s *Server) export(snap *snapshot.Snapshot, g *snapshot.GatewayGroup, enc *
 	if t := snap.TeamsByID[e.TeamID]; t != nil {
 		tags = append(tags, t.Tags...)
 	}
-	dec := snap.Telemetry.Evaluate(e.APIKeyID, e.UserID, e.TeamID, tags)
+	dec := snap.Telemetry.Evaluate(e.APIKeyID, e.UserID, e.TeamID, tags, e.RequestID)
 	e.Tags, e.RuleID = tags, dec.RuleID
 	e.Export = dec.Export && g.DataRule != "no_export"
 	e.CaptureContent = dec.CaptureContent && g.DataRule == "inherit"
 	if !e.CaptureContent {
-		e.Input, e.Output = nil, ""
+		e.Input, e.Output, e.System = nil, "", nil
 	}
 	s.Export.Write(e)
 }

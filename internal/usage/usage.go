@@ -49,8 +49,10 @@ type Event struct {
 	// InferenceGeo and Speed are what an Anthropic upstream reported. CostBasis
 	// is the pricing CostUSD was computed with (CostBasisCurrent); 0 = unknown.
 	InferenceGeo string `json:"inference_geo,omitempty"`
-	Speed        string `json:"speed,omitempty"`
-	CostBasis    int    `json:"cost_basis,omitempty"`
+	// Operation is gen_ai.operation.name; "" = chat. Not stored.
+	Operation string `json:"operation,omitempty"`
+	Speed     string `json:"speed,omitempty"`
+	CostBasis int    `json:"cost_basis,omitempty"`
 
 	// Attempts is 1 when the first-choice deployment answered, higher after
 	// failover. ErrorCode is the gateway's own reason for a failure, which

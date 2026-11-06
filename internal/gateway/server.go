@@ -100,15 +100,17 @@ func (g *Server) authenticate(next http.Handler) http.Handler {
 			return
 		}
 
+		tr := newTrace(w, r)
 		if g.Limits != nil {
 			if ok, status, code, msg := g.Limits.Check(id, snap); !ok {
 				writeLimitError(w, status, code, msg)
 				// A denial used to leave no trace at all, so "how often is this
 				// key throttled" was unanswerable. The check runs before the body
 				// is parsed, so model_name is necessarily blank here.
-				g.emit(snap, id, nil, &reqBody{}, requestID(), usageCounts{}, status,
-					time.Now(), nil, "", telemetryDecision(snap, id),
-					emitExtra{ErrorCode: code})
+				reqID := requestID()
+				g.emit(snap, id, nil, &reqBody{}, reqID, usageCounts{}, status,
+					time.Now(), nil, "", telemetryDecision(snap, id, reqID, tr),
+					emitExtra{ErrorCode: code, Trace: tr})
 				return
 			}
 		}
@@ -118,7 +120,7 @@ func (g *Server) authenticate(next http.Handler) http.Handler {
 		if !viaAuthz {
 			in.Authorization = r.Header.Get("Authorization")
 		}
-		ctx := provider.WithInbound(r.Context(), in)
+		ctx := withTrace(provider.WithInbound(r.Context(), in), tr)
 		next.ServeHTTP(w, r.WithContext(context.WithValue(ctx, identityKey, id)))
 	})
 }
@@ -139,7 +141,8 @@ func (g *Server) ServeAuthed(w http.ResponseWriter, r *http.Request, id *auth.Id
 			return
 		}
 	}
-	g.handleProxy(w, r.WithContext(context.WithValue(r.Context(), identityKey, id)))
+	ctx := withTrace(context.WithValue(r.Context(), identityKey, id), newTrace(w, r))
+	g.handleProxy(w, r.WithContext(ctx))
 }
 
 func (g *Server) handleModels(w http.ResponseWriter, r *http.Request) {

@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/exitcodenihil/llm-router/internal/auth"
 	"github.com/exitcodenihil/llm-router/internal/pricing"
@@ -30,6 +31,8 @@ type usageCounts struct {
 	// that raise every rate. Only Anthropic upstreams report them.
 	Write5m, Write1h  int
 	USInference, Fast bool
+	// Geo and Speed are inference_geo and speed as the upstream reported them.
+	Geo, Speed string
 	// TTFTMs is set by the streaming paths; 0 for buffered responses.
 	TTFTMs int
 }
@@ -39,6 +42,7 @@ func (g *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	id := IdentityFrom(r.Context())
 	start := time.Now()
 	reqID := requestID()
+	tr := traceFrom(r.Context())
 
 	raw, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
@@ -63,21 +67,21 @@ func (g *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "invalid_request_error", "model_not_allowed",
 			"model "+body.Model+" is not available for this API key")
 		g.emit(snap, id, nil, body, reqID, usageCounts{}, http.StatusNotFound, start, nil, "",
-			telemetryDecision(snap, id), emitExtra{ErrorCode: "model_not_allowed"})
+			telemetryDecision(snap, id, reqID, tr), emitExtra{Trace: tr, ErrorCode: "model_not_allowed"})
 		return
 	}
 	if len(deployments) == 0 {
 		writeError(w, http.StatusNotFound, "invalid_request_error", "model_not_found",
 			"model "+body.Model+" does not exist")
 		g.emit(snap, id, nil, body, reqID, usageCounts{}, http.StatusNotFound, start, nil, "",
-			telemetryDecision(snap, id), emitExtra{ErrorCode: "model_not_found"})
+			telemetryDecision(snap, id, reqID, tr), emitExtra{Trace: tr, ErrorCode: "model_not_found"})
 		return
 	}
 
 	injectUsage := body.Stream && !body.IncludeUsage
 
 	// telemetry export decision computed once, now that identity is known
-	dec := telemetryDecision(snap, id)
+	dec := telemetryDecision(snap, id, reqID, tr)
 
 	resp, chosen, attempts, err := tryDeployments(r.Context(), deployments, r.URL.Path[len("/v1"):], func(d *snapshot.Deployment) ([]byte, error) {
 		if d.APIFlavor == "anthropic" {
@@ -92,21 +96,21 @@ func (g *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if code := callerErrorCode(err); code != "" {
 			writeError(w, http.StatusBadRequest, "invalid_request_error", code, err.Error())
 			g.emit(snap, id, nil, body, reqID, usageCounts{}, http.StatusBadRequest, start, nil, "", dec,
-				emitExtra{Attempts: attempts, ErrorCode: code})
+				emitExtra{Trace: tr, Attempts: attempts, ErrorCode: code})
 			return
 		}
 		// Recorded too, or a provider that can't be reached (a refused token
 		// exchange, say) would fail requests without a trace in usage.
 		writeError(w, http.StatusInternalServerError, "server_error", "internal_error", err.Error())
 		g.emit(snap, id, nil, body, reqID, usageCounts{}, http.StatusInternalServerError, start, nil, "", dec,
-			emitExtra{Attempts: attempts, ErrorCode: "internal_error"})
+			emitExtra{Trace: tr, Attempts: attempts, ErrorCode: "internal_error"})
 		return
 	}
 	if resp == nil {
 		writeError(w, http.StatusBadGateway, "server_error", "upstream_unavailable",
 			"all deployments for model "+body.Model+" failed")
 		g.emit(snap, id, nil, body, reqID, usageCounts{}, http.StatusBadGateway, start, nil, "", dec,
-			emitExtra{Attempts: attempts, ErrorCode: "upstream_unavailable"})
+			emitExtra{Trace: tr, Attempts: attempts, ErrorCode: "upstream_unavailable"})
 		return
 	}
 	defer resp.Body.Close()
@@ -118,7 +122,7 @@ func (g *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	forwardRetryAfter(w, resp)
 	forwardRateLimits(w, resp)
 
-	capture := dec.CaptureContent
+	capture := contentCap(snap, id, dec)
 	var counts usageCounts
 	var output string
 	isSSE := body.Stream && resp.StatusCode == http.StatusOK
@@ -133,12 +137,10 @@ func (g *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		counts, output = copyJSON(w, resp, capture)
 	}
 
-	var input json.RawMessage
-	if capture {
-		input = body.fields["messages"]
-	}
+	input, system, output, cut := capContent(capture, body.fields["messages"], nil, output)
 	e := g.emit(snap, id, chosen, body, reqID, counts, resp.StatusCode, start, input, output, dec,
-		emitExtra{Attempts: attempts, ErrorCode: upstreamErrorCode(resp.StatusCode)})
+		emitExtra{Trace: tr, Attempts: attempts, ErrorCode: upstreamErrorCode(resp.StatusCode),
+			System: system, Truncated: cut})
 	if g.Limits != nil {
 		g.Limits.RecordUsage(id, counts.Prompt+counts.Completion, e.CostUSD)
 	}
@@ -157,8 +159,9 @@ func callerErrorCode(err error) string {
 }
 
 // telemetryDecision computes the export/capture verdict once per request from
-// the identity's key/user/team ids and aggregated tags.
-func telemetryDecision(snap *snapshot.Snapshot, id *auth.Identity) snapshot.Decision {
+// the identity's key/user/team ids and aggregated tags. A caller whose trace
+// is not sampled gets nothing exported.
+func telemetryDecision(snap *snapshot.Snapshot, id *auth.Identity, reqID string, tr traceCtx) snapshot.Decision {
 	var tags []string
 	keyID, userID, teamID := "", "", ""
 	if id.Key != nil {
@@ -173,7 +176,63 @@ func telemetryDecision(snap *snapshot.Snapshot, id *auth.Identity) snapshot.Deci
 		teamID = id.Team.ID
 		tags = append(tags, id.Team.Tags...)
 	}
-	return snap.Telemetry.Evaluate(keyID, userID, teamID, tags)
+	dec := snap.Telemetry.Evaluate(keyID, userID, teamID, tags, reqID)
+	if !tr.Sampled {
+		return snapshot.Decision{RuleID: dec.RuleID}
+	}
+	return dec
+}
+
+// contentCap is how many bytes of content to capture: none unless the policy
+// captures it and a destination that would take this request wants it. The
+// control plane's own gateway serves the control-plane group.
+func contentCap(snap *snapshot.Snapshot, id *auth.Identity, dec snapshot.Decision) int {
+	if !dec.CaptureContent {
+		return 0
+	}
+	team := ""
+	if id.Team != nil {
+		team = id.Team.ID
+	}
+	return snap.ContentWanted(team, snapshot.ControlPlaneGroup)
+}
+
+// capContent bounds captured content to limit bytes per part: the output is
+// cut, a larger system prompt is dropped, and the input keeps its newest
+// messages that fit. Destinations cut further to their own caps; this keeps a
+// queued event from holding a 10 MB prompt. cut reports anything left out.
+func capContent(limit int, input, system json.RawMessage, output string) (json.RawMessage, json.RawMessage, string, bool) {
+	if limit <= 0 {
+		return nil, nil, "", false
+	}
+	cut := false
+	if len(output) > limit {
+		output, cut = truncateUTF8(output, limit), true
+	}
+	if len(system) > limit {
+		system, cut = nil, true
+	}
+	if len(input) > limit {
+		var msgs []json.RawMessage
+		json.Unmarshal(input, &msgs)
+		n, i := 2, len(msgs)
+		for i > 0 && n+len(msgs[i-1])+1 <= limit {
+			n += len(msgs[i-1]) + 1
+			i--
+		}
+		input, cut = nil, cut || i > 0 || len(msgs) == 0
+		if i < len(msgs) {
+			input, _ = json.Marshal(msgs[i:])
+		}
+	}
+	return input, system, output, cut
+}
+
+func truncateUTF8(s string, n int) string {
+	for n > 0 && n < len(s) && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // upstreamErrorCode labels a non-2xx answer from the provider. The gateway's own
@@ -208,7 +267,7 @@ func setRoutingHeaders(w http.ResponseWriter, reqID string,
 	h.Set("X-Llmr-Attempts", strconv.Itoa(attempts))
 	// Browser clients on another origin can only read these when exposed.
 	h.Set("Access-Control-Expose-Headers",
-		"X-Request-Id, X-Llmr-Provider, X-Llmr-Upstream, X-Llmr-Attempts")
+		"X-Request-Id, X-Llmr-Trace-Id, X-Llmr-Provider, X-Llmr-Upstream, X-Llmr-Attempts")
 }
 
 // defaultUpstreamTimeout bounds the wait for an upstream's response headers
@@ -353,7 +412,7 @@ func orderByHealth(ds []*snapshot.Deployment, now time.Time) []*snapshot.Deploym
 // streamSSE copies the upstream SSE stream to the client, extracting token
 // usage from the final usage chunk. If we injected include_usage ourselves,
 // that chunk is dropped from the client copy.
-func (g *Server) streamSSE(w http.ResponseWriter, resp *http.Response, dropUsageChunk, capture bool, ttftStart time.Time) (usageCounts, string) {
+func (g *Server) streamSSE(w http.ResponseWriter, resp *http.Response, dropUsageChunk bool, capture int, ttftStart time.Time) (usageCounts, string) {
 	var counts usageCounts
 	var output strings.Builder
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -372,7 +431,7 @@ func (g *Server) streamSSE(w http.ResponseWriter, resp *http.Response, dropUsage
 		line := sc.Bytes()
 		forward := true
 		if data, ok := bytes.CutPrefix(line, []byte("data: ")); ok && !bytes.Equal(data, []byte("[DONE]")) {
-			if capture && output.Len() < 64<<10 && bytes.Contains(data, []byte(`"content"`)) {
+			if output.Len() < capture && bytes.Contains(data, []byte(`"content"`)) {
 				var chunk struct {
 					Choices []struct {
 						Delta struct {
@@ -415,7 +474,7 @@ func (g *Server) streamSSE(w http.ResponseWriter, resp *http.Response, dropUsage
 }
 
 // copyJSON forwards a non-streaming response and parses its usage object.
-func copyJSON(w http.ResponseWriter, resp *http.Response, capture bool) (usageCounts, string) {
+func copyJSON(w http.ResponseWriter, resp *http.Response, capture int) (usageCounts, string) {
 	var counts usageCounts
 	var output string
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
@@ -435,7 +494,7 @@ func copyJSON(w http.ResponseWriter, resp *http.Response, capture bool) (usageCo
 			if parsed.Usage != nil {
 				counts = parsed.Usage.counts()
 			}
-			if capture && len(parsed.Choices) > 0 && parsed.Choices[0].Message.Content != nil {
+			if capture > 0 && len(parsed.Choices) > 0 && parsed.Choices[0].Message.Content != nil {
 				output = *parsed.Choices[0].Message.Content
 			}
 		}
@@ -465,6 +524,9 @@ func (u *usageJSON) counts() usageCounts {
 type emitExtra struct {
 	Attempts  int
 	ErrorCode string
+	Trace     traceCtx
+	System    json.RawMessage // Anthropic's system, when captured
+	Truncated bool            // captured content was cut
 }
 
 func (g *Server) emit(snap *snapshot.Snapshot, id *auth.Identity, d *snapshot.Deployment, body *reqBody,
@@ -490,6 +552,13 @@ func (g *Server) emit(snap *snapshot.Snapshot, id *auth.Identity, d *snapshot.De
 		TTFTMs:           counts.TTFTMs,
 		Attempts:         extra.Attempts,
 		ErrorCode:        extra.ErrorCode,
+		System:           extra.System,
+		ContentTruncated: extra.Truncated,
+		TraceID:          extra.Trace.TraceID,
+		ParentSpanID:     extra.Trace.ParentID,
+		Operation:        extra.Trace.Operation,
+		InferenceGeo:     counts.Geo,
+		Speed:            counts.Speed,
 	}
 	if id.Key != nil {
 		e.APIKeyID = id.Key.ID
@@ -509,6 +578,7 @@ func (g *Server) emit(snap *snapshot.Snapshot, id *auth.Identity, d *snapshot.De
 		tokens := pricing.Tokens{Prompt: counts.Prompt, Completion: counts.Completion, Cached: counts.Cached,
 			Write5m: counts.Write5m, Write1h: counts.Write1h, USInference: counts.USInference, Fast: counts.Fast}
 		e.CostUSD, e.Unpriced = pricing.Cost(snap, d, tokens)
+		e.CostBasis = usage.CostBasisCurrent
 		if e.Unpriced {
 			// No real money changed hands, but the tokens still have a list value.
 			e.NotionalCostUSD = pricing.Notional(snap, d, e.ModelName, tokens)

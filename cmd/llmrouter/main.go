@@ -27,6 +27,8 @@ import (
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
 	"github.com/exitcodenihil/llm-router/internal/store"
 	"github.com/exitcodenihil/llm-router/internal/telemetry"
+	"github.com/exitcodenihil/llm-router/internal/telemetry/langfuse"
+	"github.com/exitcodenihil/llm-router/internal/telemetry/otlp"
 	"github.com/exitcodenihil/llm-router/internal/usage"
 	"github.com/exitcodenihil/llm-router/internal/workspace"
 )
@@ -99,6 +101,13 @@ func run() error {
 		}
 	}
 
+	// Before the first snapshot, so a pre-0.3.0 Langfuse config is already
+	// a destination when exporting starts.
+	if err := telemetry.MigrateLegacy(ctx, st.Pool, cfg.EncryptionKey); err != nil {
+		return err
+	}
+	telemetry.Register(otlp.Kind{}, langfuse.Kind{})
+
 	builder := &snapshot.Builder{Pool: st.Pool, EncryptionKey: cfg.EncryptionKey}
 	first, err := builder.Build(ctx)
 	if err != nil {
@@ -113,28 +122,23 @@ func run() error {
 	}
 	go writer.Run(ctx)
 	recorder := telemetry.NewRecorder()
-	lf := telemetry.NewLangfuse(func() snapshot.Telemetry {
-		if s := holder.Get(); s != nil {
-			return s.Telemetry
-		}
-		return snapshot.Telemetry{}
-	})
-	lf.Recorder = recorder
-	go lf.Run(ctx)
+	exporter := telemetry.NewManager(holder, st.Pool)
+	exporter.Recorder = recorder
+	go exporter.Run(ctx)
 	live := metrics.NewLive()
 	nodeStore := metrics.NewNodeStore()
 	httpm := metrics.NewHTTP()
 	promReg := newMetrics(httpm, nodeStore, writer)
 	events := &metrics.Events{}
 	go watchConfigEpoch(ctx, holder, events)
-	gw.Usage = usage.MultiWriter{writer, lf, live}
+	gw.Usage = usage.MultiWriter{writer, exporter, live}
 	gw.CloudAuth = auth.NewCloudValidator(st.Pool).Validate
 
 	if cfg.AdminToken == "" {
 		slog.Warn("LLMR_ADMIN_TOKEN is not set; bootstrap admin login is disabled")
 	}
 	mg := &mgmt.Server{Store: st, AdminToken: cfg.AdminToken, EncryptionKey: cfg.EncryptionKey,
-		Snapshots: holder, Live: live, NodeStore: nodeStore, HTTP: httpm, Events: events, Recorder: recorder, Exporter: lf,
+		Snapshots: holder, Live: live, NodeStore: nodeStore, HTTP: httpm, Events: events, Recorder: recorder, Telemetry: exporter,
 		Gateway: gw, Version: version, Started: time.Now(), IDEOrigin: cfg.IDEOrigin}
 	mg.Register(mux)
 	go mg.SyncWorkspaceModels(ctx)
@@ -157,7 +161,7 @@ func run() error {
 	}
 	(&console.Auth{Store: st, EncryptionKey: cfg.EncryptionKey, CookieDomain: cfg.CookieDomain,
 		TrustedProxies: cfg.TrustedProxies}).Register(mux)
-	(&gwsync.Server{Store: st, Snapshots: holder, Limits: lim, Export: usage.MultiWriter{lf, live}, Nodes: nodeStore,
+	(&gwsync.Server{Store: st, Snapshots: holder, Limits: lim, Export: usage.MultiWriter{exporter, live}, Nodes: nodeStore,
 		Key: auth.DeriveKey("llmr-gw-session", cfg.EncryptionKey)}).Register(mux)
 	mux.Handle("/", console.SPA())
 

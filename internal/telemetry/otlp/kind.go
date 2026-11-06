@@ -1,0 +1,117 @@
+package otlp
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/url"
+	"strings"
+
+	"github.com/exitcodenihil/llm-router/internal/snapshot"
+	"github.com/exitcodenihil/llm-router/internal/telemetry"
+)
+
+// ConfigTraceLink is the optional link template to a trace in the backend's
+// UI, with {trace_id} in it.
+const ConfigTraceLink = "trace_link"
+
+// Kind is a generic OTLP/HTTP endpoint: a collector, Tempo, Honeycomb, ...
+type Kind struct{}
+
+func (Kind) Name() string           { return "otlp" }
+func (Kind) Label() string          { return "OpenTelemetry (OTLP/HTTP)" }
+func (Kind) Beta() bool             { return true }
+func (Kind) SecretFields() []string { return nil }
+
+func (Kind) Validate(d *snapshot.Destination) error {
+	if d.Endpoint == "" && d.TracesURL == "" {
+		return errors.New("endpoint is required")
+	}
+	if err := ValidateCommon(d); err != nil {
+		return err
+	}
+	for k := range d.Config {
+		if k != ConfigTraceLink {
+			return fmt.Errorf("unknown config field %q", k)
+		}
+	}
+	if l := d.Config[ConfigTraceLink]; l != "" {
+		if err := CheckURL("trace link", strings.ReplaceAll(l, "{trace_id}", "0")); err != nil {
+			return err
+		}
+		if !strings.Contains(l, "{trace_id}") {
+			return errors.New("trace link must contain {trace_id}")
+		}
+	}
+	return nil
+}
+
+func (Kind) New(d *snapshot.Destination) (telemetry.Sink, error) {
+	return &Sink{Client: NewClient(TracesURL(d, "/v1/traces"), d.Headers()), link: d.Config[ConfigTraceLink]}, nil
+}
+
+// Sink exports to an OTLP/HTTP endpoint with the builder and client. Other
+// kinds embed it with their own builder.
+type Sink struct {
+	Client  *Client
+	Builder Builder
+	link    string
+}
+
+func (s *Sink) Export(ctx context.Context, batch []*telemetry.Record) error {
+	return s.Client.Send(ctx, s.Builder.Build(batch))
+}
+
+func (s *Sink) TraceURL(context.Context) string { return s.link }
+
+// TracesURL is the destination's traces URL, else its endpoint plus path.
+func TracesURL(d *snapshot.Destination, path string) string {
+	if d.TracesURL != "" {
+		return d.TracesURL
+	}
+	return strings.TrimSuffix(d.Endpoint, "/") + path
+}
+
+// ValidateCommon checks what every OTLP-based kind shares: the URLs, the
+// content cap and the extra headers.
+func ValidateCommon(d *snapshot.Destination) error {
+	if d.Endpoint != "" {
+		if err := CheckURL("endpoint", d.Endpoint); err != nil {
+			return err
+		}
+	}
+	if d.TracesURL != "" {
+		if err := CheckURL("traces URL", d.TracesURL); err != nil {
+			return err
+		}
+	}
+	for name := range d.Headers() {
+		if err := CheckHeader(name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CheckURL accepts an absolute http or https URL.
+func CheckURL(what, s string) error {
+	u, err := url.Parse(s)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("%s must be an http:// or https:// URL", what)
+	}
+	return nil
+}
+
+// CheckHeader accepts a header name the client doesn't set itself.
+func CheckHeader(name string) error {
+	if name == "" || strings.ContainsFunc(name, func(r rune) bool {
+		return r <= ' ' || r >= 0x7f || strings.ContainsRune(`"(),/:;<=>?@[\]{}`, r)
+	}) {
+		return fmt.Errorf("invalid header name %q", name)
+	}
+	switch strings.ToLower(name) {
+	case "content-type", "content-encoding", "content-length", "host", "user-agent":
+		return fmt.Errorf("header %s is set by llm-router", name)
+	}
+	return nil
+}

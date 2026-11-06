@@ -60,7 +60,8 @@ func TestSyncAgainstPostgres(t *testing.T) {
 		GatewayGroups: map[string]*snapshot.GatewayGroup{groupID: {ID: groupID, Name: "test", AllowedTeams: map[string]bool{teamA: true}, DataRule: "inherit"}},
 	})
 	lim := limits.New()
-	s := &Server{Store: st, Snapshots: holder, Limits: lim, Key: auth.DeriveKey("llmr-gw-session", "test")}
+	exported := &collect{}
+	s := &Server{Store: st, Snapshots: holder, Limits: lim, Export: exported, Key: auth.DeriveKey("llmr-gw-session", "test")}
 	mux := http.NewServeMux()
 	s.Register(mux)
 	srv := httptest.NewServer(mux)
@@ -108,6 +109,16 @@ func TestSyncAgainstPostgres(t *testing.T) {
 	}
 	if n := rows(); n != 1 {
 		t.Fatalf("usage rows = %d, want 1: the resend must not count twice and team B's event is not this group's", n)
+	}
+	// Exported once, with the group the instance belongs to and a trace id
+	// stored with the row.
+	if len(exported.events) != 1 || exported.events[0].GatewayGroupID != groupID || !usage.ValidTraceID(exported.events[0].TraceID) {
+		t.Fatalf("exported %+v", exported.events)
+	}
+	var traceID string
+	st.Pool.QueryRow(ctx, `SELECT trace_id FROM usage_events WHERE request_id=$1`, exported.events[0].RequestID).Scan(&traceID)
+	if traceID != exported.events[0].TraceID {
+		t.Fatalf("stored trace id %q, exported %q", traceID, exported.events[0].TraceID)
 	}
 	var counters limits.Counters
 	json.Unmarshal(body, &counters)
@@ -211,3 +222,7 @@ func TestSyncAgainstPostgres(t *testing.T) {
 	}
 	st.Pool.Exec(ctx, `DELETE FROM gateway_groups WHERE id=$1`, groupID)
 }
+
+type collect struct{ events []usage.Event }
+
+func (c *collect) Write(e usage.Event) { c.events = append(c.events, e) }
