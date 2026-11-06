@@ -22,6 +22,7 @@ import type {
   Me,
   Node,
   NodesResponse,
+  NodesHistoryResponse,
   ObservabilityTest,
   Price,
   Provider,
@@ -780,6 +781,10 @@ export function useNodes() {
           uptime_s: num(n.uptime_s),
           cpu_pct: num(n.cpu_pct),
           mem_pct: num(n.mem_pct),
+          mem_bytes: num(n.mem_bytes),
+          mem_limit_bytes: num(n.mem_limit_bytes),
+          open_connections: num(n.open_connections),
+          in_flight: num(n.in_flight),
           rps: num(n.rps),
           p50_ms: num(n.p50_ms),
         })) as Node[],
@@ -789,6 +794,22 @@ export function useNodes() {
     refetchInterval: 10_000,
   });
 }
+// Each gateway's last hour, one sample per step (control-plane memory).
+export function useNodesHistory() {
+  return useQuery({
+    queryKey: ["nodes-history"],
+    queryFn: async () => {
+      const r = await api.get<NodesHistoryResponse>("/api/nodes/history");
+      return {
+        step_s: num(r.step_s) || 10,
+        window_s: num(r.window_s) || 3600,
+        gateways: r.gateways ?? [],
+      } satisfies NodesHistoryResponse;
+    },
+    refetchInterval: 10_000,
+  });
+}
+
 // cluster_events ride the /api/nodes response — no separate hook. Read
 // `useNodes().data?.cluster_events`.
 

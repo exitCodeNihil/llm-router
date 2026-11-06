@@ -6,6 +6,7 @@ import {
   BarChart,
   CartesianGrid,
   Cell,
+  Legend,
   Line,
   LineChart,
   ResponsiveContainer,
@@ -195,6 +196,69 @@ export function LatencyLine({
         <YAxis tick={axisTick} axisLine={false} tickLine={false} width={52} />
         <Tooltip content={<ChartTooltip />} cursor={{ stroke: chart.grid }} />
         <Line type="monotone" dataKey={yKey} stroke={chart.info} strokeWidth={2} dot={false} isAnimationActive={false} />
+      </LineChart>
+    </ResponsiveContainer>
+  );
+}
+
+/** Categorical hues for one line per series, from the Astryx data palette. */
+export const SERIES_COLORS = [
+  "var(--color-icon-blue)",
+  "var(--color-accent)",
+  "var(--color-icon-green)",
+  "var(--color-icon-purple)",
+  "var(--color-text-disabled)",
+];
+
+/**
+ * Lines over time, one per series. A missing value leaves a gap rather than
+ * a line drawn across it, so a gateway that stopped syncing shows as one.
+ */
+export function SeriesLines({
+  data,
+  xKey,
+  series,
+  formatValue = (v) => String(v),
+}: {
+  data: Array<Record<string, unknown>>;
+  xKey: string;
+  series: Array<{ key: string; name: string; color: string; isDashed?: boolean }>;
+  formatValue?: (v: number) => string;
+}) {
+  return (
+    <ResponsiveContainer width="100%" height="100%">
+      <LineChart data={data} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+        <CartesianGrid horizontal vertical={false} stroke={chart.grid} />
+        <XAxis dataKey={xKey} tick={axisTick} axisLine={false} tickLine={false} minTickGap={32} />
+        <YAxis
+          tick={axisTick}
+          axisLine={false}
+          tickLine={false}
+          width={64}
+          allowDecimals={false}
+          tickFormatter={(v) => formatValue(Number(v))}
+        />
+        <Tooltip
+          content={<ChartTooltip format={(v, name) => `${name}: ${formatValue(Number(v))}`} />}
+          cursor={{ stroke: chart.grid }}
+        />
+        {series.length > 1 && (
+          <Legend iconType="plainline" iconSize={12} wrapperStyle={{ fontSize: 11, color: chart.axis }} />
+        )}
+        {series.map((s) => (
+          <Line
+            key={s.key}
+            type="monotone"
+            dataKey={s.key}
+            name={s.name}
+            stroke={s.color}
+            strokeWidth={s.isDashed ? 1.5 : 2}
+            strokeDasharray={s.isDashed ? "4 4" : undefined}
+            dot={false}
+            connectNulls={false}
+            isAnimationActive={false}
+          />
+        ))}
       </LineChart>
     </ResponsiveContainer>
   );

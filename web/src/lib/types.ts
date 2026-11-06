@@ -432,8 +432,15 @@ export interface Node {
   version: string;
   version_skew: boolean;
   uptime_s: number;
+  /** CPU use against the node's CPU allowance. */
   cpu_pct: number;
+  /** Memory in use against the limit; 0 without a limit. */
   mem_pct: number;
+  mem_bytes: number;
+  /** 0: no memory limit. */
+  mem_limit_bytes: number;
+  open_connections: number;
+  in_flight: number;
   rps: number;
   p50_ms: number;
   last_seen: string | null;
@@ -447,6 +454,28 @@ export interface ClusterEvent {
 export interface NodesResponse {
   nodes: Node[];
   cluster_events: ClusterEvent[];
+}
+
+// ── Gateway history (GET /api/nodes/history, admin) ──────────────
+/** The peak of each value over one step. */
+export interface NodeSample {
+  ts: number; // unix seconds, the start of the step
+  open_connections: number;
+  in_flight: number;
+  mem_bytes: number;
+  mem_limit_bytes: number;
+}
+export interface NodeHistory {
+  id: string;
+  name: string;
+  group: string;
+  /** Oldest first; steps without a sync are missing. */
+  samples: NodeSample[];
+}
+export interface NodesHistoryResponse {
+  step_s: number;
+  window_s: number;
+  gateways: NodeHistory[];
 }
 
 export interface UsageSummary {
