@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Card } from "@astryxdesign/core/Card";
 import { Grid } from "@astryxdesign/core/Grid";
 import { HStack, VStack } from "@astryxdesign/core/Stack";
@@ -93,6 +93,21 @@ function scopeSummary(s: DestinationScope, noun: string, name: (v: string) => st
     : { short: `All ${noun}s except ${list}`, full: names.join(", ") };
 }
 
+/**
+ * A tooltip over plain text. The Tooltip opens on focus only for a focusable
+ * trigger, so the cell takes a tab stop and a name of its own; the tooltip
+ * then describes it.
+ */
+function CellTip({ content, label, children }: { content: ReactNode; label: string; children: ReactNode }) {
+  return (
+    <Tooltip content={content}>
+      <span tabIndex={0} role="group" aria-label={label} style={{ display: "flex", minWidth: 0, maxWidth: "100%" }}>
+        {children}
+      </span>
+    </Tooltip>
+  );
+}
+
 function StatusCell({ d }: { d: TelemetryDestination }) {
   // The row's own flag wins: right after a toggle the exporter may still
   // report the old worker's health until the config reloads. A destination
@@ -109,14 +124,17 @@ function StatusCell({ d }: { d: TelemetryDestination }) {
     `${int(h.delivered)} delivered, ${int(dropped)} dropped${h.queued ? `, ${int(h.queued)} queued` : ""} since start`,
   ].filter(Boolean) as string[];
   return (
-    <Tooltip content={<VStack gap={1}>{lines.map((l) => <span key={l}>{l}</span>)}</VStack>}>
+    <CellTip
+      label={`${d.name} status: ${s.label}`}
+      content={<VStack gap={1}>{lines.map((l) => <span key={l}>{l}</span>)}</VStack>}
+    >
       <HStack gap={1.5} vAlign="center">
         <StatusDot variant={s.variant} label={s.label} />
         <Text type="supporting" color={status === "failing" ? undefined : "secondary"}>
           {s.label}
         </Text>
       </HStack>
-    </Tooltip>
+    </CellTip>
   );
 }
 
@@ -202,12 +220,12 @@ function DestinationsCard({ policyCapturesContent }: { policyCapturesContent: bo
       renderCell: (d) => {
         const k = kindOf(d.kind);
         return (
-          <Tooltip content={k?.label ?? d.kind}>
+          <CellTip content={k?.label ?? d.kind} label={`Kind: ${d.kind}${k?.beta ? ", beta" : ""}`}>
             <HStack gap={1} vAlign="center">
               <Badge variant="neutral" label={d.kind} />
               {k?.beta && <Badge variant="info" label="Beta" />}
             </HStack>
-          </Tooltip>
+          </CellTip>
         );
       },
     },
@@ -246,7 +264,13 @@ function DestinationsCard({ policyCapturesContent }: { policyCapturesContent: bo
             </Text>
           </VStack>
         );
-        return full ? <Tooltip content={full}>{cell}</Tooltip> : cell;
+        return full ? (
+          <CellTip content={full} label={`Scope: ${t.short}; ${g.short}`}>
+            {cell}
+          </CellTip>
+        ) : (
+          cell
+        );
       },
     },
     {
@@ -276,12 +300,14 @@ function DestinationsCard({ policyCapturesContent }: { policyCapturesContent: bo
       renderCell: (d) => (
         <HStack gap={1} hAlign="end" vAlign="center">
           <Button
-            label="Test"
+            label={`Test ${d.name}`}
             variant="ghost"
             size="sm"
             isLoading={testing === d.id}
             onClick={() => runTest(d)}
-          />
+          >
+            Test
+          </Button>
           <IconButton
             label={`Edit ${d.name}`}
             variant="ghost"
