@@ -120,6 +120,12 @@ pub fn queued() -> usize {
     queue().lock().unwrap().len()
 }
 
+/// How many events the queue has room for without growing: memory it holds
+/// even when empty.
+pub fn capacity() -> usize {
+    queue().lock().unwrap().capacity()
+}
+
 // Anthropic's pricing rules on top of a model's rates (internal/pricing).
 const CACHE_WRITE_5M: f64 = 1.25;
 const CACHE_WRITE_1H: f64 = 2.0;

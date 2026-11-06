@@ -129,8 +129,12 @@ async fn dispatch(st: &'static State, req: Request<Incoming>) -> Response<Body> 
             }
         }
         (&Method::GET, "/metrics") => {
-            let body =
-                metrics::render(st.is_ready(), crate::usage::queued(), crate::usage::DROPPED.load(Ordering::Relaxed));
+            let body = metrics::render(
+                st.is_ready(),
+                crate::usage::queued(),
+                crate::usage::capacity(),
+                crate::usage::DROPPED.load(Ordering::Relaxed),
+            );
             let mut r = Response::new(Body::full(body));
             r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; version=0.0.4"));
             r

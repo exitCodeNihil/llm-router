@@ -68,7 +68,7 @@ pub fn latency(ms: i64) {
     LATENCY_SUM_MS.fetch_add(ms.max(0) as u64, Relaxed);
 }
 
-pub fn render(ready: bool, usage_queued: usize, usage_dropped: u64) -> String {
+pub fn render(ready: bool, usage_queued: usize, usage_capacity: usize, usage_dropped: u64) -> String {
     let mut s = String::with_capacity(4096);
     let mut gauge = |name: &str, help: &str, v: i64| {
         let _ = writeln!(s, "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {v}");
@@ -78,6 +78,7 @@ pub fn render(ready: bool, usage_queued: usize, usage_dropped: u64) -> String {
     gauge("llmr_config_version", "Config version in use", CONFIG_VERSION.load(Relaxed));
     gauge("llmr_workers", "Worker threads", WORKERS.load(Relaxed));
     gauge("llmr_usage_queued", "Usage events waiting for the next sync", usage_queued as i64);
+    gauge("llmr_usage_queue_capacity", "Usage events the queue holds memory for", usage_capacity as i64);
 
     let _ = writeln!(s, "# HELP llmr_requests_total Requests served\n# TYPE llmr_requests_total counter");
     for (r, route) in ROUTES.iter().enumerate() {
