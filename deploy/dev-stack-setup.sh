@@ -77,8 +77,9 @@ Settings → Cloud token auth → Add issuer:
   Type: Generic OIDC · Issuer URL: $Z · Audience: svc-caller
   Claim mapping: email claim "client_id", auto-create user ON
 
-Settings → Observability:
-  Host: http://localhost:3001 · Public key: pk-lf-dev-1234 · Secret key: sk-lf-dev-1234
+Observability → Add destination (after make stack-telemetry):
+  OTLP: endpoint http://localhost:4318 · Grafana http://localhost:3000
+  Langfuse: host http://localhost:3001 · public key pk-lf-dev-1234 · secret key sk-lf-dev-1234
   Langfuse UI: http://localhost:3001 (admin@example.com / Password1!)
 
 Token-exchange smoke test:

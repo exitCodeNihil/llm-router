@@ -34,6 +34,9 @@ services:
       # Registers the pass-through provider so Claude Code can use your own
       # claude.ai subscription through the gateway. Stores no credential.
       LLMR_SEED_CLAUDE_SUBSCRIPTION: ${LLMR_SEED_CLAUDE_SUBSCRIPTION:-1}
+      # Prometheus metrics on their own port, which is not published: add
+      # "127.0.0.1:9090:9090" to ports, or scrape from this network.
+      LLMR_METRICS_LISTEN: ":9090"
     depends_on:
       postgres:
         condition: service_healthy

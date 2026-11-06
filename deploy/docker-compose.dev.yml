@@ -90,10 +90,10 @@ services:
     image: docker.io/grafana/otel-lgtm:0.39.0
     profiles: [otel]
     ports:
-      - "3000:3000" # Grafana
-      - "3200:3200" # Tempo query API (end-to-end tests read traces back here)
-      - "4317:4317" # OTLP gRPC
-      - "4318:4318" # OTLP HTTP
+      - "127.0.0.1:3000:3000" # Grafana
+      - "127.0.0.1:3200:3200" # Tempo query API (end-to-end tests read traces back here)
+      - "127.0.0.1:4317:4317" # OTLP gRPC
+      - "127.0.0.1:4318:4318" # OTLP HTTP
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
@@ -200,7 +200,7 @@ services:
     profiles: [langfuse]
     depends_on: *langfuse-deps
     ports:
-      - "3001:3000"
+      - "127.0.0.1:3001:3000"
     environment:
       <<: *langfuse-env
       NEXTAUTH_SECRET: dev-nextauth-secret-0123456789abcdef
