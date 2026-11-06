@@ -221,7 +221,7 @@ async fn serve(
 #[derive(Clone, Copy)]
 struct Rq {
     trace: Trace,
-    operation: &'static str,
+    operation: telemetry::Operation,
 }
 
 /// Who a request says it is: a gateway key, resolved, or an identity token,

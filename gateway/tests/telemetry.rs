@@ -172,9 +172,9 @@ async fn captures_content_within_the_cap() {
                 assert_eq!(e.trace_id, 0x4bf92f3577b34da6a3ce929d0e0e4736, "{what}");
                 assert_eq!(e.parent_span_id, 0x00f067aa0ba902b7, "{what}");
                 assert!(e.export && e.capture_content && e.rule_id.is_none(), "{what}");
-                assert_eq!((e.operation, e.cost_basis), ("chat", 1), "{what}");
+                assert_eq!((e.operation.as_str(), e.cost_basis), ("chat", 1), "{what}");
                 if flavor == "anthropic" {
-                    assert_eq!(e.inference_geo.as_str(), "us", "{what}");
+                    assert_eq!(e.reported.as_ref().unwrap().inference_geo.as_str(), "us", "{what}");
                 }
                 let c = e.content.as_ref().unwrap_or_else(|| panic!("{what}: no content"));
                 // the request's own bytes, spaces and all

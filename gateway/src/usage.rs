@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::value::RawValue;
 
 use crate::config::{AuthMode, Config, Deployment, Key, Price};
-use crate::telemetry::{self, Trace, Verdict};
+use crate::telemetry::{self, Operation, Trace, Verdict};
 use crate::translate::{Tag, Usage};
 use crate::{limits, metrics};
 
@@ -59,11 +59,11 @@ pub struct Event {
     #[serde(skip_serializing_if = "is_zero_u64", serialize_with = "hex_span")]
     pub parent_span_id: u64,
     /// gen_ai.operation.name.
-    pub operation: &'static str,
-    #[serde(skip_serializing_if = "Tag::is_empty")]
-    pub inference_geo: Tag,
-    #[serde(skip_serializing_if = "Tag::is_empty")]
-    pub speed: Tag,
+    pub operation: Operation,
+    /// inference_geo and speed, boxed: most upstreams report neither, and
+    /// every queued event would carry their room.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub reported: Option<Box<Reported>>,
     /// The pricing cost_usd was computed with (usage.CostBasisCurrent).
     #[serde(skip_serializing_if = "is_zero_u8")]
     pub cost_basis: u8,
@@ -78,6 +78,15 @@ pub struct Event {
     /// Captured content: only when the verdict captures it.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub content: Option<Box<Content>>,
+}
+
+/// What an Anthropic upstream reported about where and how it served a request.
+#[derive(Debug, Default, Serialize)]
+pub struct Reported {
+    #[serde(skip_serializing_if = "Tag::is_empty")]
+    pub inference_geo: Tag,
+    #[serde(skip_serializing_if = "Tag::is_empty")]
+    pub speed: Tag,
 }
 
 /// A request's captured content, each part within the capture cap: input
@@ -242,11 +251,14 @@ fn batch_len(sizes: impl Iterator<Item = usize>, max_events: usize, max_bytes: u
 impl Event {
     /// About how many bytes the event takes as JSON: the fixed fields plus
     /// its strings and content. An estimate for sizing batches, not an exact
-    /// count, but never under for content, which is most of a large event.
+    /// count: the batch cap's 2x margin covers numbers far longer than real
+    /// ones, but content, most of a large event, is never underestimated.
     pub fn encoded_size(&self) -> usize {
         self.content.as_ref().map_or(0, |c| c.encoded_size())
-            + self.rule_id.as_ref().map_or(0, |r| r.len())
-            + 900
+            + self.rule_id.as_ref().map_or(0, |r| r.len() + 14)
+            + self.reported.as_ref().map_or(0, |_| 100)
+            + if self.parent_span_id != 0 { 38 } else { 0 }
+            + 560
             + self.request_id.len()
             + self.api_key_id.len()
             + self.user_id.len()
@@ -346,7 +358,7 @@ pub struct Emit {
     pub deployment: Option<Arc<Deployment>>,
     pub attempts: i64,
     pub trace: Trace,
-    pub operation: &'static str,
+    pub operation: Operation,
     pub verdict: Verdict,
     /// The request's content, once captured; the response text joins it at send.
     pub content: Option<Box<Content>>,
@@ -548,8 +560,8 @@ impl Emit {
             trace_id: self.trace.id,
             parent_span_id: self.trace.parent,
             operation: self.operation,
-            inference_geo: u.geo,
-            speed: u.speed,
+            reported: (!u.geo.is_empty() || !u.speed.is_empty())
+                .then(|| Box::new(Reported { inference_geo: u.geo, speed: u.speed })),
             cost_basis: 0,
             export: self.verdict.decision.export,
             capture_content: self.verdict.decision.capture_content,
@@ -654,10 +666,52 @@ mod tests {
         assert_eq!(queued_content(), left);
     }
 
-    /// Batches stay under the control plane's 32 MiB limit only if no event
-    /// is larger than its estimate, content included.
+    /// Batches stay under the control plane's 32 MiB limit only if events
+    /// are no larger than their estimate, content included: ordinary ones
+    /// not at all, and ones with every number at its longest by under 2x,
+    /// the batch cap's margin.
     #[test]
     fn size_estimates_cover_content() {
+        let ordinary = Event {
+            request_id: "req_0123456789abcdef".into(),
+            api_key_id: "4b7c3a1e-0000-4000-8000-000000000000".into(),
+            user_id: "4b7c3a1e-0000-4000-8000-000000000001".into(),
+            team_id: "4b7c3a1e-0000-4000-8000-000000000002".into(),
+            deployment_id: "4b7c3a1e-0000-4000-8000-000000000003".into(),
+            provider_id: "4b7c3a1e-0000-4000-8000-000000000004".into(),
+            model_name: "claude-sonnet-4-5-20250929".into(),
+            ts_ms: 1_793_975_436_295,
+            prompt_tokens: 1_234_567,
+            completion_tokens: 123_456,
+            cached_tokens: 1_000_000,
+            cache_write_5m: 200_000,
+            cache_write_1h: 30_000,
+            cost_usd: 0.123456789012345,
+            notional_cost_usd: 1.23456789012345,
+            unpriced: true,
+            latency_ms: 123_456,
+            attempts: 3,
+            ttft_ms: 12_345,
+            error_code: "upstream_rate_limited",
+            trace_id: u128::MAX,
+            parent_span_id: u64::MAX,
+            operation: Operation::TextCompletion,
+            reported: Some(Box::new(Reported {
+                inference_geo: Tag::new(&"g".repeat(40)),
+                speed: Tag::new("standard"),
+            })),
+            cost_basis: 1,
+            export: true,
+            capture_content: true,
+            rule_id: Some("4b7c3a1e-0000-4000-8000-000000000005".into()),
+            stream: true,
+            ..event("")
+        };
+        let actual = serde_json::to_vec(&ordinary).unwrap().len();
+        assert!(ordinary.encoded_size() >= actual, "estimate {} < actual {actual}", ordinary.encoded_size());
+        let actual = serde_json::to_vec(&event("plain")).unwrap().len();
+        assert!(event("plain").encoded_size() >= actual);
+
         let nasty = "\"\\\u{1}\n<é>".repeat(5000);
         let input =
             serde_json::to_string(&vec![serde_json::json!({"role": "user", "content": nasty.clone()}); 3]).unwrap();
@@ -684,9 +738,11 @@ mod tests {
                 error_code: "upstream_rate_limited",
                 trace_id: u128::MAX,
                 parent_span_id: u64::MAX,
-                operation: "text_completion",
-                inference_geo: Tag::new(&"g".repeat(40)),
-                speed: Tag::new("standard"),
+                operation: Operation::TextCompletion,
+                reported: Some(Box::new(Reported {
+                    inference_geo: Tag::new(&"g".repeat(40)),
+                    speed: Tag::new("standard"),
+                })),
                 cost_basis: 1,
                 export: true,
                 capture_content: true,
@@ -696,7 +752,8 @@ mod tests {
             },
         ] {
             let actual = serde_json::to_vec(&e).unwrap().len();
-            assert!(e.encoded_size() >= actual, "estimate {} < actual {actual}", e.encoded_size());
+            let content = e.content.as_ref().map_or(0, |c| c.encoded_size());
+            assert!(2 * e.encoded_size() - content >= actual, "estimate {} vs actual {actual}", e.encoded_size());
         }
     }
 
@@ -704,8 +761,8 @@ mod tests {
     fn serializes_trace_and_content() {
         let e = Event {
             trace_id: 0x4bf92f3577b34da6a3ce929d0e0e4736,
-            operation: "chat",
-            inference_geo: Tag::new("us"),
+            operation: Operation::Chat,
+            reported: Some(Box::new(Reported { inference_geo: Tag::new("us"), ..Reported::default() })),
             rule_id: Some("r1".into()),
             export: true,
             content: content(r#"[{"role":"user","content":"hi"}]"#, None, "answer"),

@@ -388,14 +388,39 @@ fn hex_n(s: &[u8]) -> Option<u128> {
     Some(n)
 }
 
-/// gen_ai.operation.name for a route.
-pub fn operation(path: &str) -> &'static str {
+/// gen_ai.operation.name, one byte on a queued event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Operation {
+    #[default]
+    Chat,
+    TextCompletion,
+    Embeddings,
+}
+
+impl Operation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Operation::Chat => "chat",
+            Operation::TextCompletion => "text_completion",
+            Operation::Embeddings => "embeddings",
+        }
+    }
+}
+
+impl serde::Serialize for Operation {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+/// The operation of a route.
+pub fn operation(path: &str) -> Operation {
     if path.ends_with("/embeddings") {
-        "embeddings"
+        Operation::Embeddings
     } else if path.ends_with("/v1/completions") {
-        "text_completion"
+        Operation::TextCompletion
     } else {
-        "chat"
+        Operation::Chat
     }
 }
 
@@ -587,9 +612,9 @@ mod tests {
 
     #[test]
     fn operations() {
-        assert_eq!(operation("/v1/embeddings"), "embeddings");
-        assert_eq!(operation("/v1/completions"), "text_completion");
-        assert_eq!(operation("/v1/chat/completions"), "chat");
-        assert_eq!(operation("/v1/messages"), "chat");
+        assert_eq!(operation("/v1/embeddings").as_str(), "embeddings");
+        assert_eq!(operation("/v1/completions").as_str(), "text_completion");
+        assert_eq!(operation("/v1/chat/completions").as_str(), "chat");
+        assert_eq!(operation("/v1/messages").as_str(), "chat");
     }
 }
