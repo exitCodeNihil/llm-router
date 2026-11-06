@@ -78,7 +78,7 @@ gateway:
       cpu: 250m
       memory: 128Mi
   # On scale-in or rollout: keep accepting for preStopSleepSeconds while the pod
-  # leaves the Service (0 turns this off; needs Kubernetes 1.30+), then finish
+  # leaves the Service (0 turns this off; left out before Kubernetes 1.30), then finish
   # requests in flight (LLMR_SHUTDOWN_TIMEOUT, 30 s) and upload the last usage.
   preStopSleepSeconds: 5
   terminationGracePeriodSeconds: 50

@@ -66,7 +66,7 @@ spec:
           {{- end }}
           readinessProbe:
             httpGet: {path: /healthz, port: 8080}
-          {{- if .Values.gateway.preStopSleepSeconds }}
+          {{- if and .Values.gateway.preStopSleepSeconds (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) }}
           # Keep accepting while the endpoint is removed from Services, so a
           # scale-in or rollout refuses no connections.
           lifecycle:
