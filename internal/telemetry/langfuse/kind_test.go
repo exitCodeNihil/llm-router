@@ -158,6 +158,8 @@ func TestValidate(t *testing.T) {
 		"no public key": func(d *snapshot.Destination) { delete(d.Config, ConfigPublicKey) },
 		"no secret":     func(d *snapshot.Destination) { delete(d.Secrets, SecretKey) },
 		"bad ui url":    func(d *snapshot.Destination) { d.Config[ConfigUIURL] = "langfuse" },
+		"host userinfo": func(d *snapshot.Destination) { d.Endpoint = "https://pk:sk@cloud.langfuse.com" },
+		"ui userinfo":   func(d *snapshot.Destination) { d.Config[ConfigUIURL] = "https://a:b@langfuse.example.com" },
 		"own auth":      func(d *snapshot.Destination) { d.Secrets["header:Authorization"] = "x" },
 	} {
 		d := ok()

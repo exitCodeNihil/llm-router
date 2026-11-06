@@ -123,6 +123,10 @@ func TestKindValidate(t *testing.T) {
 		{snapshot.Destination{Endpoint: "https://x", Secrets: map[string]string{"header:X-Scope-OrgID": "a"}}, true},
 		{snapshot.Destination{Endpoint: "https://x", Secrets: map[string]string{"header:Content-Type": "a"}}, false},
 		{snapshot.Destination{Endpoint: "https://x", Secrets: map[string]string{"header:Bad Name": "a"}}, false},
+		// Credentials go in headers, not URLs.
+		{snapshot.Destination{Endpoint: "https://user:pass@x"}, false},
+		{snapshot.Destination{Endpoint: "https://x", TracesURL: "https://token@x/v1/traces"}, false},
+		{snapshot.Destination{Endpoint: "https://x", Config: map[string]string{"trace_link": "https://u:p@grafana/{trace_id}"}}, false},
 	} {
 		if err := (Kind{}).Validate(&c.d); (err == nil) != c.ok {
 			t.Errorf("%+v: %v", c.d, err)

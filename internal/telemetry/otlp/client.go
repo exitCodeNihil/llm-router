@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -75,7 +76,7 @@ func (c *Client) Send(ctx context.Context, msg proto.Message) error {
 		return err
 	}
 	c.plain.Store(true)
-	slog.Info("telemetry destination refused gzip; sending uncompressed from now on", "url", c.URL, "status", xe.Status)
+	slog.Info("telemetry destination refused gzip; sending uncompressed from now on", "url", Redact(c.URL), "status", xe.Status)
 	return nil
 }
 
@@ -92,7 +93,7 @@ func refusesEncoding(status int) bool {
 func (c *Client) post(ctx context.Context, body []byte, gz bool) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.URL, bytes.NewReader(body))
 	if err != nil {
-		return &telemetry.ExportError{Msg: err.Error()}
+		return &telemetry.ExportError{Msg: "invalid URL " + Redact(c.URL)}
 	}
 	for k, v := range c.Headers {
 		req.Header.Set(k, v)
@@ -106,6 +107,10 @@ func (c *Client) post(ctx context.Context, body []byte, gz bool) error {
 	if err != nil {
 		// Timeouts, refused connections, TLS and DNS failures may all pass;
 		// only our own cancellation won't.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			ue.URL = Redact(ue.URL)
+		}
 		return &telemetry.ExportError{Retryable: ctx.Err() == nil, Msg: err.Error()}
 	}
 	defer resp.Body.Close()
@@ -148,10 +153,10 @@ func snippet(b []byte) string {
 }
 
 // logPartial logs spans an OTLP backend accepted the request but refused.
-func logPartial(url, ctype string, body []byte) {
+func logPartial(u, ctype string, body []byte) {
 	rejected, msg := partialSuccess(ctype, body)
 	if rejected > 0 || msg != "" {
-		slog.Warn("telemetry destination refused part of a batch", "url", url, "rejected_spans", rejected, "message", msg)
+		slog.Warn("telemetry destination refused part of a batch", "url", Redact(u), "rejected_spans", rejected, "message", msg)
 	}
 }
 

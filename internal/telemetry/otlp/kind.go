@@ -93,13 +93,32 @@ func ValidateCommon(d *snapshot.Destination) error {
 	return nil
 }
 
-// CheckURL accepts an absolute http or https URL.
+// CheckURL accepts an absolute http or https URL without credentials in it.
 func CheckURL(what, s string) error {
 	u, err := url.Parse(s)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return fmt.Errorf("%s must be an http:// or https:// URL", what)
 	}
+	if u.User != nil {
+		return fmt.Errorf("%s must not contain a user name or password: send credentials in a header", what)
+	}
 	return nil
+}
+
+// Redact is a URL fit for logs and error messages: no credentials and no
+// query string, which may carry a token.
+func Redact(s string) string {
+	u, err := url.Parse(s)
+	if err != nil {
+		s, _, _ = strings.Cut(s, "?")
+		return s
+	}
+	u.User = nil
+	if u.RawQuery != "" || u.ForceQuery {
+		u.RawQuery, u.ForceQuery = "redacted", false
+	}
+	u.Fragment, u.RawFragment = "", ""
+	return u.String()
 }
 
 // CheckHeader accepts a header name the client doesn't set itself.

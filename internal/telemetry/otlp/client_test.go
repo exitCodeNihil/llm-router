@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -186,5 +187,19 @@ func TestPartialSuccess(t *testing.T) {
 	defer srv.Close()
 	if err := NewClient(srv.URL, nil).Send(context.Background(), payload()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A URL's query string may hold a token: errors and logs leave it out.
+func TestErrorsRedactTheQuery(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	u := srv.URL + "/v1/traces?api_key=s3cret"
+	srv.Close()
+	err := NewClient(u, nil).Send(context.Background(), payload())
+	if err == nil || strings.Contains(err.Error(), "s3cret") || !strings.Contains(err.Error(), "/v1/traces") {
+		t.Fatalf("err %v", err)
+	}
+	if r := Redact("https://u:p@x.example.com/p?token=1#f"); r != "https://x.example.com/p?redacted" {
+		t.Errorf("redact %s", r)
 	}
 }
