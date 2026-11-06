@@ -196,6 +196,9 @@ func buildConfig(s *snapshot.Snapshot, g *snapshot.GatewayGroup, schema int) bui
 	providers := map[string]*snapshot.Provider{}
 	for _, name := range names {
 		for _, d := range routingOrder(s.DeploymentsByModel[name], g.Region) {
+			if !servable(d.Provider, schema) {
+				continue
+			}
 			providers[d.Provider.ID] = d.Provider
 			c.Deployments = append(c.Deployments, Deployment{ID: d.ID, ProviderID: d.Provider.ID,
 				ModelName: d.ModelName, UpstreamName: d.UpstreamName, APIFlavor: d.APIFlavor, TimeoutMS: d.TimeoutMS,
@@ -224,6 +227,21 @@ func buildConfig(s *snapshot.Snapshot, g *snapshot.GatewayGroup, schema int) bui
 	sort.Slice(c.Teams, func(i, j int) bool { return c.Teams[i].ID < c.Teams[j].ID })
 	sort.Slice(c.Providers, func(i, j int) bool { return c.Providers[i].ID < c.Providers[j].ID })
 	return b
+}
+
+// servable reports whether a gateway speaking schema can serve p. Schema 1
+// gateways (0.2.x) mint no Google or Entra tokens and know no Vertex URLs, so
+// they get neither these providers nor their deployments, and never hold a
+// service account key they can't use.
+func servable(p *snapshot.Provider, schema int) bool {
+	if schema >= 2 {
+		return true
+	}
+	switch p.AuthMode {
+	case "entra", "gcp_adc", "gcp_sa":
+		return false
+	}
+	return p.Type != "gcp_vertex"
 }
 
 // routingOrder puts the deployments in the group's region first, keeping the

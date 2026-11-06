@@ -107,6 +107,50 @@ func TestConfigForOneTeam(t *testing.T) {
 	}
 }
 
+// Vertex and Entra providers need schema 2: a 0.2.x gateway can't mint their
+// tokens, so it must get neither their deployments nor the service account key.
+func TestConfigCloudProvidersNeedSchema2(t *testing.T) {
+	s := fixture()
+	vertex := &snapshot.Provider{ID: "pv", Name: "vertex", Type: "gcp_vertex", AuthMode: "gcp_sa",
+		APIKey: `{"type":"service_account","private_key":"sa-secret"}`, Project: "proj-1", Location: "us-east5"}
+	adc := &snapshot.Provider{ID: "pg", Name: "adc", Type: "gcp_vertex", AuthMode: "gcp_adc", Project: "proj-1"}
+	entra := &snapshot.Provider{ID: "pz", Name: "foundry", Type: "azure", AuthMode: "entra", BaseURL: "https://r.openai.azure.com"}
+	s.DeploymentsByModel["claude"] = []*snapshot.Deployment{
+		{ID: "d-vertex", Provider: vertex, ModelName: "claude", UpstreamName: "claude-sonnet-4-5@20250929", APIFlavor: "anthropic"},
+		{ID: "d-entra", Provider: entra, ModelName: "claude", UpstreamName: "claude-sonnet-4-5", APIFlavor: "anthropic"},
+	}
+	s.DeploymentsByModel["gemini"] = []*snapshot.Deployment{
+		{ID: "d-adc", Provider: adc, ModelName: "gemini", UpstreamName: "google/gemini-2.5-flash"},
+	}
+	g := &snapshot.GatewayGroup{ID: "g", Name: "all"}
+
+	old := buildConfig(s, g, 1)
+	raw, _ := json.Marshal(old.cfg)
+	for _, leak := range []string{"sa-secret", "proj-1", "d-vertex", "d-entra", "d-adc", `"claude"`, `"gemini"`} {
+		if strings.Contains(string(raw), leak) {
+			t.Errorf("schema 1 config carries %s: %s", leak, raw)
+		}
+	}
+	if len(old.cfg.Deployments) != 3 || len(old.cfg.Providers) != 3 {
+		t.Errorf("schema 1 keeps the providers it can serve: %+v", old.cfg.Providers)
+	}
+
+	cur := buildConfig(s, g, schemaVersion)
+	got := map[string]Provider{}
+	for _, p := range cur.cfg.Providers {
+		got[p.ID] = p
+	}
+	if p := got["pv"]; p.APIKey != vertex.APIKey || p.Project != "proj-1" || p.Location != "us-east5" || p.AuthMode != "gcp_sa" {
+		t.Errorf("schema 2 vertex provider = %+v", p)
+	}
+	if got["pg"].AuthMode != "gcp_adc" || got["pz"].AuthMode != "entra" || got["pz"].APIKey != "" {
+		t.Errorf("schema 2 providers = %+v", cur.cfg.Providers)
+	}
+	if len(cur.cfg.Deployments) != 6 {
+		t.Errorf("schema 2 serves every deployment: %+v", cur.cfg.Deployments)
+	}
+}
+
 func TestConfigRegionFirst(t *testing.T) {
 	b := buildConfig(fixture(), &snapshot.GatewayGroup{ID: "g", Name: "eu", Region: "eu"}, schemaVersion)
 	if b.cfg.Deployments[0].ID != "d-a-eu" || b.cfg.Deployments[1].ID != "d-a-us" {
