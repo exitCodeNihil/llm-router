@@ -87,22 +87,56 @@ type sink struct {
 	otlp.Sink
 	host, ui, auth string
 
-	mu      sync.Mutex
-	link    string
-	checked time.Time
+	mu        sync.Mutex
+	link      string
+	checked   time.Time
+	resolving bool
 }
 
-// TraceURL needs the project id, which only Langfuse knows: it is looked up
-// once, and a failed lookup is retried after a minute.
-func (s *sink) TraceURL(ctx context.Context) string {
+// TraceURL needs the project id, which only Langfuse knows. It is looked up
+// in the background, so a dead host never holds up a caller: "" until it is
+// known, and a failed lookup is retried after a minute.
+func (s *sink) TraceURL(context.Context) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.link != "" || time.Since(s.checked) < time.Minute {
-		return s.link
+	if s.link == "" && !s.resolving && time.Since(s.checked) >= time.Minute {
+		s.resolving, s.checked = true, time.Now()
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			link := s.lookup(ctx)
+			s.mu.Lock()
+			s.resolving = false
+			if link != "" {
+				s.link = link
+			}
+			s.mu.Unlock()
+		}()
 	}
-	s.checked = time.Now()
+	return s.link
+}
+
+// WaitTraceURL looks the link up now if it isn't known yet.
+func (s *sink) WaitTraceURL(ctx context.Context) string {
+	s.mu.Lock()
+	link := s.link
+	s.mu.Unlock()
+	if link != "" {
+		return link
+	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+	if link = s.lookup(ctx); link != "" {
+		s.mu.Lock()
+		s.link = link
+		s.mu.Unlock()
+	}
+	return link
+}
+
+// lookup asks Langfuse for the key pair's project and builds the link; ""
+// when it can't. It holds no lock.
+func (s *sink) lookup(ctx context.Context) string {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.host+"/api/public/projects", nil)
 	if err != nil {
 		return ""
@@ -123,8 +157,7 @@ func (s *sink) TraceURL(ctx context.Context) string {
 	if base == "" {
 		base = s.host
 	}
-	s.link = base + "/project/" + out.Data[0].ID + "/traces/{trace_id}"
-	return s.link
+	return base + "/project/" + out.Data[0].ID + "/traces/{trace_id}"
 }
 
 // Langfuse attributes (langfuse.com/integrations/native/opentelemetry).

@@ -484,9 +484,7 @@ func (m *Server) destinations(ctx context.Context, id string) ([]destinationView
 			}
 		}
 		if m.Telemetry != nil {
-			tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			v.TraceURL = m.Telemetry.TraceURL(tctx, v.ID)
-			cancel()
+			v.TraceURL = m.Telemetry.TraceURL(ctx, v.ID) // doesn't wait on the backend
 		}
 	}
 	return out, nil

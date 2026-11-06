@@ -30,8 +30,17 @@ type Sink interface {
 	// Export sends one batch. A failure the queue may retry or split is an
 	// *ExportError.
 	Export(ctx context.Context, batch []*Record) error
-	// TraceURL is a link to a trace with {trace_id} in it; "" = none.
+	// TraceURL is a link to a trace with {trace_id} in it; "" = none, or
+	// not known yet. It must not wait on the backend: the console's list
+	// calls it.
 	TraceURL(ctx context.Context) string
+}
+
+// TraceURLWaiter is a Sink whose trace link takes a lookup, which
+// WaitTraceURL makes now instead of in the background, for a test someone is
+// waiting on.
+type TraceURLWaiter interface {
+	WaitTraceURL(ctx context.Context) string
 }
 
 // ExportError is a failed export, classified for the queue.

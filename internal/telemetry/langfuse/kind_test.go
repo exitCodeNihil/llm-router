@@ -129,8 +129,19 @@ func TestExportAndTraceURL(t *testing.T) {
 	if got == nil || got.ResourceSpans[0].ScopeSpans[0].Spans[0].Name != "chat claude-sonnet-5-5" {
 		t.Fatalf("got %v", got)
 	}
-	if u := s.TraceURL(context.Background()); u != "https://langfuse.example.com/project/proj1/traces/{trace_id}" {
+	const link = "https://langfuse.example.com/project/proj1/traces/{trace_id}"
+	// Looked up in the background: "" until known.
+	u := s.TraceURL(context.Background())
+	for deadline := time.Now().Add(2 * time.Second); u == "" && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+		u = s.TraceURL(context.Background())
+	}
+	if u != link {
 		t.Errorf("trace URL %q", u)
+	}
+	s2, _ := Kind{}.New(d)
+	if u := s2.(telemetry.TraceURLWaiter).WaitTraceURL(context.Background()); u != link {
+		t.Errorf("waited-for trace URL %q", u)
 	}
 
 	// The wrong key pair is refused, not retried.
@@ -140,8 +151,26 @@ func TestExportAndTraceURL(t *testing.T) {
 	if xe, ok := err.(*telemetry.ExportError); !ok || xe.Status != 401 || xe.Retryable {
 		t.Errorf("err %v", err)
 	}
-	if u := s.TraceURL(context.Background()); u != "" {
+	if u := s.(telemetry.TraceURLWaiter).WaitTraceURL(context.Background()); u != "" {
 		t.Errorf("trace URL with a bad key: %q", u)
+	}
+}
+
+// A Langfuse that doesn't answer never holds up the caller of TraceURL: the
+// console's destination list calls it.
+func TestTraceURLDoesNotWait(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-release }))
+	defer srv.Close()
+	defer close(release)
+	d := &snapshot.Destination{Kind: "langfuse", Endpoint: srv.URL,
+		Config: map[string]string{ConfigPublicKey: "pk"}, Secrets: map[string]string{SecretKey: "sk"}}
+	s, _ := Kind{}.New(d)
+	for range 3 {
+		start := time.Now()
+		if u := s.TraceURL(context.Background()); u != "" || time.Since(start) > 100*time.Millisecond {
+			t.Fatalf("TraceURL %q after %v", u, time.Since(start))
+		}
 	}
 }
 

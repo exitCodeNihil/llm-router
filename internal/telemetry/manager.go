@@ -414,7 +414,13 @@ func Test(ctx context.Context, d *snapshot.Destination) TestResult {
 		return res
 	}
 	res := TestResult{OK: true, Detail: "the destination accepted a test span"}
-	if t := slot.s.TraceURL(ctx); t != "" {
+	t := ""
+	if wt, ok := slot.s.(TraceURLWaiter); ok {
+		t = wt.WaitTraceURL(ctx)
+	} else {
+		t = slot.s.TraceURL(ctx)
+	}
+	if t != "" {
 		res.TraceURL = strings.ReplaceAll(t, "{trace_id}", r.E.TraceID)
 	}
 	return res
