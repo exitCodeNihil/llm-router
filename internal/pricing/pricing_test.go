@@ -123,7 +123,7 @@ func TestAnthropicCatalog(t *testing.T) {
 		"claude-opus-4-7":            {5, 25, 0.5},
 		"claude-opus-4-6":            {5, 25, 0.5},
 		"claude-opus-4-5-20251101":   {5, 25, 0.5},
-		"claude-sonnet-5-5":          {2, 10, 0.1},
+		"claude-sonnet-5-5":          {2, 10, 0.2},
 		"claude-sonnet-5":            {2, 10, 0.2},
 		"claude-sonnet-4-6":          {3, 15, 0.3},
 		"claude-sonnet-4-5-20250929": {3, 15, 0.3},
