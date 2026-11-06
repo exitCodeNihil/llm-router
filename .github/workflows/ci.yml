@@ -30,7 +30,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
-      - run: go test -p 1 ./internal/gwsync ./internal/mgmt
+      - run: go test -p 1 ./internal/... ./cmd/...
         env:
           LLMR_TEST_DATABASE_URL: postgres://t:t@127.0.0.1:5432/t?sslmode=disable
 
