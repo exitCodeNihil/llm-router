@@ -77,6 +77,37 @@ gateway:
     requests:
       cpu: 250m
       memory: 128Mi
+  # Scale gateways on CPU (needs metrics-server and a CPU request). Gateways
+  # scale horizontally; the control plane does not (see replicas above).
+  # Past saturation a gateway's memory grows with its open connections, so set
+  # a memory limit too and scale before CPU runs out.
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+# Prometheus metrics (docs/monitoring.md). Gateways serve /metrics on their
+# traffic port; the control plane serves it on its own port, which the
+# ingress does not route, so the console's host never exposes it.
+metrics:
+  port: 9090         # the control plane's metrics port; 0 serves /metrics on 8080
+  # prometheus.io/scrape, /port and /path annotations on both pods.
+  podAnnotations: true
+  # PodMonitors for the Prometheus Operator: the control plane and every gateway.
+  podMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}       # e.g. release: kube-prometheus-stack, to match your Prometheus
+  # Alerting rules for the Prometheus Operator.
+  prometheusRule:
+    enabled: false
+    labels: {}
+    # Series these alerts look at; default: namespace="<this release's namespace>".
+    selector: ""
+    gatewayMemoryRatio: 0.85   # of the gateway's memory limit
+    errorRatio: 0.05           # 5xx share of /v1 requests
+    notSyncingSeconds: 30
 
 # Extra env and volumes for the llm-router container.
 extraEnv: []

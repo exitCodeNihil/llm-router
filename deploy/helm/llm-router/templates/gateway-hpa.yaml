@@ -1,0 +1,29 @@
+{{- if and .Values.gateway.enabled .Values.gateway.autoscaling.enabled }}
+{{- $a := .Values.gateway.autoscaling }}
+{{- if not (dig "requests" "cpu" "" .Values.gateway.resources) }}
+{{- fail "gateway.autoscaling needs gateway.resources.requests.cpu: CPU utilization is measured against the request" }}
+{{- end }}
+# Gateways scale horizontally: each one joins the group and shares limits
+# through the control plane, which stays a single replica.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ .Release.Name }}-llm-router-gateway
+  labels:
+    app.kubernetes.io/name: llm-router-gateway
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ .Release.Name }}-llm-router-gateway
+  minReplicas: {{ $a.minReplicas }}
+  maxReplicas: {{ $a.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $a.targetCPUUtilizationPercentage }}
+{{- end }}

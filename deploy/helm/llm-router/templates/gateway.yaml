@@ -18,12 +18,20 @@ metadata:
     app.kubernetes.io/name: llm-router-gateway
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
+  {{- if not .Values.gateway.autoscaling.enabled }}
   replicas: {{ .Values.gateway.replicas }}
+  {{- end }}
   selector:
     matchLabels: *labels
   template:
     metadata:
       labels: *labels
+      {{- if .Values.metrics.podAnnotations }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+      {{- end }}
     spec:
       serviceAccountName: {{ include "llm-router.gatewayServiceAccountName" . }}
       containers:
@@ -31,7 +39,8 @@ spec:
           image: "{{ .Values.gateway.image.repository }}:{{ .Values.gateway.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
           ports:
-            - containerPort: 8080
+            - name: http
+              containerPort: 8080
           env:
             - name: LLMR_CONTROL_PLANE_URL
               value: {{ .Values.gateway.controlPlaneUrl | default (printf "http://%s-llm-router:%v" .Release.Name .Values.service.port) | quote }}
