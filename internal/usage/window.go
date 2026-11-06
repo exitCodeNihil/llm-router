@@ -55,7 +55,7 @@ func Sanitize(e *Event) int {
 	for _, f := range []struct {
 		s *string
 		n int
-	}{{&e.RequestID, 64}, {&e.ModelName, 256}, {&e.ErrorCode, 64}, {&e.InferenceGeo, 32}, {&e.Speed, 32}} {
+	}{{&e.RequestID, 64}, {&e.ModelName, 256}, {&e.ErrorCode, 64}, {&e.InferenceGeo, 32}, {&e.Speed, 32}, {&e.Operation, 32}} {
 		v := *f.s
 		if strings.ContainsRune(v, 0) || !utf8.ValidString(v) {
 			v = strings.ToValidUTF8(strings.ReplaceAll(v, "\x00", ""), "")
