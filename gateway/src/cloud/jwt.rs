@@ -459,19 +459,27 @@ async fn get(client: &HttpsClient, url: &str) -> Result<Bytes, String> {
 
 /// A user the control plane created that the config doesn't have yet: no
 /// policy or limits of their own, and their teams' models (snapshot builder).
+/// A team the config doesn't have yet admits nothing: the user gets its models
+/// with the config that brings it, never more than the control plane allows.
 fn provisional_user(cfg: &Config, p: &Provisioned) -> Arc<User> {
-    let mut team_models: Option<HashSet<String>> = None;
-    let mut unrestricted = false;
-    for t in p.team_ids.iter().filter_map(|id| cfg.teams.get(id)) {
-        match &t.allowed_models {
-            None => unrestricted = true,
-            Some(set) => team_models.get_or_insert_default().extend(set.iter().cloned()),
+    let team_models = if p.team_ids.is_empty() {
+        None // no team, no restriction, as on the control plane
+    } else {
+        let mut models = HashSet::new();
+        let mut unrestricted = false;
+        for id in &p.team_ids {
+            match cfg.teams.get(id).map(|t| &t.allowed_models) {
+                Some(None) => unrestricted = true,
+                Some(Some(set)) => models.extend(set.iter().cloned()),
+                None => {}
+            }
         }
-    }
+        if unrestricted { None } else { Some(models) }
+    };
     Arc::new(User {
         id: p.user_id.clone(),
         allowed_models: None,
-        team_models: if unrestricted { None } else { team_models },
+        team_models,
         memberships: HashMap::new(),
         scope: None,
         team_ids: p.team_ids.clone(),
@@ -868,6 +876,27 @@ mod tests {
             hex(&sha256(cases[0].1.as_bytes())),
             "7bf4275a83b36f3e36d285d92b1ce0eb742132d551f6a8b0e8b6bea16a5e3d64"
         );
+    }
+
+    #[test]
+    fn provisioned_users_in_teams_the_config_lacks_get_nothing_from_them() {
+        let wire: Wire = serde_json::from_value(json!({
+            "schema": 2, "version": 1, "group": {"id": "g", "name": "g"},
+            "teams": [{"id": "t1", "allowed_models": ["m"]}, {"id": "open", "allowed_models": null}],
+        }))
+        .unwrap();
+        let cfg = Config::build(wire).unwrap();
+        let models = |teams: &[&str]| {
+            let p = Provisioned { user_id: "u".into(), team_ids: teams.iter().map(|t| t.to_string()).collect() };
+            provisional_user(&cfg, &p).team_models.clone()
+        };
+        // A team the config doesn't have yet admits nothing until it arrives.
+        assert_eq!(models(&["t-new"]), Some(HashSet::new()));
+        assert_eq!(models(&["t1", "t-new"]), Some(HashSet::from(["m".to_string()])));
+        // A known team without a policy, or no team at all, restricts nothing,
+        // as on the control plane.
+        assert_eq!(models(&["open", "t-new"]), None);
+        assert_eq!(models(&[]), None);
     }
 
     #[test]
