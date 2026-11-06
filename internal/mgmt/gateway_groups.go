@@ -96,6 +96,7 @@ func (m *Server) deleteGatewayGroup(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusNotFound, "not found")
 		return
 	}
+	m.removeFromScopes(r.Context(), "group_values", id.String())
 	m.bump(r.Context())
 	w.WriteHeader(http.StatusNoContent)
 }

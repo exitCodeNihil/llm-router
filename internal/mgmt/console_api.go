@@ -501,7 +501,7 @@ func (m *Server) usageRecent(w http.ResponseWriter, r *http.Request) {
 	args := []any{limit}
 	scope := usageScope(c, &args)
 	m.list(w, r, fmt.Sprintf(`
-		SELECT ts, request_id, model_name, api_key_id, user_id, team_id,
+		SELECT ts, request_id, trace_id, model_name, api_key_id, user_id, team_id,
 		       prompt_tokens, completion_tokens, cost_usd, latency_ms, status_code, stream
 		FROM usage_events WHERE %s ORDER BY ts DESC LIMIT $1`, scope), args...)
 }
