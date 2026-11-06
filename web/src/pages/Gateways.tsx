@@ -204,10 +204,18 @@ function historyRows(h: NodesHistoryResponse, ids: string[]) {
   return rows;
 }
 
+function colorIndex(id: string) {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+  return h % SERIES_COLORS.length;
+}
+
 function GatewayHistory() {
   const history = useNodesHistory();
-  const [selected, setSelected] = useState(ALL);
+  const [picked, setSelected] = useState(ALL);
   const gateways = history.data?.gateways ?? [];
+  // A gateway that was scaled in drops out of the history: fall back to all.
+  const selected = gateways.some((g) => g.id === picked) ? picked : ALL;
   const shown = selected === ALL ? gateways : gateways.filter((g) => g.id === selected);
   const ids = shown.map((g) => g.id);
   const key = ids.join(",");
@@ -220,7 +228,8 @@ function GatewayHistory() {
     shown.map((g, i) => ({
       key: `${prefix}${i}`,
       name: one ? g.name : `${g.group} / ${g.name}`,
-      color: one ? chart.accent : SERIES_COLORS[i % SERIES_COLORS.length],
+      // By id, so a gateway keeps its colour as others come and go.
+      color: one ? chart.accent : SERIES_COLORS[colorIndex(g.id)],
     }));
   const memory = one
     ? [...series("m"), { key: "l0", name: "Limit", color: chart.crit, isDashed: true }]
