@@ -80,7 +80,7 @@ func TestSyncKeepsGatewayStats(t *testing.T) {
 		t.Fatal("no stats kept")
 	}
 	want := metrics.NodeMetric{Name: "gw-7f9c", Group: "eu-west", Version: "0.3.0", UptimeS: 42, CPUPct: 37.5,
-		InFlight: 5, Workers: 2, OpenConns: 310, MemBytes: 100 << 20, MemLimitBytes: 512 << 20, Updated: nm.Updated}
+		InFlight: 5, Workers: 2, OpenConns: 310, MemBytes: 100 << 20, MemLimitBytes: 512 << 20, Schema: 2, Updated: nm.Updated}
 	if nm != want {
 		t.Fatalf("kept %+v\nwant %+v", nm, want)
 	}
@@ -91,5 +91,12 @@ func TestSyncKeepsGatewayStats(t *testing.T) {
 	post("/gw/v1/sync", joined.Session, `{"batch":2,"cursor":"","events":[],"rates":[],"stats":{"version":"0.2.2","uptime_s":1,"in_flight":0,"workers":2}}`)
 	if nm, _ := nodes.Get(joined.InstanceID); nm.MemLimitBytes != 0 || nm.Name != "gw-7f9c" || nm.Version != "0.2.2" {
 		t.Fatalf("after an older gateway's sync: %+v", nm)
+	}
+	// A 0.2 gateway joins without a schema and is kept as schema 1.
+	var old sessionResponse
+	json.Unmarshal(post("/gw/v1/join", token, `{"name":"gw-old","version":"0.2.2"}`), &old)
+	post("/gw/v1/sync", old.Session, `{"batch":1,"cursor":"","events":[],"rates":[],"stats":{"version":"0.2.2","uptime_s":1,"in_flight":0,"workers":2}}`)
+	if nm, _ := nodes.Get(old.InstanceID); nm.Schema != 1 {
+		t.Fatalf("0.2 gateway kept as schema %d", nm.Schema)
 	}
 }

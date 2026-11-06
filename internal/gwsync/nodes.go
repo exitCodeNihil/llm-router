@@ -8,7 +8,7 @@ import (
 
 // observe keeps a gateway's stats from its sync for the Gateways page and
 // /metrics. The instance's name is read once per control-plane process.
-func (s *Server) observe(r *http.Request, instance, group string, st Stats) {
+func (s *Server) observe(r *http.Request, instance, group string, schema int, st Stats) {
 	if s.Nodes == nil {
 		return
 	}
@@ -24,5 +24,5 @@ func (s *Server) observe(r *http.Request, instance, group string, st Stats) {
 	}
 	s.Nodes.Set(instance, metrics.NodeMetric{Name: name, Group: group, Version: trim(st.Version, 100), UptimeS: st.UptimeS,
 		CPUPct: st.CPUPct, InFlight: st.InFlight, Workers: st.Workers, OpenConns: st.OpenConnections,
-		MemBytes: st.MemBytes, MemLimitBytes: st.MemLimitBytes, Leaving: st.Leaving})
+		MemBytes: st.MemBytes, MemLimitBytes: st.MemLimitBytes, Leaving: st.Leaving, Schema: schema})
 }

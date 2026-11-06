@@ -376,7 +376,7 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request, p peer) {
 			s.Limits.Ingest(d.Scope, d.Minute, d.Requests, d.Tokens)
 		}
 	}
-	s.observe(r, instance, g.Name, req.Stats)
+	s.observe(r, instance, g.Name, p.schema, req.Stats)
 	writeJSON(w, http.StatusOK, s.Limits.Export(snap, req.Cursor))
 }
 

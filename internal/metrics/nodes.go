@@ -21,6 +21,7 @@ type NodeMetric struct {
 	MemBytes      int64
 	MemLimitBytes int64 // 0: no limit
 	Leaving       bool  // shutting down: these are its last syncs
+	Schema        int   // config schema the gateway negotiated; 0 unknown
 	Updated       time.Time
 }
 

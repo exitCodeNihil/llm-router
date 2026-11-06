@@ -9,6 +9,7 @@ import { Icon } from "@astryxdesign/core/Icon";
 import { Badge } from "@astryxdesign/core/Badge";
 import { Code } from "@astryxdesign/core/Code";
 import { StatusDot } from "@astryxdesign/core/StatusDot";
+import { Tooltip } from "@astryxdesign/core/Tooltip";
 import { ProgressBar } from "@astryxdesign/core/ProgressBar";
 import { Divider } from "@astryxdesign/core/Divider";
 import { Grid } from "@astryxdesign/core/Grid";
@@ -48,6 +49,20 @@ function uptime(seconds: number): string {
   return `${m}m`;
 }
 
+// A gateway older than 0.3 isn't sent Vertex or Entra providers, so their
+// models fail there until it is upgraded.
+function UnservedBadge({ node }: { node: Node }) {
+  const names = node.unserved_providers ?? [];
+  const text = `${node.name} is older than 0.3 and can't serve ${names.join(", ")}. Requests for their models fail on it until it is upgraded.`;
+  return (
+    <Tooltip content={text}>
+      <span tabIndex={0} role="group" aria-label={text} style={{ display: "inline-flex" }}>
+        <Badge variant="warning" label={`skips ${names.length} provider${names.length === 1 ? "" : "s"}`} />
+      </span>
+    </Tooltip>
+  );
+}
+
 // ── Live cluster (self + peers) ─────────────────────────────────
 function ClusterTable() {
   const nodes = useNodes();
@@ -73,6 +88,7 @@ function ClusterTable() {
               {n.role === "gateway" && <Badge variant="neutral" label={n.region ? `${n.group} · ${n.region}` : (n.group ?? "gateway")} />}
             </HStack>
             {n.addr && <Code>{n.addr}</Code>}
+            {!!n.unserved_providers?.length && <UnservedBadge node={n} />}
           </VStack>
         </HStack>
       ),

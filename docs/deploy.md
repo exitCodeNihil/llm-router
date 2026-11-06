@@ -113,7 +113,7 @@ counting what requests in flight may still capture, plus the one batch it is sen
 before compression); past that it sends usage without content.
 
 Google Vertex AI and Azure Entra ID providers need gateways from 0.3.0; older gateways don't receive
-them. A Vertex provider's service account key goes to the gateways that serve it. With application
+them, and **Gateways** marks each one with the providers it skips. A Vertex provider's service account key goes to the gateways that serve it. With application
 default credentials or Entra ID, each gateway uses its own identity, the same way the control plane
 does:
 

@@ -2,8 +2,10 @@ package mgmt
 
 import (
 	"net/http"
+	"sort"
 	"time"
 
+	"github.com/exitcodenihil/llm-router/internal/gwsync"
 	"github.com/exitcodenihil/llm-router/internal/metrics"
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
 )
@@ -157,6 +159,7 @@ func (m *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 			status = "warn"
 		}
 		gw := nodeRow(nm)
+		gw["unserved_providers"] = unservedProviders(m.Snapshots, nm.Schema)
 		p50 := 0
 		if m.Live != nil {
 			p50 = m.Live.NodeP50(id)
@@ -179,6 +182,28 @@ func (m *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"nodes": nodes, "cluster_events": events})
+}
+
+// unservedProviders names the providers with models that a gateway on this
+// config schema leaves out (Vertex and Entra on gateways older than 0.3), so
+// the Gateways page can say why those models fail there. Empty when the
+// schema is current or not yet known.
+func unservedProviders(h *snapshot.Holder, schema int) []string {
+	names := []string{}
+	if schema < 1 || h == nil || h.Get() == nil {
+		return names
+	}
+	seen := map[string]bool{}
+	for _, ds := range h.Get().DeploymentsByModel {
+		for _, d := range ds {
+			if p := d.Provider; p != nil && !seen[p.ID] && !gwsync.Servable(p, schema) {
+				seen[p.ID] = true
+				names = append(names, p.Name)
+			}
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 // nodeRow is the ops part of a node's row on the Gateways page.

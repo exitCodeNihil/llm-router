@@ -261,7 +261,7 @@ func buildConfig(s *snapshot.Snapshot, g *snapshot.GatewayGroup, schema int) bui
 	providers := map[string]*snapshot.Provider{}
 	for _, name := range names {
 		for _, d := range routingOrder(s.DeploymentsByModel[name], g.Region) {
-			if !servable(d.Provider, schema) {
+			if !Servable(d.Provider, schema) {
 				continue
 			}
 			providers[d.Provider.ID] = d.Provider
@@ -344,11 +344,11 @@ func tags(in []string) []string {
 	return slices.Sorted(slices.Values(in))
 }
 
-// servable reports whether a gateway speaking schema can serve p. Schema 1
+// Servable reports whether a gateway speaking schema can serve p. Schema 1
 // gateways (0.2.x) mint no Google or Entra tokens and know no Vertex URLs, so
 // they get neither these providers nor their deployments, and never hold a
 // service account key they can't use.
-func servable(p *snapshot.Provider, schema int) bool {
+func Servable(p *snapshot.Provider, schema int) bool {
 	if schema >= 2 {
 		return true
 	}

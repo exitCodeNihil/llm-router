@@ -490,6 +490,8 @@ export interface Node {
   region?: string;
   version: string;
   version_skew: boolean;
+  /** Providers this gateway leaves out because it is older than 0.3. */
+  unserved_providers?: string[];
   uptime_s: number;
   /** CPU use against the node's CPU allowance. */
   cpu_pct: number;
