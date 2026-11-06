@@ -1,6 +1,7 @@
 package gwsync
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"slices"
 	"sort"
@@ -31,6 +32,23 @@ type Config struct {
 	Providers   []Provider       `json:"providers"`
 	Deployments []Deployment     `json:"deployments"` // per model, in routing order
 	Prices      map[string]Price `json:"prices"`
+	// Schema 2, and only when issuers are configured: identity-token issuers,
+	// and every user the group serves by hex SHA-256 of their lowercased email,
+	// so a gateway can map a verified token to a user without the address.
+	Issuers []Issuer          `json:"issuers,omitempty"`
+	Emails  map[string]string `json:"emails,omitempty"`
+}
+
+// Issuer is a token issuer a gateway verifies callers' identity tokens
+// against (snapshot.Issuer). AutoCreate is set only when a user it creates
+// would be served by this group.
+type Issuer struct {
+	URL        string            `json:"url"`
+	Audience   string            `json:"audience"`
+	EmailClaim string            `json:"email_claim"`
+	Match      map[string]string `json:"match,omitempty"`
+	MapToTeam  string            `json:"map_to_team,omitempty"`
+	AutoCreate bool              `json:"auto_create,omitempty"`
 }
 
 type Group struct {
@@ -61,6 +79,7 @@ type User struct {
 	BudgetUSD     *float64            `json:"budget_usd,omitempty"`
 	RPMLimit      *int                `json:"rpm_limit,omitempty"`
 	TPMLimit      *int                `json:"tpm_limit,omitempty"`
+	TeamIDs       []string            `json:"team_ids,omitempty"` // schema 2
 }
 
 type Team struct {
@@ -168,6 +187,9 @@ func buildConfig(s *snapshot.Snapshot, g *snapshot.GatewayGroup, schema int) bui
 		}
 		c.Keys = append(c.Keys, wk)
 	}
+	if schema >= 2 && len(s.Issuers) > 0 {
+		ids = addIdentityUsers(c, s, g, users, teams, ids)
+	}
 	for _, u := range users {
 		wu := User{ID: u.ID, AllowedModels: list(u.AllowedModels), TeamModels: list(u.TeamModels),
 			BudgetUSD: u.BudgetUSD, RPMLimit: u.RPMLimit, TPMLimit: u.TPMLimit}
@@ -178,6 +200,9 @@ func buildConfig(s *snapshot.Snapshot, g *snapshot.GatewayGroup, schema int) bui
 				}
 				wu.Memberships[teamID] = m.BudgetUSD
 			}
+		}
+		if schema >= 2 && len(u.TeamIDs) > 0 {
+			wu.TeamIDs = slices.Sorted(slices.Values(u.TeamIDs))
 		}
 		c.Users = append(c.Users, wu)
 	}
@@ -242,6 +267,70 @@ func servable(p *snapshot.Provider, schema int) bool {
 		return false
 	}
 	return p.Type != "gcp_vertex"
+}
+
+// servesUser reports whether group g serves u when they sign in with an
+// identity token: every user for an unrestricted group, else members of a
+// team the group allows.
+func servesUser(g *snapshot.GatewayGroup, u *snapshot.User) bool {
+	if g.AllowedTeams == nil {
+		return true
+	}
+	return slices.ContainsFunc(u.TeamIDs, func(t string) bool { return g.AllowedTeams[t] })
+}
+
+// memberOfAllowed reports whether the user is a member of a team the group
+// allows: an identity-token caller the group serves, whatever team the
+// issuer maps them to.
+func memberOfAllowed(snap *snapshot.Snapshot, g *snapshot.GatewayGroup, userID string) bool {
+	u := snap.UsersByID[userID]
+	return u != nil && servesUser(g, u)
+}
+
+// addIdentityUsers adds what identity-token callers need: the issuers, every
+// user the group serves with their email hash, and the teams the issuers map
+// callers to. It returns ids with the identities those callers can have, so
+// the deployments they can reach are part of the config.
+func addIdentityUsers(c *Config, s *snapshot.Snapshot, g *snapshot.GatewayGroup,
+	users map[string]*snapshot.User, teams map[string]*snapshot.Team, ids []*auth.Identity) []*auth.Identity {
+	var issuerTeams []*snapshot.Team // nil for an issuer that maps callers to no team
+	for _, iss := range s.Issuers {
+		wi := Issuer{URL: iss.IssuerURL, Audience: iss.Audience, EmailClaim: iss.EmailClaim, Match: iss.Match,
+			MapToTeam:  iss.MapToTeam,
+			AutoCreate: iss.AutoCreateUser && (g.AllowedTeams == nil || g.AllowedTeams[iss.MapToTeam])}
+		c.Issuers = append(c.Issuers, wi)
+		t := s.TeamsByID[iss.MapToTeam]
+		if t != nil {
+			teams[t.ID] = t
+		}
+		if !slices.Contains(issuerTeams, t) {
+			issuerTeams = append(issuerTeams, t)
+		}
+	}
+	sort.Slice(c.Issuers, func(i, j int) bool { return c.Issuers[i].URL < c.Issuers[j].URL })
+	c.Emails = map[string]string{}
+	for _, u := range s.UsersByID {
+		if !servesUser(g, u) {
+			continue
+		}
+		users[u.ID] = u
+		sum := sha256.Sum256([]byte(strings.ToLower(u.Email)))
+		c.Emails[hex.EncodeToString(sum[:])] = u.ID
+		if g.AllowedTeams != nil {
+			for _, t := range issuerTeams {
+				ids = append(ids, &auth.Identity{User: u, Team: t})
+			}
+		}
+	}
+	// An auto-created caller has no policy of their own yet: their team's.
+	if g.AllowedTeams != nil {
+		for _, iss := range c.Issuers {
+			if iss.AutoCreate {
+				ids = append(ids, &auth.Identity{User: &snapshot.User{}, Team: s.TeamsByID[iss.MapToTeam]})
+			}
+		}
+	}
+	return ids
 }
 
 // routingOrder puts the deployments in the group's region first, keeping the

@@ -1,6 +1,8 @@
 package gwsync
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -203,5 +205,105 @@ func TestSessionRejects(t *testing.T) {
 		if code, _ := call(tok); code != http.StatusUnauthorized {
 			t.Errorf("%s: got %d, want 401", name, code)
 		}
+	}
+}
+
+func withIssuer(s *snapshot.Snapshot, mapToTeam string, autoCreate bool) *snapshot.Snapshot {
+	s.Issuers = []*snapshot.Issuer{{ID: "i1", Type: "oidc", IssuerURL: "https://idp.example.com", Audience: "aud",
+		EmailClaim: "email", Match: map[string]string{"tid": "t"}, MapToTeam: mapToTeam, AutoCreateUser: autoCreate}}
+	// dave has no key: only an identity token brings him to a gateway.
+	dave := &snapshot.User{ID: "dave", Email: "Dave@Example.com", TeamIDs: []string{"A"}}
+	s.UsersByID["dave"] = dave
+	return s
+}
+
+func emailHash(email string) string {
+	sum := sha256.Sum256([]byte(email))
+	return hex.EncodeToString(sum[:])
+}
+
+// Identity-token callers need the issuers, an email index and users without
+// keys; a schema 1 gateway can't use any of it and gets none.
+func TestConfigIdentitySchemaGate(t *testing.T) {
+	s := withIssuer(fixture(), "B", true)
+	old := buildConfig(s, &snapshot.GatewayGroup{ID: "g", Name: "all"}, 1)
+	raw, _ := json.Marshal(old.cfg)
+	for _, f := range []string{`"issuers"`, `"emails"`, `"team_ids"`, `"dave"`} {
+		if strings.Contains(string(raw), f) {
+			t.Errorf("schema 1 config carries %s", f)
+		}
+	}
+
+	b := buildConfig(s, &snapshot.GatewayGroup{ID: "g", Name: "all"}, 2)
+	c := b.cfg
+	if len(c.Issuers) != 1 || c.Issuers[0].URL != "https://idp.example.com" || !c.Issuers[0].AutoCreate ||
+		c.Issuers[0].Match["tid"] != "t" || c.Issuers[0].MapToTeam != "B" {
+		t.Fatalf("issuers = %+v", c.Issuers)
+	}
+	if len(c.Emails) != 4 || c.Emails[emailHash("dave@example.com")] != "dave" {
+		t.Fatalf("emails = %v", c.Emails)
+	}
+	raw, _ = json.Marshal(c)
+	if strings.Contains(strings.ToLower(string(raw)), "@example.com") {
+		t.Fatal("a config carries an email address in the clear")
+	}
+	var dave *User
+	for i := range c.Users {
+		if c.Users[i].ID == "dave" {
+			dave = &c.Users[i]
+		}
+	}
+	if dave == nil || len(dave.TeamIDs) != 1 || dave.TeamIDs[0] != "A" {
+		t.Fatalf("dave = %+v", dave)
+	}
+
+	// Without issuers nothing changes, so a deployment that doesn't use
+	// identity tokens doesn't ship every user.
+	plain := buildConfig(fixture(), &snapshot.GatewayGroup{ID: "g", Name: "all"}, 2)
+	if plain.cfg.Issuers != nil || plain.cfg.Emails != nil || len(plain.cfg.Users) != 3 {
+		t.Fatalf("no issuers: %+v %v %d", plain.cfg.Issuers, plain.cfg.Emails, len(plain.cfg.Users))
+	}
+}
+
+// A team's gateway serves the members of its teams and nobody else, and only
+// auto-creates users when they would join one of its teams.
+func TestConfigIdentityForOneTeam(t *testing.T) {
+	g := &snapshot.GatewayGroup{ID: "g", Name: "team-a", AllowedTeams: map[string]bool{"A": true}}
+	b := buildConfig(withIssuer(fixture(), "B", true), g, 2)
+	got := map[string]bool{}
+	for _, id := range b.cfg.Emails {
+		got[id] = true
+	}
+	if len(got) != 2 || !got["alice"] || !got["dave"] {
+		t.Fatalf("team A's gateway serves %v, want alice and dave", got)
+	}
+	if b.cfg.Issuers[0].AutoCreate {
+		t.Fatal("new users join team B, which this group doesn't serve: no auto-create")
+	}
+	// The issuer's team is where callers' usage counts, so its limits come along.
+	teams := map[string]bool{}
+	for _, t := range b.cfg.Teams {
+		teams[t.ID] = true
+	}
+	if !teams["A"] || !teams["B"] {
+		t.Fatalf("teams = %v", teams)
+	}
+
+	b = buildConfig(withIssuer(fixture(), "A", true), g, 2)
+	if !b.cfg.Issuers[0].AutoCreate {
+		t.Fatal("new users join team A, which this group serves: auto-create")
+	}
+}
+
+// The sync check takes usage from a member of an allowed team, whatever team
+// the issuer maps them to, and not from anyone else.
+func TestMemberOfAllowed(t *testing.T) {
+	s := withIssuer(fixture(), "B", false)
+	g := &snapshot.GatewayGroup{ID: "g", AllowedTeams: map[string]bool{"A": true}}
+	if !memberOfAllowed(s, g, "dave") || !memberOfAllowed(s, g, "alice") {
+		t.Fatal("members of team A are this group's")
+	}
+	if memberOfAllowed(s, g, "bob") || memberOfAllowed(s, g, "carol") || memberOfAllowed(s, g, "") {
+		t.Fatal("bob, carol and nobody are not this group's")
 	}
 }
