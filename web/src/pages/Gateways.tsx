@@ -319,7 +319,7 @@ function ClusterEvents() {
 
 // ── Gateway groups ──────────────────────────────────────────────
 const DATA_RULES: { value: DataRule; label: string }[] = [
-  { value: "inherit", label: "Follow the telemetry settings" },
+  { value: "inherit", label: "Follow the capture policy" },
   { value: "no_content", label: "Never capture prompts or responses" },
   { value: "no_export", label: "Never export" },
 ];
