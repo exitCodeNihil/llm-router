@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.2](https://github.com/exitCodeNihil/llm-router/compare/v0.2.1...v0.2.2) (2026-11-06)
+
+
+### Features
+
+* add the kubernetes identity source to the chart ([292ebb6](https://github.com/exitCodeNihil/llm-router/commit/292ebb6d0cf0579eaaf8cbf3dc40d8c3b56741d9))
+* get Anthropic identity tokens from the Kubernetes API and renew them early ([d4362b2](https://github.com/exitCodeNihil/llm-router/commit/d4362b2bc4b72bfbf01dcb2b8c24d2418a0b2830))
+
+
+### Bug Fixes
+
+* record usage when a provider can't be reached ([39e9ade](https://github.com/exitCodeNihil/llm-router/commit/39e9ade3baae34a09201a83be7eb5a5989bec69b))
+
 ## [0.2.1](https://github.com/exitCodeNihil/llm-router/compare/v0.2.0...v0.2.1) (2026-11-05)
 
 
