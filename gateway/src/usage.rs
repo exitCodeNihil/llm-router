@@ -449,26 +449,13 @@ fn capture_request(body: &[u8], with_system: bool, limit: usize) -> Content {
 
 /// A JSON value cut to fit in `limit` bytes by shortening its strings, the
 /// longest first, leaving "role" and "type" alone; None when even empty
-/// strings don't fit. Only an oversized part takes this path: it is re-encoded.
+/// strings don't fit. Only an oversized part takes this path: it is
+/// re-encoded, keys in their order, numbers as written.
 fn cut_json(raw: &str, limit: usize) -> Option<Box<RawValue>> {
-    fn strings<'a>(v: &'a mut serde_json::Value, out: &mut Vec<&'a mut String>) {
-        match v {
-            serde_json::Value::String(s) => out.push(s),
-            serde_json::Value::Array(a) => a.iter_mut().for_each(|x| strings(x, out)),
-            serde_json::Value::Object(m) => {
-                for (k, x) in m.iter_mut() {
-                    if k != "role" && k != "type" {
-                        strings(x, out);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut v: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let mut excess = serde_json::to_string(&v).ok()?.len().saturating_sub(limit);
+    let mut v = Node::parse(raw, 0)?;
+    let mut excess = v.encode().len().saturating_sub(limit);
     let mut all = Vec::new();
-    strings(&mut v, &mut all);
+    v.strings(&mut all);
     all.sort_by_key(|s| std::cmp::Reverse(s.len()));
     // Every byte of text takes at least a byte encoded, so cutting n bytes
     // of text saves at least n.
@@ -480,11 +467,132 @@ fn cut_json(raw: &str, limit: usize) -> Option<Box<RawValue>> {
         cut_utf8(s, before.saturating_sub(excess));
         excess = excess.saturating_sub(before - s.len());
     }
-    let out = serde_json::to_string(&v).ok()?;
+    let out = v.encode();
     if out.len() > limit {
         return None;
     }
     RawValue::from_string(out).ok()
+}
+
+/// A JSON value whose strings can be cut. Everything else keeps its text: a
+/// number read into an f64 and written back can change (0.1000000000000000055
+/// to 0.1) or not be written at all (1e999).
+enum Node<'a> {
+    Text(String),
+    /// A number, true, false or null, as written.
+    Raw(&'a str),
+    List(Vec<Node<'a>>),
+    Object(Vec<(String, Node<'a>)>),
+}
+
+/// Deeper than this is refused, as serde_json refuses it.
+const MAX_DEPTH: usize = 128;
+
+impl<'a> Node<'a> {
+    fn parse(raw: &'a str, depth: usize) -> Option<Node<'a>> {
+        let raw = raw.trim_matches([' ', '\t', '\n', '\r']);
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        Some(match raw.as_bytes().first()? {
+            b'"' => Node::Text(serde_json::from_str(raw).unwrap_or_else(|_| {
+                let mut s = String::new();
+                crate::translate::unescape_into(&raw[1..raw.len() - 1], &mut s, usize::MAX);
+                s
+            })),
+            b'[' => Node::List(
+                serde_json::from_str::<Vec<&RawValue>>(raw)
+                    .ok()?
+                    .into_iter()
+                    .map(|x| Node::parse(x.get(), depth + 1))
+                    .collect::<Option<_>>()?,
+            ),
+            b'{' => Node::Object(
+                serde_json::from_str::<Entries>(raw)
+                    .ok()?
+                    .0
+                    .into_iter()
+                    .map(|(k, x)| Some((k, Node::parse(x.get(), depth + 1)?)))
+                    .collect::<Option<_>>()?,
+            ),
+            _ => Node::Raw(raw),
+        })
+    }
+
+    fn strings<'n>(&'n mut self, out: &mut Vec<&'n mut String>) {
+        match self {
+            Node::Text(s) => out.push(s),
+            Node::Raw(_) => {}
+            Node::List(a) => a.iter_mut().for_each(|x| x.strings(out)),
+            Node::Object(m) => {
+                for (k, x) in m.iter_mut() {
+                    if k != "role" && k != "type" {
+                        x.strings(out);
+                    }
+                }
+            }
+        }
+    }
+
+    fn encode(&self) -> String {
+        let mut out = Vec::new();
+        self.write(&mut out);
+        String::from_utf8(out).unwrap_or_default()
+    }
+
+    fn write(&self, o: &mut Vec<u8>) {
+        match self {
+            Node::Text(s) => {
+                let _ = serde_json::to_writer(&mut *o, s);
+            }
+            Node::Raw(r) => o.extend_from_slice(r.as_bytes()),
+            Node::List(a) => {
+                o.push(b'[');
+                for (i, x) in a.iter().enumerate() {
+                    if i > 0 {
+                        o.push(b',');
+                    }
+                    x.write(o);
+                }
+                o.push(b']');
+            }
+            Node::Object(m) => {
+                o.push(b'{');
+                for (i, (k, x)) in m.iter().enumerate() {
+                    if i > 0 {
+                        o.push(b',');
+                    }
+                    let _ = serde_json::to_writer(&mut *o, k);
+                    o.push(b':');
+                    x.write(o);
+                }
+                o.push(b'}');
+            }
+        }
+    }
+}
+
+/// An object's members in order, duplicates kept, values unparsed.
+struct Entries<'a>(Vec<(String, &'a RawValue)>);
+
+impl<'de: 'a, 'a> Deserialize<'de> for Entries<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Entries<'de>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(self, mut m: M) -> Result<Entries<'de>, M::Error> {
+                let mut out = Vec::new();
+                while let Some(e) = m.next_entry()? {
+                    out.push(e);
+                }
+                Ok(Entries(out))
+            }
+        }
+        d.deserialize_map(V)
+    }
 }
 
 /// `s` cut to at most `n` bytes, at a character boundary.
@@ -804,7 +912,7 @@ mod tests {
         assert!(cut.content_truncated);
         // Not even the newest message fits: it stays, its text cut to fit.
         let cut = capture_request(body.as_bytes(), true, 32);
-        assert_eq!(cut.input.as_ref().unwrap().get(), r#"[{"content":"th","role":"user"}]"#);
+        assert_eq!(cut.input.as_ref().unwrap().get(), r#"[{"role":"user","content":"th"}]"#);
         assert_eq!(cut.system.as_ref().unwrap().get(), r#""you are terse""#);
         assert!(cut.content_truncated);
         let cut = capture_request(body.as_bytes(), true, 10);
@@ -890,6 +998,28 @@ mod tests {
         assert!(c.content_truncated);
         assert_eq!(c.output.len(), 1000);
         assert_eq!(c.output.capacity(), c.output.len());
+    }
+
+    /// A cut part keeps every number as written, its keys in their order.
+    #[test]
+    fn cutting_keeps_numbers_as_written() {
+        let nums = r#"{"z":1e999,"f":0.1000000000000000055511151231257827,"big":123456789012345678901234567890,"n":-0,"e":1E+2,"t":true,"x":null}"#;
+        let raw = format!(
+            r#"{{"role":"user","content":"{}","meta":{nums},"list":[1.50,"{}"]}}"#,
+            "a".repeat(300),
+            "b".repeat(50)
+        );
+        let cut = cut_json(&raw, 260).unwrap();
+        let got = cut.get();
+        assert!(got.len() <= 260, "{got}");
+        assert!(got.starts_with(r#"{"role":"user","content":"a"#), "{got}");
+        assert!(got.contains(&format!(r#""meta":{nums},"list":[1.50,"b"#)), "{got}");
+        // an unpaired surrogate in the text is no reason to lose the part
+        let cut = cut_json(&format!(r#"["\ud83d{}"]"#, "c".repeat(100)), 20).unwrap();
+        assert_eq!(cut.get(), format!("[\"\u{fffd}{}\"]", "c".repeat(13)));
+        // nesting serde_json would refuse is refused, not a stack overflow
+        let deep = format!("{}\"{}\"{}", "[".repeat(100_000), "d".repeat(10), "]".repeat(100_000));
+        assert!(cut_json(&deep, 10).is_none());
     }
 
     #[test]

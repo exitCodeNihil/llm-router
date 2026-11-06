@@ -1307,7 +1307,7 @@ impl<'a> JStr<'a> {
 /// bytes of it, cut at a character; whether any was left out. Lenient as Go's
 /// encoding/json is: an unpaired surrogate escape, or any escape that isn't
 /// JSON, reads as U+FFFD and the rest of the text is kept.
-fn unescape_into(inner: &str, out: &mut String, max: usize) -> bool {
+pub(crate) fn unescape_into(inner: &str, out: &mut String, max: usize) -> bool {
     let b = inner.as_bytes();
     let start = out.len();
     let room = |out: &String| max - (out.len() - start);
