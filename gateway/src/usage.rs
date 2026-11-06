@@ -99,6 +99,10 @@ pub struct Content {
     /// Something was cut to the cap, or left out over the queue's budget.
     #[serde(skip_serializing_if = "is_false")]
     pub content_truncated: bool,
+    /// Its encoded size, worked out once before it is queued: batches are
+    /// sized under the queue's lock.
+    #[serde(skip)]
+    encoded: usize,
 }
 
 impl Content {
@@ -111,6 +115,15 @@ impl Content {
 
     /// About how many bytes it takes as JSON: the output's escapes counted.
     fn encoded_size(&self) -> usize {
+        if self.encoded > 0 { self.encoded } else { self.measure() }
+    }
+
+    /// Work out the encoded size now, to keep it.
+    fn seal(&mut self) {
+        self.encoded = self.measure();
+    }
+
+    fn measure(&self) -> usize {
         let escaped = self
             .output
             .bytes()
@@ -191,6 +204,9 @@ pub static DROPPED: AtomicU64 = AtomicU64::new(0);
 pub static CONTENT_STRIPPED: AtomicU64 = AtomicU64::new(0);
 
 fn push(mut e: Event) {
+    if let Some(c) = e.content.as_mut() {
+        c.seal();
+    }
     let mut q = queue().lock().unwrap();
     if q.events.len() >= MAX_QUEUED {
         drop(q);
@@ -721,6 +737,7 @@ mod tests {
             system: system.map(|s| RawValue::from_string(s.into()).unwrap()),
             output: output.into(),
             content_truncated: false,
+            encoded: 0,
         }))
     }
 
@@ -851,6 +868,24 @@ mod tests {
             let content = e.content.as_ref().map_or(0, |c| c.encoded_size());
             assert!(2 * e.encoded_size() - content >= actual, "estimate {} vs actual {actual}", e.encoded_size());
         }
+    }
+
+    /// The size is worked out once, before the queue's lock is taken: a
+    /// batch is sized under it.
+    #[test]
+    fn content_size_is_worked_out_once() {
+        let mut c = content("[1]", None, "a\nb").unwrap();
+        let measured = c.encoded_size();
+        assert_eq!(measured, 64 + 3 + 4);
+        c.seal();
+        c.output = "x".repeat(1000);
+        assert_eq!(c.encoded_size(), measured, "kept, not counted again");
+        let _q = QUEUE.lock().unwrap();
+        push(Event { model_name: "sealed-test".into(), content: content("[1]", None, "a\nb"), ..event("s") });
+        let (mine, rest): (Vec<Event>, Vec<Event>) =
+            take(usize::MAX, usize::MAX).into_iter().partition(|e| e.model_name == "sealed-test");
+        requeue(rest);
+        assert_eq!(mine[0].content.as_ref().unwrap().encoded, measured);
     }
 
     /// The queue holds up to 200,000 of them.
