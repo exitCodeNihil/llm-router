@@ -18,12 +18,13 @@ import { Timestamp } from "@astryxdesign/core/Timestamp";
 import { Tooltip } from "@astryxdesign/core/Tooltip";
 import { useToast } from "@astryxdesign/core/Toast";
 
-import type { ApiKey, Me, TelemetryPolicy } from "../lib/types";
+import type { ApiKey, Me, TelemetryDestination, TelemetryPolicy } from "../lib/types";
 import {
   useChatModels,
   useCreateKey,
   useDeleteKey,
   useDeployments,
+  useDestinations,
   useKeys,
   useTeams,
   useTelemetry,
@@ -67,8 +68,23 @@ function ownerLabel(k: ApiKey, teamName?: string, userEmail?: string): string {
   return "—";
 }
 
-/** Whether telemetry export applies to this key under the current settings. */
+/**
+ * Whether telemetry export applies to this key under the current settings.
+ * The policy says what may leave; content only leaves for a destination that
+ * takes it, so without an enabled one in content mode it is metadata at most.
+ * Destinations still loading (undefined) leave the policy's answer as is.
+ */
 function evalTrace(
+  k: ApiKey,
+  t: TelemetryPolicy | undefined,
+  dests: TelemetryDestination[] | undefined,
+): { capture: "content" | "meta" | "none"; rule?: string } {
+  const r = policyTrace(k, t);
+  const takesContent = !dests || dests.some((d) => d.enabled && d.content_mode === "content");
+  return r.capture === "content" && !takesContent ? { ...r, capture: "meta" } : r;
+}
+
+function policyTrace(
   k: ApiKey,
   t: TelemetryPolicy | undefined,
 ): { capture: "content" | "meta" | "none"; rule?: string } {
@@ -377,6 +393,7 @@ export default function Keys({ me }: { me: Me }) {
   const update = useUpdateKey();
   const showToast = useToast();
   const telemetry = useTelemetry(me.is_admin).data;
+  const destinations = useDestinations(me.is_admin).data;
   // Mirrors canManageKey server-side: admins, the owning team's admins, and
   // the personal owner. Everyone else gets a read-only row.
   const canManage = (k: ApiKey) =>
@@ -455,7 +472,7 @@ export default function Keys({ me }: { me: Me }) {
       key: "trace",
       header: "Trace",
       width: pixel(96),
-      renderCell: (k) => <TraceBadge {...evalTrace(k, telemetry)} />,
+      renderCell: (k) => <TraceBadge {...evalTrace(k, telemetry, destinations)} />,
     },
     {
       key: "budget_usd",
