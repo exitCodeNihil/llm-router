@@ -133,7 +133,7 @@ A gateway logs why it refuses them, and requests to those providers fail with th
 | `LLMR_GATEWAY_NAME` | Name on the Gateways page (default: the hostname) |
 
 `/healthz` answers 200 once the gateway has its config and has synced, and 503 while it starts or
-drains. `/metrics` is in Prometheus format.
+drains. `/metrics` is in Prometheus format; see [Monitoring](monitoring.md).
 
 ## Configuration
 
@@ -148,12 +148,16 @@ For llm-router itself (the gateways have [their own](#gateways)):
 | `LLMR_TRUSTED_PROXIES` | Comma-separated addresses or CIDR ranges of proxies whose `X-Forwarded-For` names the client. Console sign-in is limited to 20 attempts a minute per client address (IPv6 per /64) and 5 failures per 15 minutes per email and address. Each proxy must append to `X-Forwarded-For` |
 | `LLMR_SEED_CLAUDE_SUBSCRIPTION` | `1` adds the [subscription pass-through](clients.md#on-your-claudeai-subscription) provider and models |
 | `LLMR_IDE_LISTEN`, `LLMR_IDE_ORIGIN`, `LLMR_COOKIE_DOMAIN` | [Workspace IDE](workspaces.md) listener, its public origin, and the session cookie domain when it is another hostname |
+| `LLMR_METRICS_LISTEN` | Serve `/metrics` on this address (e.g. `:9090`) instead of the main listener; `off` turns it off. See [Monitoring](monitoring.md) |
 | `LLMR_WORKSPACE_NETWORK` | Docker network shared with workspaces, so a containerised llm-router reaches each IDE by name (set by `docker-compose.workspaces.yml`). Unset, the IDE is published on the host's loopback |
 
 Placeholder secrets such as `change-me` are refused. Generate them with `openssl rand -hex 16`.
 
 ## Operating
 
+- **Monitoring**: both the control plane and the gateways serve Prometheus metrics, the chart
+  can add PodMonitors, alert rules and a gateway autoscaler, and there is a Grafana dashboard.
+  Gateways scale horizontally; the control plane doesn't. See [Monitoring](monitoring.md).
 - **Langfuse**: **Observability** exports request traces. Rules choose which traffic is exported
   and whether prompts leave the gateway (off by default). With no rules, nothing is exported.
   Wrong credentials are rejected per batch, so check the delivery health on that page. Need a
@@ -191,6 +195,8 @@ secret key `LANGFUSE_SECRET_KEY` from `deploy/.env`. Langfuse itself is at http:
 - `LLMR_ENCRYPTION_KEY` in a secret manager and backed up. Rotating it means re-entering provider
   keys and signing everyone out.
 - TLS in front of 8080.
+- `/metrics` off the public listener (`LLMR_METRICS_LISTEN`; the chart does it), and the
+  [alerts](monitoring.md#alerts) wired to someone. Give gateways a memory limit.
 - Create real admin accounts or SSO, then unset `LLMR_ADMIN_TOKEN`.
 - Leave [workspaces](workspaces.md) off unless you need them. They need a container socket or
   cluster credentials, which is host-level trust.
