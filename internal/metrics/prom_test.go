@@ -4,6 +4,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -199,5 +201,19 @@ func TestNodeStoreHistory(t *testing.T) {
 	}
 	if first := ss[0]; first.OpenConns != 3609 { // the last sync of the first step an hour back
 		t.Errorf("oldest sample %+v", first)
+	}
+}
+
+func TestMemory(t *testing.T) {
+	used, limit := Memory()
+	if used <= 0 {
+		t.Fatalf("memory in use %d", used)
+	}
+	// Set in a container started with a memory limit, to check it is read.
+	if want := os.Getenv("LLMR_TEST_MEMORY_LIMIT"); want != "" && strconv.FormatInt(limit, 10) != want {
+		t.Fatalf("limit %d, want %s", limit, want)
+	}
+	if pct := CPUPct(); pct < 0 || pct > 100 {
+		t.Fatalf("cpu %v%%", pct)
 	}
 }

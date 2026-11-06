@@ -148,6 +148,10 @@ mod tests {
         if cfg!(target_os = "linux") {
             assert!(m.used > 0);
         }
+        // Set in a container started with a memory limit, to check it is read.
+        if let Ok(want) = std::env::var("LLMR_TEST_MEMORY_LIMIT") {
+            assert_eq!(m.limit, want.parse().ok());
+        }
         assert!((0.0..=100.0).contains(&cpu_pct()));
     }
 }
