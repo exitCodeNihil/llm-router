@@ -79,11 +79,41 @@ fn push(e: Event) {
     q.push_back(e);
 }
 
-/// Up to `max` queued events, oldest first.
-pub fn take(max: usize) -> Vec<Event> {
+/// Queued events, oldest first: at most `max_events`, and no more than about
+/// `max_bytes` once encoded (always at least one).
+pub fn take(max_events: usize, max_bytes: usize) -> Vec<Event> {
     let mut q = queue().lock().unwrap();
-    let n = q.len().min(max);
+    let n = batch_len(q.iter().map(Event::encoded_size), max_events, max_bytes);
     q.drain(..n).collect()
+}
+
+/// How many leading items of the given sizes fit in one batch.
+fn batch_len(sizes: impl Iterator<Item = usize>, max_events: usize, max_bytes: usize) -> usize {
+    let mut n = 0;
+    let mut bytes = 0;
+    for size in sizes.take(max_events) {
+        bytes += size;
+        if n > 0 && bytes > max_bytes {
+            break;
+        }
+        n += 1;
+    }
+    n
+}
+
+impl Event {
+    /// About how many bytes the event takes as JSON: the fixed fields plus
+    /// its strings. An estimate for sizing batches, not an exact count.
+    fn encoded_size(&self) -> usize {
+        400 + self.request_id.len()
+            + self.api_key_id.len()
+            + self.user_id.len()
+            + self.team_id.len()
+            + self.model_name.len()
+            + self.deployment_id.len()
+            + self.provider_id.len()
+            + self.error_code.len()
+    }
 }
 
 pub fn queued() -> usize {
@@ -206,6 +236,14 @@ impl Emit {
 mod tests {
     use super::*;
     use crate::config::Wire;
+
+    #[test]
+    fn batches_are_capped_by_count_and_bytes() {
+        assert_eq!(batch_len([100; 10].into_iter(), 4, 1 << 20), 4, "event cap");
+        assert_eq!(batch_len([100; 10].into_iter(), 100, 350), 3, "byte cap");
+        assert_eq!(batch_len([1000, 10].into_iter(), 100, 500), 1, "one oversized event still goes out alone");
+        assert_eq!(batch_len(std::iter::empty(), 100, 500), 0);
+    }
 
     #[test]
     fn prices_like_go() {

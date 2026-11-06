@@ -228,7 +228,9 @@ fn emit(cfg: &Arc<Config>, key: &Arc<Key>, model: String, stream: bool) -> Emit 
         request_id: format!("req_{:016x}", fastrand::u64(..)),
         stream,
         start: Instant::now(),
-        ts_ms: now_ms(),
+        // The control plane's clock, so a gateway's own skew can't move usage
+        // into another day or month.
+        ts_ms: limits::cp_now_ms(),
         deployment: None,
         attempts: 0,
     }

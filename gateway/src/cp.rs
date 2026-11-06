@@ -24,8 +24,11 @@ pub const VERSION: &str = match option_env!("LLMR_VERSION") {
     None => "dev",
 };
 
-/// The most events one sync uploads; a backlog goes out in back-to-back syncs.
-const MAX_BATCH: usize = 50_000;
+/// The most events one sync uploads, and about the most bytes before gzip; a
+/// backlog goes out in back-to-back syncs. The control plane reads at most
+/// 32 MiB of a sync, so the byte cap keeps a batch well under that.
+const MAX_BATCH: usize = 20_000;
+const MAX_BATCH_BYTES: usize = 8 << 20;
 
 pub struct ControlPlane {
     base: String,
@@ -276,7 +279,8 @@ impl ControlPlane {
     /// and settle it on success.
     async fn sync_once(&self, s: &mut Syncer) -> bool {
         if s.pending.is_none() {
-            let events = usage::take(MAX_BATCH);
+            let events = usage::take(MAX_BATCH, MAX_BATCH_BYTES);
+            let count = events.len();
             let (rates, scopes) = limits::freeze();
             s.batch += 1;
             let (batch, cursor) = (s.batch, s.cursor.clone());
@@ -299,7 +303,7 @@ impl ControlPlane {
             })
             .await;
             let Ok(Ok(body)) = body else { return false };
-            s.pending = Some(Batch { body: body.into(), scopes });
+            s.pending = Some(Batch { body: body.into(), scopes, events: count });
         }
         let Some(batch) = &s.pending else { return false };
         let (session, generation) = self.session();
@@ -320,7 +324,17 @@ impl ControlPlane {
             }
             Ok(Call::Ok(status, _, bytes)) => {
                 metrics::SYNC_FAILURES.fetch_add(1, Ordering::Relaxed);
-                eprintln!("sync: {status}: {}", String::from_utf8_lossy(&bytes[..bytes.len().min(200)]).trim());
+                let why = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]).trim().to_string();
+                if refused(status) {
+                    // Resending the same bytes would be refused again and hold
+                    // back every later event: drop this batch and move on.
+                    metrics::SYNC_REFUSED_EVENTS.fetch_add(batch.events as u64, Ordering::Relaxed);
+                    eprintln!("sync: {status}: {why}; dropping a batch of {} events", batch.events);
+                    limits::discard(&batch.scopes);
+                    s.pending = None;
+                } else {
+                    eprintln!("sync: {status}: {why}");
+                }
                 false
             }
             Err(e) => {
@@ -343,6 +357,14 @@ struct Syncer {
 struct Batch {
     body: Bytes,
     scopes: Vec<Arc<limits::Scope>>,
+    events: usize,
+}
+
+/// Whether the control plane refused a batch for good: a client error other
+/// than a timeout or a rate limit. 401 is handled before this, by joining
+/// again. Server errors are worth resending.
+fn refused(status: StatusCode) -> bool {
+    status.is_client_error() && status != StatusCode::REQUEST_TIMEOUT && status != StatusCode::TOO_MANY_REQUESTS
 }
 
 #[derive(Serialize)]
@@ -382,4 +404,24 @@ fn is_local(url: &str) -> bool {
     let rest = url.trim_start_matches("http://");
     let host = rest.split(['/', ':']).next().unwrap_or("");
     host == "localhost" || host == "127.0.0.1" || host == "[::1]" || !host.contains('.')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_lasting_refusals_drop_a_batch() {
+        for (status, drop) in [
+            (StatusCode::BAD_REQUEST, true),
+            (StatusCode::PAYLOAD_TOO_LARGE, true),
+            (StatusCode::UNPROCESSABLE_ENTITY, true),
+            (StatusCode::REQUEST_TIMEOUT, false),
+            (StatusCode::TOO_MANY_REQUESTS, false),
+            (StatusCode::INTERNAL_SERVER_ERROR, false),
+            (StatusCode::SERVICE_UNAVAILABLE, false),
+        ] {
+            assert_eq!(refused(status), drop, "{status}");
+        }
+    }
 }

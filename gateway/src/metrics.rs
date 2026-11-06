@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 pub static IN_FLIGHT: AtomicI64 = AtomicI64::new(0);
 pub static SHED: AtomicU64 = AtomicU64::new(0);
 pub static SYNC_FAILURES: AtomicU64 = AtomicU64::new(0);
+pub static SYNC_REFUSED_EVENTS: AtomicU64 = AtomicU64::new(0);
 pub static CONFIG_VERSION: AtomicI64 = AtomicI64::new(0);
 pub static WORKERS: AtomicI64 = AtomicI64::new(0);
 
@@ -106,6 +107,11 @@ pub fn render(ready: bool, usage_queued: usize, usage_dropped: u64) -> String {
     };
     counter("llmr_shed_total", "Requests refused because too many were in flight", SHED.load(Relaxed));
     counter("llmr_sync_failures_total", "Failed syncs with the control plane", SYNC_FAILURES.load(Relaxed));
+    counter(
+        "llmr_sync_refused_events_total",
+        "Usage events dropped because the control plane refused their batch",
+        SYNC_REFUSED_EVENTS.load(Relaxed),
+    );
     counter("llmr_usage_dropped_total", "Usage events dropped because the queue was full", usage_dropped);
 
     let _ = writeln!(
