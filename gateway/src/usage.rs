@@ -116,6 +116,21 @@ impl Event {
     }
 }
 
+/// Put events back at the front of the queue, in order, ahead of newer ones.
+/// Events that no longer fit are dropped and counted.
+pub fn requeue(events: Vec<Event>) {
+    let mut q = queue().lock().unwrap();
+    let room = MAX_QUEUED.saturating_sub(q.len());
+    let dropped = events.len().saturating_sub(room);
+    for e in events.into_iter().take(room).rev() {
+        q.push_front(e);
+    }
+    drop(q);
+    if dropped > 0 {
+        DROPPED.fetch_add(dropped as u64, Ordering::Relaxed);
+    }
+}
+
 pub fn queued() -> usize {
     queue().lock().unwrap().len()
 }
@@ -242,6 +257,45 @@ impl Emit {
 mod tests {
     use super::*;
     use crate::config::Wire;
+
+    fn event(id: &str) -> Event {
+        Event {
+            ts_ms: 0,
+            request_id: id.into(),
+            api_key_id: String::new(),
+            user_id: String::new(),
+            team_id: String::new(),
+            model_name: "requeue-test".into(),
+            deployment_id: String::new(),
+            provider_id: String::new(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            cost_usd: 0.0,
+            unpriced: false,
+            latency_ms: 0,
+            status_code: 200,
+            stream: false,
+            notional_cost_usd: 0.0,
+            attempts: 0,
+            error_code: "",
+            ttft_ms: 0,
+        }
+    }
+
+    #[test]
+    fn requeued_events_go_out_first_in_order() {
+        push(event("c"));
+        requeue(vec![event("a"), event("b")]);
+        let ids: Vec<_> = take(usize::MAX, usize::MAX)
+            .into_iter()
+            .filter(|e| e.model_name == "requeue-test")
+            .map(|e| e.request_id)
+            .collect();
+        assert_eq!(ids, ["a", "b", "c"]);
+    }
 
     #[test]
     fn batches_are_capped_by_count_and_bytes() {

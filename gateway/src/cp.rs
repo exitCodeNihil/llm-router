@@ -26,9 +26,11 @@ pub const VERSION: &str = match option_env!("LLMR_VERSION") {
 
 /// The most events one sync uploads, and about the most bytes before gzip; a
 /// backlog goes out in back-to-back syncs. The control plane reads at most
-/// 32 MiB of a sync, so the byte cap keeps a batch well under that.
-const MAX_BATCH: usize = 20_000;
-const MAX_BATCH_BYTES: usize = 8 << 20;
+/// 32 MiB of a sync, so the byte cap keeps a batch at half that. A proxy that
+/// refuses a batch as too large (413) halves the cap, down to MIN_BATCH_BYTES.
+const MAX_BATCH: usize = 50_000;
+const MAX_BATCH_BYTES: usize = 16 << 20;
+const MIN_BATCH_BYTES: usize = 64 << 10;
 
 pub struct ControlPlane {
     base: String,
@@ -279,8 +281,7 @@ impl ControlPlane {
     /// and settle it on success.
     async fn sync_once(&self, s: &mut Syncer) -> bool {
         if s.pending.is_none() {
-            let events = usage::take(MAX_BATCH, MAX_BATCH_BYTES);
-            let count = events.len();
+            let events = usage::take(MAX_BATCH, s.max_bytes());
             let (rates, scopes) = limits::freeze();
             s.batch += 1;
             let (batch, cursor) = (s.batch, s.cursor.clone());
@@ -299,11 +300,11 @@ impl ControlPlane {
                 let mut gz =
                     flate2::write::GzEncoder::new(Vec::with_capacity(json.len() / 8), flate2::Compression::fast());
                 gz.write_all(&json)?;
-                gz.finish()
+                Ok::<_, std::io::Error>((gz.finish()?, events))
             })
             .await;
-            let Ok(Ok(body)) = body else { return false };
-            s.pending = Some(Batch { body: body.into(), scopes, events: count });
+            let Ok(Ok((body, events))) = body else { return false };
+            s.pending = Some(Batch { body: body.into(), scopes, events });
         }
         let Some(batch) = &s.pending else { return false };
         let (session, generation) = self.session();
@@ -325,13 +326,21 @@ impl ControlPlane {
             Ok(Call::Ok(status, _, bytes)) => {
                 metrics::SYNC_FAILURES.fetch_add(1, Ordering::Relaxed);
                 let why = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]).trim().to_string();
-                if refused(status) {
+                if status == StatusCode::PAYLOAD_TOO_LARGE && s.max_bytes() > MIN_BATCH_BYTES {
+                    // Something in between limits request size: put the events
+                    // back and send smaller batches from now on.
+                    let Some(batch) = s.pending.take() else { return false };
+                    s.limit_bytes = Some(s.max_bytes() / 2);
+                    eprintln!("sync: {status}; sending batches of at most {} bytes", s.max_bytes());
+                    limits::discard(&batch.scopes);
+                    usage::requeue(batch.events);
+                } else if refused(status) {
                     // Resending the same bytes would be refused again and hold
                     // back every later event: drop this batch and move on.
-                    metrics::SYNC_REFUSED_EVENTS.fetch_add(batch.events as u64, Ordering::Relaxed);
-                    eprintln!("sync: {status}: {why}; dropping a batch of {} events", batch.events);
+                    let Some(batch) = s.pending.take() else { return false };
+                    metrics::SYNC_REFUSED_EVENTS.fetch_add(batch.events.len() as u64, Ordering::Relaxed);
+                    eprintln!("sync: {status}: {why}; dropping a batch of {} events", batch.events.len());
                     limits::discard(&batch.scopes);
-                    s.pending = None;
                 } else {
                     eprintln!("sync: {status}: {why}");
                 }
@@ -351,20 +360,30 @@ struct Syncer {
     batch: i64,
     cursor: String,
     pending: Option<Batch>,
+    /// A smaller byte cap than MAX_BATCH_BYTES, after a 413.
+    limit_bytes: Option<usize>,
 }
 
-/// A frozen upload, resent as is until acknowledged.
+impl Syncer {
+    fn max_bytes(&self) -> usize {
+        self.limit_bytes.unwrap_or(MAX_BATCH_BYTES)
+    }
+}
+
+/// A frozen upload, resent as is until acknowledged. Its events are kept to
+/// be queued again if the batch turns out to be too large to send.
 struct Batch {
     body: Bytes,
     scopes: Vec<Arc<limits::Scope>>,
-    events: usize,
+    events: Vec<Event>,
 }
 
-/// Whether the control plane refused a batch for good: a client error other
-/// than a timeout or a rate limit. 401 is handled before this, by joining
-/// again. Server errors are worth resending.
+/// Whether the control plane refused a batch for good: it answers 400 when it
+/// cannot read one, and a sync it cannot read now it never will. Anything
+/// else, including a 4xx from a proxy or load balancer in between (a 404 or
+/// 503 during a rollout, say), is resent. 401 is handled before this.
 fn refused(status: StatusCode) -> bool {
-    status.is_client_error() && status != StatusCode::REQUEST_TIMEOUT && status != StatusCode::TOO_MANY_REQUESTS
+    status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY
 }
 
 #[derive(Serialize)]
@@ -414,8 +433,10 @@ mod tests {
     fn only_lasting_refusals_drop_a_batch() {
         for (status, drop) in [
             (StatusCode::BAD_REQUEST, true),
-            (StatusCode::PAYLOAD_TOO_LARGE, true),
             (StatusCode::UNPROCESSABLE_ENTITY, true),
+            (StatusCode::FORBIDDEN, false),
+            (StatusCode::NOT_FOUND, false),
+            (StatusCode::PAYLOAD_TOO_LARGE, false),
             (StatusCode::REQUEST_TIMEOUT, false),
             (StatusCode::TOO_MANY_REQUESTS, false),
             (StatusCode::INTERNAL_SERVER_ERROR, false),
