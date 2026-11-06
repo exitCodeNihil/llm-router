@@ -302,7 +302,9 @@ try {
   check("a failing banner names it", await page.getByText(`${lfName} is failing`).isVisible());
   await lfRow.getByText("Failing").hover();
   await page.waitForTimeout(800);
-  check("hovering the status shows the last error", await page.getByText(/^Last error/).first().isVisible().catch(() => false));
+  // Other destinations' tooltips hold a last error too, hidden: look for a shown one.
+  const shown = await Promise.all((await page.getByText(/^Last error/).all()).map((l) => l.isVisible().catch(() => false)));
+  check("hovering the status shows the last error", shown.includes(true));
   await shot(page, "05-card-failing", { fullPage: true });
 
   await page.goto(`${BASE}/requests`, { waitUntil: "networkidle" });
