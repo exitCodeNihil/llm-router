@@ -26,7 +26,7 @@ spec:
   template:
     metadata:
       labels: *labels
-      {{- if .Values.metrics.podAnnotations }}
+      {{- if and .Values.metrics.podAnnotations (not .Values.metrics.podMonitor.enabled) }}
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "8080"
@@ -34,6 +34,9 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "llm-router.gatewayServiceAccountName" . }}
+      # Long enough to wait out endpoint removal, finish requests in flight
+      # (LLMR_SHUTDOWN_TIMEOUT) and upload the last usage.
+      terminationGracePeriodSeconds: {{ .Values.gateway.terminationGracePeriodSeconds }}
       containers:
         - name: gateway
           image: "{{ .Values.gateway.image.repository }}:{{ .Values.gateway.image.tag | default .Chart.AppVersion }}"
@@ -63,7 +66,14 @@ spec:
           {{- end }}
           readinessProbe:
             httpGet: {path: /healthz, port: 8080}
-          resources: {{- toYaml .Values.gateway.resources | nindent 12 }}
+          {{- if .Values.gateway.preStopSleepSeconds }}
+          # Keep accepting while the endpoint is removed from Services, so a
+          # scale-in or rollout refuses no connections.
+          lifecycle:
+            preStop:
+              sleep: {seconds: {{ .Values.gateway.preStopSleepSeconds }}}
+          {{- end }}
+          resources: {{- toYaml (.Values.gateway.resources | default dict) | nindent 12 }}
       {{- if or .Values.anthropicIdentity.enabled .Values.gateway.extraVolumes }}
       volumes:
         {{- if .Values.anthropicIdentity.enabled }}

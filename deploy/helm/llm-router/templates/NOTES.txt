@@ -1,0 +1,7 @@
+llm-router is installed{{ if .Values.ingress.enabled }} at http{{ if .Values.ingress.tls }}s{{ end }}://{{ .Values.ingress.host }}{{ end }}.
+{{- if and .Values.gateway.enabled (not (dig "limits" "memory" "" (.Values.gateway.resources | default dict))) }}
+
+WARNING: the gateways have no memory limit. Past saturation a gateway's memory
+grows with its open connections, and LLMRouterGatewayMemoryHigh can't fire
+without a limit. Set gateway.resources.limits.memory.
+{{- end }}

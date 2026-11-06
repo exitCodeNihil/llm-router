@@ -77,22 +77,30 @@ gateway:
     requests:
       cpu: 250m
       memory: 128Mi
-  # Scale gateways on CPU (needs metrics-server and a CPU request). Gateways
-  # scale horizontally; the control plane does not (see replicas above).
-  # Past saturation a gateway's memory grows with its open connections, so set
-  # a memory limit too and scale before CPU runs out.
+  # On scale-in or rollout: keep accepting for preStopSleepSeconds while the pod
+  # leaves the Service (0 turns this off; needs Kubernetes 1.30+), then finish
+  # requests in flight (LLMR_SHUTDOWN_TIMEOUT, 30 s) and upload the last usage.
+  preStopSleepSeconds: 5
+  terminationGracePeriodSeconds: 50
+  # Scale gateways on CPU (needs metrics-server and a CPU request), and
+  # optionally on memory. Gateways scale horizontally; the control plane does
+  # not (see replicas above). A gateway mostly waits on upstreams, and past
+  # saturation its memory grows with its open connections while CPU can stay
+  # low: set a memory limit, and a memory target to scale on it too.
   autoscaling:
     enabled: false
     minReplicas: 2
     maxReplicas: 10
     targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: null   # e.g. 70, against the memory request
 
 # Prometheus metrics (docs/monitoring.md). Gateways serve /metrics on their
 # traffic port; the control plane serves it on its own port, which the
 # ingress does not route, so the console's host never exposes it.
 metrics:
   port: 9090         # the control plane's metrics port; 0 serves /metrics on 8080
-  # prometheus.io/scrape, /port and /path annotations on both pods.
+  # prometheus.io/scrape, /port and /path annotations on both pods; left out
+  # while podMonitor is on, so no target is scraped twice.
   podAnnotations: true
   # PodMonitors for the Prometheus Operator: the control plane and every gateway.
   podMonitor:

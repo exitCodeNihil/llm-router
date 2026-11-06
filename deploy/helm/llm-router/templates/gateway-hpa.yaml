@@ -1,7 +1,11 @@
 {{- if and .Values.gateway.enabled .Values.gateway.autoscaling.enabled }}
 {{- $a := .Values.gateway.autoscaling }}
-{{- if not (dig "requests" "cpu" "" .Values.gateway.resources) }}
+{{- $res := .Values.gateway.resources | default dict }}
+{{- if not (dig "requests" "cpu" "" $res) }}
 {{- fail "gateway.autoscaling needs gateway.resources.requests.cpu: CPU utilization is measured against the request" }}
+{{- end }}
+{{- if and $a.targetMemoryUtilizationPercentage (not (dig "requests" "memory" "" $res)) }}
+{{- fail "gateway.autoscaling.targetMemoryUtilizationPercentage needs gateway.resources.requests.memory" }}
 {{- end }}
 # Gateways scale horizontally: each one joins the group and shares limits
 # through the control plane, which stays a single replica.
@@ -26,4 +30,14 @@ spec:
         target:
           type: Utilization
           averageUtilization: {{ $a.targetCPUUtilizationPercentage }}
+    {{- with $a.targetMemoryUtilizationPercentage }}
+    # A gateway mostly waits on upstreams, so it can run out of memory holding
+    # connections while its CPU stays low.
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ . }}
+    {{- end }}
 {{- end }}

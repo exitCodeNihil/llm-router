@@ -18,7 +18,7 @@ connections and memory together, and add gateways before CPU runs out.
 | Console | **Gateways** page; `GET /api/nodes` and `GET /api/nodes/history` | admin |
 
 `/metrics` carries no secret and nothing per key, user, team or model: counters by route and
-status class, gauges, and the names of gateway groups and gateways. Like the gateways', the
+status class, gauges, and the names of gateway groups, gateways and telemetry destinations. Like the gateways', the
 control plane's asks for no credential, so Prometheus scrapes it with no setup.
 
 The control plane's listener also serves the console, so it is often public. To keep `/metrics` off
@@ -75,12 +75,14 @@ The control plane only:
 | `llmr_telemetry_destination_delivered_total` | counter | `destination` | Spans the destination accepted |
 | `llmr_telemetry_destination_dropped_total` | counter | `destination`, `reason` | Spans lost: `overflow` (queue full), `rejected` (refused by the destination), `expired` (retries gave up) |
 
-The `llmr_gateway_*` series come from each gateway's sync, about every second, so scraping the
+The `llmr_gateway_*` series come from each gateway's sync, every 2 seconds (back to back while it
+has usage to upload), so scraping the
 control plane alone gives the whole fleet's connections and memory. `gateway` is the gateway's name
 (`LLMR_GATEWAY_NAME`, by default its hostname, the pod name on Kubernetes); the label is not
 `instance`, which Prometheus sets to the scraped target. A gateway that shuts down goes from these
-series within 15 seconds; one that stops syncing without shutting down stays for 5 minutes, so
-`LLMRouterGatewayNotSyncing` can fire, and then goes. Scrape the gateways too for their request
+series within 15 seconds; one that stops syncing without shutting down stays for 30 minutes, so
+`LLMRouterGatewayNotSyncing` can fire and keeps firing, and then goes. Give every gateway in a group
+its own name: two with the same name show as one. Scrape the gateways too for their request
 counters, latency, sheds and sync failures.
 
 ## Kubernetes
@@ -112,6 +114,12 @@ The labels must match your Prometheus's `podMonitorSelector` and `ruleSelector`.
 | `gateway.autoscaling.enabled` | `false` | A HorizontalPodAutoscaler for the gateways |
 | `gateway.autoscaling.minReplicas`, `.maxReplicas` | `2`, `10` | Its bounds |
 | `gateway.autoscaling.targetCPUUtilizationPercentage` | `70` | Its CPU target, against `gateway.resources.requests.cpu` |
+| `gateway.autoscaling.targetMemoryUtilizationPercentage` | unset | A memory target too, against `gateway.resources.requests.memory` |
+| `gateway.preStopSleepSeconds` | `5` | On scale-in or rollout, keep accepting while the pod leaves the Service (Kubernetes 1.30+; `0` turns it off) |
+| `gateway.terminationGracePeriodSeconds` | `50` | Time to finish requests in flight (`LLMR_SHUTDOWN_TIMEOUT`, 30 s) and upload the last usage |
+
+The scrape annotations are left out while `metrics.podMonitor.enabled` is on, so no target is
+scraped twice.
 
 ## Alerts
 
@@ -120,11 +128,13 @@ The labels must match your Prometheus's `podMonitorSelector` and `ruleSelector`.
 | `LLMRouterControlPlaneDown` | No control plane scraped (`absent(llmr_build_info{runtime="control_plane"})`) | 5m |
 | `LLMRouterGatewayNotSyncing` | A gateway's last sync is more than 30 s old | 1m |
 | `LLMRouterGatewaySyncFailing` | A gateway's syncs keep failing | 10m |
-| `LLMRouterGatewayMemoryHigh` | A gateway uses more than 85% of its memory limit | 5m |
+| `LLMRouterGatewayNotReady` | A gateway has had no config or no sync since it started (`llmr_ready == 0`) | 5m |
+| `LLMRouterGatewayMemoryHigh` | A gateway uses more than 85% of its memory limit, from its own `/metrics`, so it fires while the control plane is down. Needs a memory limit on the gateway | 5m |
 | `LLMRouterRequestsShed` | A gateway sheds requests (`rate(llmr_shed_total[5m]) > 0`) | 2m |
 | `LLMRouterHighErrorRate` | More than 5% of `/v1` requests end in 5xx | 10m |
 | `LLMRouterUsageDropped` | Usage events were dropped in the last 10 minutes | |
 | `LLMRouterTelemetryDestinationFailing` | A telemetry destination keeps failing (`llmr_telemetry_destination_failing{destination}`) | 10m |
+| `LLMRouterTelemetrySpansDropped` | A telemetry destination dropped spans in the last 10 minutes, by reason (info) | |
 
 Without the operator, copy the `groups` from `helm template` with
 `metrics.prometheusRule.enabled=true` into a rules file.
@@ -152,8 +162,11 @@ the control plane's memory, so it starts empty after a restart.
 ## Scaling
 
 Gateways scale horizontally: add replicas, or turn on `gateway.autoscaling`. Each joins its group,
-takes its config from the control plane and shares rate limits and budgets through it. Scale on CPU
-and give gateways a memory limit, so the memory alert has something to measure against.
+takes its config from the control plane and shares rate limits and budgets through it. A gateway
+mostly waits on upstreams, so it can run out of memory holding connections while its CPU stays
+low: scale on CPU and memory, and give gateways a memory limit, so the memory alert has something
+to measure against. Memory and its limit are read from cgroup v2; on a cgroup v1 host memory is the
+process's resident size and there is no limit.
 
 The control plane doesn't scale out. It keeps rate limits, budget counters, live metrics and the
 gateway history in memory, so it runs as one replica (see [Kubernetes](deploy.md#kubernetes)).

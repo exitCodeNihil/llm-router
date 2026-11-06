@@ -83,12 +83,16 @@ spec:
           annotations:
             summary: "{{ "{{ $labels.pod }}" }} fails to sync with the control plane"
             description: The gateway's syncs with the control plane have been failing for 10 minutes; see its logs.
+        # From each gateway's own /metrics, so it fires while the control plane
+        # is down too. Needs a memory limit on the gateway.
         - alert: LLMRouterGatewayMemoryHigh
-          expr: llmr_gateway_memory_bytes{ {{- $sel -}} } / llmr_gateway_memory_limit_bytes{ {{- $sel -}} } > {{ $r.gatewayMemoryRatio }}
+          expr: |
+            (llmr_memory_bytes{ {{- $sel -}} } / llmr_memory_limit_bytes{ {{- $sel -}} })
+              * on (instance) group_left llmr_build_info{runtime="gateway",{{ $sel }}} > {{ $r.gatewayMemoryRatio }}
           for: 5m
           labels: {severity: warning}
           annotations:
-            summary: "Gateway {{ "{{ $labels.group }}/{{ $labels.gateway }}" }} uses {{ "{{ $value | humanizePercentage }}" }} of its memory limit"
+            summary: "Gateway {{ "{{ $labels.instance }}" }} uses {{ "{{ $value | humanizePercentage }}" }} of its memory limit"
             description: Past saturation a gateway's memory grows with its open connections until it is killed. Add gateways or lower LLMR_MAX_IN_FLIGHT.
         - alert: LLMRouterRequestsShed
           expr: rate(llmr_shed_total{ {{- $sel -}} }[5m]) > 0
@@ -106,6 +110,13 @@ spec:
           annotations:
             summary: "{{ "{{ $value | humanizePercentage }}" }} of /v1 requests fail with 5xx"
             description: Upstreams are failing or unreachable; see the Requests page for which deployments.
+        - alert: LLMRouterGatewayNotReady
+          expr: llmr_ready{ {{- $sel -}} } == 0
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "Gateway {{ "{{ $labels.instance }}" }} has not been ready for 5 minutes"
+            description: It has no config or has not synced with the control plane since it started; see its logs.
         - alert: LLMRouterUsageDropped
           expr: increase(llmr_usage_dropped_total{ {{- $sel -}} }[10m]) > 0
           labels: {severity: warning}
@@ -118,5 +129,11 @@ spec:
           labels: {severity: warning}
           annotations:
             summary: "Telemetry destination {{ "{{ $labels.destination }}" }} is failing"
-            description: Exports to this destination have been failing for 10 minutes; see Settings, Observability.
+            description: Exports to this destination have been failing for 10 minutes; see Observability.
+        - alert: LLMRouterTelemetrySpansDropped
+          expr: sum by (destination, reason) (increase(llmr_telemetry_destination_dropped_total{ {{- $sel -}} }[10m])) > 0
+          labels: {severity: info}
+          annotations:
+            summary: "Telemetry destination {{ "{{ $labels.destination }}" }} dropped spans ({{ "{{ $labels.reason }}" }})"
+            description: "overflow: the queue was full; rejected: the destination refused them; expired: it was unreachable for 10 minutes."
 {{- end }}

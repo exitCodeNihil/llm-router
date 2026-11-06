@@ -15,7 +15,7 @@ spec:
   template:
     metadata:
       labels: *labels
-      {{- if .Values.metrics.podAnnotations }}
+      {{- if and .Values.metrics.podAnnotations (not .Values.metrics.podMonitor.enabled) }}
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: {{ .Values.metrics.port | default 8080 | quote }}
