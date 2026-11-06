@@ -243,38 +243,6 @@ export interface TelemetryRule {
   enabled: boolean;
 }
 
-// Delivery outcome from the in-process exporter. Distinct from the live feed,
-// which lists events *selected* for export: a rejected key still fills the feed.
-export interface TelemetryHealth {
-  delivered: number;
-  dropped: number;
-  last_ok_at?: string;
-  last_error?: string;
-  last_error_at?: string;
-}
-
-export interface TelemetrySettings {
-  configured: boolean;
-  health?: TelemetryHealth;
-  /** Langfuse trace URL prefix; append a request_id. Absent when export is off. */
-  trace_base_url?: string;
-  telemetry?: {
-    type: "langfuse";
-    host: string;
-    public_key: string;
-    secret_key: string;
-    enabled: boolean;
-    capture_content: boolean;
-    mode: TelemetryMode | ""; // "" == everything
-    rules: TelemetryRule[];
-    // legacy scope fields — removed on the backend, kept optional so the old
-    // Telemetry.tsx card keeps compiling until the Observability page lands.
-    scope?: "all" | "tags" | "teams";
-    scope_tags?: string[];
-    scope_team_ids?: string[];
-  };
-}
-
 // Capture policy (GET/PUT /api/settings/telemetry). It decides what may be
 // exported at all; each destination then filters by its own scope and
 // content mode.
@@ -484,10 +452,6 @@ export interface DeploymentReq {
 }
 
 // ── Observability ────────────────────────────────────────────────
-export interface ObservabilityTest {
-  ok: boolean;
-  detail: string;
-}
 export interface ExportedEvent {
   ts: string;
   key_name: string;

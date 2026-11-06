@@ -25,7 +25,6 @@ import type {
   Node,
   NodesResponse,
   NodesHistoryResponse,
-  ObservabilityTest,
   Price,
   Provider,
   RequestFilters,
@@ -37,7 +36,7 @@ import type {
   TeamMember,
   TelemetryDestination,
   TelemetryKind,
-  TelemetrySettings,
+  TelemetryPolicy,
   TimeseriesPoint,
   TokenIssuer,
   UsageByModel,
@@ -452,26 +451,22 @@ export const useSetSso = () =>
     [["sso"]],
   );
 
-// ── Telemetry settings ──────────────────────────────────────────
+// ── Telemetry capture policy ────────────────────────────────────
 export function useTelemetry(enabled = true) {
   return useQuery({
     queryKey: ["telemetry"],
     enabled,
     queryFn: async () => {
-      const d = await api.get<TelemetrySettings>("/api/settings/telemetry");
-      // Legacy telemetry blobs predate the rules engine — default rules/mode so
-      // every consumer (Observability page, Keys trace badges) can iterate safely.
-      if (d.telemetry) {
-        d.telemetry.rules = d.telemetry.rules ?? [];
-        d.telemetry.mode = d.telemetry.mode || "everything";
-      }
+      const d = await api.get<TelemetryPolicy>("/api/settings/telemetry");
+      d.rules = d.rules ?? [];
+      d.mode = d.mode || "everything";
       return d;
     },
   });
 }
 export const useSetTelemetry = () =>
   useInvalidatingMutation(
-    (b: Record<string, unknown>) => api.put("/api/settings/telemetry", b),
+    (b: TelemetryPolicy) => api.put("/api/settings/telemetry", b),
     [["telemetry"]],
   );
 
@@ -908,14 +903,6 @@ export function useObservabilityRuleStats(preview?: {
       } satisfies RuleStats;
     },
     refetchInterval: 5_000,
-  });
-}
-
-// ── Observability: test connection (always HTTP 200; check `ok`) ──
-export function useTestObservability() {
-  return useMutation({
-    mutationFn: (b: Record<string, unknown>) =>
-      api.post<ObservabilityTest>("/api/observability/test", b),
   });
 }
 

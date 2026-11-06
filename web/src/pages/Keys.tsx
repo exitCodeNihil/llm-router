@@ -18,7 +18,7 @@ import { Timestamp } from "@astryxdesign/core/Timestamp";
 import { Tooltip } from "@astryxdesign/core/Tooltip";
 import { useToast } from "@astryxdesign/core/Toast";
 
-import type { ApiKey, Me, TelemetrySettings } from "../lib/types";
+import type { ApiKey, Me, TelemetryPolicy } from "../lib/types";
 import {
   useChatModels,
   useCreateKey,
@@ -70,7 +70,7 @@ function ownerLabel(k: ApiKey, teamName?: string, userEmail?: string): string {
 /** Whether telemetry export applies to this key under the current settings. */
 function evalTrace(
   k: ApiKey,
-  t: TelemetrySettings["telemetry"],
+  t: TelemetryPolicy | undefined,
 ): { capture: "content" | "meta" | "none"; rule?: string } {
   if (!t || t.mode === "off") return { capture: "none" };
   if (t.mode !== "by_rule")
@@ -376,7 +376,7 @@ export default function Keys({ me }: { me: Me }) {
   const del = useDeleteKey();
   const update = useUpdateKey();
   const showToast = useToast();
-  const telemetry = useTelemetry(me.is_admin).data?.telemetry;
+  const telemetry = useTelemetry(me.is_admin).data;
   // Mirrors canManageKey server-side: admins, the owning team's admins, and
   // the personal owner. Everyone else gets a read-only row.
   const canManage = (k: ApiKey) =>
