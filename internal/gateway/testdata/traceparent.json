@@ -1,5 +1,5 @@
 {
- "about": "W3C traceparent parsing shared by the Go and Rust gateways. An invalid header is ignored: the request starts a new trace and is exported as usual. sampled is flags & 1; a valid header with sampled false means nothing is exported for the request.",
+ "about": "W3C traceparent parsing shared by the Go and Rust gateways. An invalid header is ignored: the request starts a new trace and is exported as usual. sampled is flags & 1, parsed but not acted on: the trace id and parent id are used whatever it says, and the export policy alone decides what is exported.",
  "cases": [
   {"header": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", "valid": true, "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "parent_id": "00f067aa0ba902b7", "sampled": true},
   {"header": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00", "valid": true, "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", "parent_id": "00f067aa0ba902b7", "sampled": false},

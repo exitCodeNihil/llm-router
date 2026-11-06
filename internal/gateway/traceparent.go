@@ -15,8 +15,9 @@ import (
 type traceCtx struct {
 	TraceID  string // 32 hex
 	ParentID string // the caller's span, 16 hex; "" for a new trace
-	// Sampled is false only when the caller's traceparent says its trace is
-	// not recorded; then nothing is exported for the request either.
+	// Sampled is the caller's sampled flag. Read, never acted on: what is
+	// exported is the policy's decision alone, or any key holder could opt
+	// out of export.
 	Sampled bool
 	// Operation is gen_ai.operation.name for the route.
 	Operation string

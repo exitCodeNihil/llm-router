@@ -160,8 +160,8 @@ func callerErrorCode(err error) string {
 }
 
 // telemetryDecision computes the export/capture verdict once per request from
-// the identity's key/user/team ids and aggregated tags. A caller whose trace
-// is not sampled gets nothing exported.
+// the identity's key/user/team ids and aggregated tags. The caller's
+// traceparent doesn't take part: its sampled flag would let a caller opt out.
 func telemetryDecision(snap *snapshot.Snapshot, id *auth.Identity, reqID string, tr traceCtx) snapshot.Decision {
 	var tags []string
 	keyID, userID, teamID := "", "", ""
@@ -177,11 +177,7 @@ func telemetryDecision(snap *snapshot.Snapshot, id *auth.Identity, reqID string,
 		teamID = id.Team.ID
 		tags = append(tags, id.Team.Tags...)
 	}
-	dec := snap.Telemetry.Evaluate(keyID, userID, teamID, tags, reqID)
-	if !tr.Sampled {
-		return snapshot.Decision{RuleID: dec.RuleID}
-	}
-	return dec
+	return snap.Telemetry.Evaluate(keyID, userID, teamID, tags, reqID)
 }
 
 // contentCap is how many bytes of content to capture: none unless the policy

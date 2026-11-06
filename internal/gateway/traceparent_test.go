@@ -84,10 +84,12 @@ func TestTraceIDOnResponseAndEvent(t *testing.T) {
 		t.Fatalf("header %q, event %q", got, e.TraceID)
 	}
 
-	// The caller's trace isn't sampled: nothing is exported.
+	// The caller's trace isn't sampled: exported all the same, in its trace.
+	// The policy alone decides, or a caller could opt out of export.
 	traceReq(t, g, key, "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00")
-	if e = cw.events[len(cw.events)-1]; e.Export || e.CaptureContent {
-		t.Fatalf("unsampled trace exported: %+v", e)
+	if e = cw.events[len(cw.events)-1]; !e.Export || e.TraceID != "4bf92f3577b34da6a3ce929d0e0e4736" ||
+		e.ParentSpanID != "00f067aa0ba902b7" {
+		t.Fatalf("unsampled trace not exported: %+v", e)
 	}
 }
 
