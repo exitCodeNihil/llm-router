@@ -30,6 +30,7 @@ use ring::signature;
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::https_or_loopback;
 use crate::config::{Config, Issuer, Key, User};
 use crate::now_ms;
 use crate::server::{HttpsClient, https_client};
@@ -414,6 +415,11 @@ async fn fetch_keys(client: &HttpsClient, issuer: &str) -> Result<KeySet, String
         #[serde(default)]
         id_token_signing_alg_values_supported: Vec<String>,
     }
+    // Tokens are trusted on the strength of these keys: fetch them only over
+    // https (plain http to this machine, for a local test issuer).
+    if !https_or_loopback(issuer) {
+        return Err(format!("issuer {issuer:?} must use https"));
+    }
     let url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
     let d: Discovery = serde_json::from_slice(&get(client, &url).await?).map_err(|e| format!("discovery: {e}"))?;
     if d.issuer != issuer {
@@ -421,6 +427,9 @@ async fn fetch_keys(client: &HttpsClient, issuer: &str) -> Result<KeySet, String
             "issuer did not match the issuer returned by provider, expected {issuer:?} got {:?}",
             d.issuer
         ));
+    }
+    if !https_or_loopback(&d.jwks_uri) {
+        return Err(format!("jwks_uri {:?} must use https", d.jwks_uri));
     }
     let jwks: Jwks = serde_json::from_slice(&get(client, &d.jwks_uri).await?).map_err(|e| format!("jwks: {e}"))?;
     // What the issuer says it signs with, of what we verify; RS256 when
@@ -949,6 +958,26 @@ mod tests {
         assert_eq!(idp.fetches(), 2, "at most one refetch a minute");
         ids.verify(&cfg, &idp.mint("RS256", "k1", json!({}))).await.unwrap();
         assert_eq!(idp.fetches(), 2);
+    }
+
+    #[tokio::test]
+    async fn fetches_keys_only_over_https() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = https_client(1);
+        let err = fetch_keys(&client, "http://idp.example").await.err().unwrap();
+        assert!(err.contains("must use https"), "{err}");
+        // A discovery document that points at plain-http keys elsewhere.
+        let me: Arc<OnceLock<String>> = Arc::default();
+        let m = me.clone();
+        let url = serve(Arc::new(move |_, _, _| {
+            let base = m.get().cloned().unwrap_or_default();
+            let doc = json!({"issuer": base, "jwks_uri": "http://keys.example/jwks"}).to_string();
+            Box::pin(async move { (200, doc) })
+        }))
+        .await;
+        me.set(url.clone()).unwrap();
+        let err = fetch_keys(&client, &url).await.err().unwrap();
+        assert!(err.contains("jwks_uri") && err.contains("must use https"), "{err}");
     }
 
     /// The current keys, as if fetched `age` ago.
