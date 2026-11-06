@@ -294,6 +294,7 @@ fn emit(cfg: &Arc<Config>, key: &Arc<Key>, model: String, stream: bool, rq: Rq) 
         verdict,
         content: None,
         output: Default::default(),
+        reserved: Default::default(),
     }
 }
 

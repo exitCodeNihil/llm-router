@@ -3,7 +3,7 @@
 //! Postgres and decides what telemetry to export.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -165,9 +165,57 @@ fn hex_span<S: Serializer>(n: &u64, s: S) -> Result<S::Ok, S::Error> {
 /// long enough to fill it, new events are dropped and counted.
 const MAX_QUEUED: usize = 200_000;
 
-/// The most captured content the queue holds. Past it an event keeps its
-/// usage and loses its content, marked truncated, and is counted.
+/// The most captured content the gateway holds: queued, and reserved by
+/// requests in flight. Past it a request is not captured, and an event put
+/// back after a failed sync loses its content; either keeps its usage, marked
+/// truncated, and is counted.
 const CONTENT_BUDGET: usize = 64 << 20;
+
+/// Content bytes reserved by requests in flight that capture it: the most each
+/// can hold until its event is queued.
+static RESERVED: AtomicUsize = AtomicUsize::new(0);
+/// The queue's content, readable without its lock.
+static QUEUED_CONTENT: AtomicUsize = AtomicUsize::new(0);
+
+/// A request's share of the content budget, given back when dropped: once its
+/// event is queued, where the queue counts the content instead, or when the
+/// request ends without one.
+#[derive(Debug, Default)]
+pub struct Reservation(usize);
+
+impl Reservation {
+    /// `n` bytes of the budget, if what is queued and reserved leaves them.
+    fn take(n: usize) -> Option<Reservation> {
+        let queued = QUEUED_CONTENT.load(Ordering::Relaxed);
+        let before = RESERVED.fetch_add(n, Ordering::Relaxed);
+        if before + n + queued > CONTENT_BUDGET {
+            RESERVED.fetch_sub(n, Ordering::Relaxed);
+            return None;
+        }
+        Some(Reservation(n))
+    }
+
+    /// Give back all but `n` bytes.
+    fn keep(&mut self, n: usize) {
+        if n < self.0 {
+            RESERVED.fetch_sub(self.0 - n, Ordering::Relaxed);
+            self.0 = n;
+        }
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.0 > 0 {
+            RESERVED.fetch_sub(self.0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Content bytes requests in flight have reserved.
+pub fn reserved_content() -> usize {
+    RESERVED.load(Ordering::Relaxed)
+}
 
 #[derive(Default)]
 struct Queue {
@@ -177,11 +225,6 @@ struct Queue {
 }
 
 impl Queue {
-    /// Count an event's content against the budget, or strip it.
-    fn admit(&mut self, e: &mut Event) {
-        self.admit_within(e, CONTENT_BUDGET);
-    }
-
     fn admit_within(&mut self, e: &mut Event, budget: usize) {
         let Some(c) = e.content.as_mut() else { return };
         let n = c.bytes();
@@ -200,7 +243,8 @@ fn queue() -> &'static Mutex<Queue> {
 }
 
 pub static DROPPED: AtomicU64 = AtomicU64::new(0);
-/// Events that lost their content because the queue's content budget was spent.
+/// Events that lost their content, or were never captured, because the
+/// content budget was spent.
 pub static CONTENT_STRIPPED: AtomicU64 = AtomicU64::new(0);
 
 fn push(mut e: Event) {
@@ -213,7 +257,9 @@ fn push(mut e: Event) {
         DROPPED.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    q.admit(&mut e);
+    // A captured event's reservation still covers its content: it fits.
+    q.admit_within(&mut e, CONTENT_BUDGET);
+    QUEUED_CONTENT.store(q.content, Ordering::Relaxed);
     q.events.push_back(e);
 }
 
@@ -225,13 +271,14 @@ pub fn take(max_events: usize, max_bytes: usize) -> Vec<Event> {
     let batch: Vec<Event> = q.events.drain(..n).collect();
     let freed: usize = batch.iter().filter_map(|e| e.content.as_ref()).map(|c| c.bytes()).sum();
     q.content -= freed;
+    QUEUED_CONTENT.store(q.content, Ordering::Relaxed);
     shrink(&mut q.events);
     batch
 }
 
 /// Content bytes the queue holds.
 pub fn queued_content() -> usize {
-    queue().lock().unwrap().content
+    QUEUED_CONTENT.load(Ordering::Relaxed)
 }
 
 /// The queue keeps the capacity a burst grew it to. Give most of it back once
@@ -285,10 +332,13 @@ pub fn requeue(events: Vec<Event>) {
     let mut q = queue().lock().unwrap();
     let room = MAX_QUEUED.saturating_sub(q.events.len());
     let dropped = events.len().saturating_sub(room);
+    // what requests in flight reserved stays theirs
+    let budget = CONTENT_BUDGET.saturating_sub(RESERVED.load(Ordering::Relaxed));
     for mut e in events.into_iter().take(room).rev() {
-        q.admit(&mut e);
+        q.admit_within(&mut e, budget);
         q.events.push_front(e);
     }
+    QUEUED_CONTENT.store(q.content, Ordering::Relaxed);
     drop(q);
     if dropped > 0 {
         DROPPED.fetch_add(dropped as u64, Ordering::Relaxed);
@@ -372,6 +422,8 @@ pub struct Emit {
     /// The request's content, once captured; the response text joins it at send.
     pub content: Option<Box<Content>>,
     pub output: Capture,
+    /// The content budget the capture holds until the event is queued.
+    pub reserved: Reservation,
 }
 
 /// The fields of a request body whose content is captured, the last of each
@@ -619,11 +671,27 @@ fn cut_utf8(s: &mut String, n: usize) -> bool {
 
 impl Emit {
     /// Capture the request's content when its verdict asks for it: messages,
-    /// and on the Anthropic surface its top-level system.
+    /// and on the Anthropic surface its top-level system. It reserves what the
+    /// capture can grow to, the response text up to the cap included, against
+    /// the content budget; when that is spent, nothing is captured and the
+    /// event is marked truncated.
     pub fn capture_request(&mut self, body: &[u8], with_system: bool) {
-        if self.verdict.capture > 0 {
-            self.content = Some(Box::new(capture_request(body, with_system, self.verdict.capture)));
+        let cap = self.verdict.capture;
+        if cap == 0 {
+            return;
         }
+        // Input and system are parts of the body, each within the cap.
+        let request = body.len().min(if with_system { cap.saturating_mul(2) } else { cap });
+        let Some(mut reserved) = Reservation::take(request.saturating_add(cap)) else {
+            CONTENT_STRIPPED.fetch_add(1, Ordering::Relaxed);
+            self.verdict.capture = 0;
+            self.content = Some(Box::new(Content { content_truncated: true, ..Content::default() }));
+            return;
+        };
+        let c = capture_request(body, with_system, cap);
+        reserved.keep(c.bytes() + cap);
+        self.content = Some(Box::new(c));
+        self.reserved = reserved;
     }
 
     /// The response text, for a verdict that captures content.
@@ -639,7 +707,8 @@ impl Emit {
     fn take_content(&mut self) -> Option<Box<Content>> {
         let limit = self.verdict.capture;
         if limit == 0 {
-            return None;
+            // none, or none for want of budget
+            return self.content.take();
         }
         let mut c = self.content.take().unwrap_or_default();
         let (output, cut) = std::mem::take(&mut self.output).into_parts();
@@ -655,6 +724,7 @@ impl Emit {
     /// Queue the request's event and count its tokens and spend against its limits.
     pub fn send(mut self, status: u16, error_code: &'static str, u: Usage, ttft_ms: i64) {
         let content = self.take_content();
+        let reserved = std::mem::take(&mut self.reserved);
         let mut e = Event {
             ts_ms: self.ts_ms,
             request_id: self.request_id,
@@ -705,6 +775,7 @@ impl Emit {
         let (cost, tokens) = (e.cost_usd, u.prompt + u.completion);
         metrics::latency(e.latency_ms);
         push(e);
+        drop(reserved); // the queue counts the content now
         limits::record(&self.key, tokens, cost);
     }
 }
@@ -1008,7 +1079,59 @@ mod tests {
             },
             content: None,
             output: Capture::default(),
+            reserved: Reservation::default(),
         }
+    }
+
+    /// A request that captures reserves what its capture can grow to against
+    /// the budget the queue's content counts in; past it the request isn't
+    /// captured. The reservation is given back when its event is queued, or
+    /// when the request ends without one.
+    #[test]
+    fn requests_in_flight_reserve_their_content() {
+        let _q = QUEUE.lock().unwrap();
+        let body = br#"{"system":"s","messages":[{"role":"user","content":"hello"}]}"#;
+        let (before, queued) = (reserved_content(), queued_content());
+        assert!(before + queued < CONTENT_BUDGET / 4, "{before} {queued}");
+        let cap = CONTENT_BUDGET / 2;
+        let mut a = emit_capturing("reserve-a", cap);
+        a.capture_request(body, true);
+        let held = body.len() - "{,}".len() - r#""system":"messages":"#.len() + cap;
+        assert_eq!(reserved_content(), before + held, "the request as captured, the response up to the cap");
+        assert!(a.content.as_ref().unwrap().input.is_some());
+
+        // over the budget: usage only, marked, and counted
+        let stripped = CONTENT_STRIPPED.load(Ordering::Relaxed);
+        let mut b = emit_capturing("reserve-b", cap);
+        b.capture_request(body, true);
+        assert_eq!(reserved_content(), before + held);
+        assert_eq!(b.verdict.capture, 0, "nor is the response captured");
+        b.set_output(crate::translate::oai_json_text(br#"{"choices":[{"message":{"content":"x"}}]}"#, cap));
+        assert!(CONTENT_STRIPPED.load(Ordering::Relaxed) > stripped);
+        b.send(200, "", Usage::default(), 0);
+
+        // a request that ends without an event gives its room back
+        drop(a);
+        assert_eq!(reserved_content(), before);
+        let mut c = emit_capturing("reserve-c", cap);
+        c.capture_request(body, true);
+        assert!(reserved_content() > before);
+        c.set_output(crate::translate::oai_json_text(br#"{"choices":[{"message":{"content":"answer"}}]}"#, cap));
+        c.send(200, "", Usage::default(), 0);
+        assert_eq!(reserved_content(), before, "the queue counts it now");
+
+        let (mine, rest): (Vec<Event>, Vec<Event>) =
+            take(usize::MAX, usize::MAX).into_iter().partition(|e| e.model_name.starts_with("reserve-"));
+        requeue(rest);
+        assert_eq!(queued_content(), queued);
+        let [b, c] = &mine[..] else { panic!("{mine:?}") };
+        let b = b.content.as_ref().unwrap();
+        assert!(b.content_truncated && b.input.is_none() && b.output.is_empty());
+        let c = c.content.as_ref().unwrap();
+        assert_eq!(
+            (c.input.as_ref().unwrap().get(), c.output.as_str()),
+            (r#"[{"role":"user","content":"hello"}]"#, "answer")
+        );
     }
 
     /// What is queued holds no more memory than the bytes the budget counts.

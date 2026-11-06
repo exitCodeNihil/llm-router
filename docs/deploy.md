@@ -108,8 +108,9 @@ group stops its gateways getting config at once, and they stop serving within 15
 Gateways trace requests as the control plane's own `/v1` does: they continue a caller's
 `traceparent`, return `X-Llmr-Trace-Id`, and capture prompts and responses only when the capture
 policy and a destination that takes the group's traffic with content both want them. Captured content
-travels to the control plane with the usage it belongs to. A gateway holds at most 64 MiB of it while
-the control plane is away; past that it sends usage without content.
+travels to the control plane with the usage it belongs to. A gateway keeps at most 64 MiB of it,
+counting what requests in flight may still capture, plus the one batch it is sending (at most 16 MiB
+before compression); past that it sends usage without content.
 
 Google Vertex AI and Azure Entra ID providers need gateways from 0.3.0; older gateways don't receive
 them. A Vertex provider's service account key goes to the gateways that serve it. With application
