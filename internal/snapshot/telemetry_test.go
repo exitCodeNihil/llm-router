@@ -178,3 +178,17 @@ func TestContentWanted(t *testing.T) {
 		}
 	}
 }
+
+// Settings that can't be read turn export off rather than on: the zero
+// policy exports everything.
+func TestCorruptTelemetrySettingsExportNothing(t *testing.T) {
+	for _, raw := range []string{`{"mode":`, `[]`, `{"mode":7}`} {
+		p := parseTelemetry([]byte(raw))
+		if p.Mode != "off" || p.Evaluate("k", "u", "t", nil, "r").Export {
+			t.Errorf("%s: policy %+v exports", raw, p)
+		}
+	}
+	if p := parseTelemetry([]byte(`{"mode":"by_rule"}`)); p.Mode != "by_rule" {
+		t.Errorf("valid settings: %+v", p)
+	}
+}

@@ -250,9 +250,7 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 
 	var telemetryRaw []byte
 	if err := b.Pool.QueryRow(ctx, `SELECT value FROM settings WHERE key='telemetry'`).Scan(&telemetryRaw); err == nil {
-		if err := json.Unmarshal(telemetryRaw, &s.Telemetry); err != nil {
-			slog.Error("corrupt telemetry settings; exporter disabled", "err", err)
-		}
+		s.Telemetry = parseTelemetry(telemetryRaw)
 	}
 
 	if err := b.loadDestinations(ctx, s); err != nil {
@@ -285,6 +283,17 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// parseTelemetry reads the capture policy. One that can't be read exports
+// nothing: the zero policy would export everything.
+func parseTelemetry(raw []byte) Telemetry {
+	var t Telemetry
+	if err := json.Unmarshal(raw, &t); err != nil {
+		slog.Error("corrupt telemetry settings; export is off until they are saved again", "err", err)
+		return Telemetry{Mode: "off"}
+	}
+	return t
 }
 
 // loadDestinations reads the telemetry destinations. One whose secrets can't
