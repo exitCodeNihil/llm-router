@@ -64,3 +64,10 @@ curl https://router.example.com/v1/chat/completions -H "Authorization: Bearer $T
   -H "Content-Type: application/json" \
   -d '{"model":"my-model","messages":[{"role":"user","content":"hi"}]}'
 ```
+
+[Gateways](deploy.md#gateways) verify identity tokens too, with the issuer's keys and no call to
+the control plane for people they know. A gateway group limited to some teams serves their members,
+and creates new users only when **Map to team** is one of its teams. A new person's first request
+goes to the control plane once, which checks the token itself before it creates the user, so a
+gateway can't create users on its own. To map tokens to users, gateways get every user they serve
+and a hash of each email address, not the address.

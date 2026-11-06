@@ -105,8 +105,7 @@ usage it held (up to 200,000 events) when it's back.
 A new join token stops further gateways joining with the old one; running ones carry on. Deleting a
 group stops its gateways getting config at once, and they stop serving within 15 minutes.
 
-The Rust gateway doesn't yet serve sign-in with identity tokens or prompt capture for telemetry. The
-control plane's own `/v1` serves both.
+The Rust gateway doesn't yet serve prompt capture for telemetry. The control plane's own `/v1` does.
 
 Google Vertex AI and Azure Entra ID providers need gateways from 0.3.0; older gateways don't receive
 them. A Vertex provider's service account key goes to the gateways that serve it. With application
