@@ -30,10 +30,23 @@ import { Sankey, type SankeyEdge, type SankeyNode } from "../components/Sankey";
 
 type Metric = "cost_usd" | "requests" | "tokens";
 
-// A provider keeps its colour when the ranking changes: hues go by name order.
-function providerColors(names: string[]): (name: string) => string {
-  const order = [...new Set(names)].sort();
-  return (name) => SERIES_COLORS[order.indexOf(name) % SERIES_COLORS.length];
+type ColorOf = (name: string) => string;
+
+// One colour per provider for the whole page: hues go by name order over every
+// provider either chart shows, so a provider has the same colour in both and
+// keeps it when the ranking changes. The spend chart's "other" stays neutral.
+function useProviderColors(days: number): ColorOf {
+  const flow = useUsageFlow(days);
+  const spend = useUsageByProviderDaily(days);
+  return useMemo(() => {
+    const names = new Set((flow.data ?? []).map((e) => e.provider_name));
+    for (const p of spend.data?.providers ?? []) if (p !== "other") names.add(p);
+    const order = [...names].sort();
+    return (name: string) =>
+      name === "other" && !names.has(name)
+        ? chart.neutral
+        : SERIES_COLORS[Math.max(order.indexOf(name), 0) % SERIES_COLORS.length];
+  }, [flow.data, spend.data]);
 }
 
 const trunc = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
@@ -43,7 +56,7 @@ const trunc = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…
  * links. Only the five busiest keys get their own row; the rest fold into a
  * "+N keys" node so the diagram stays readable under load.
  */
-function buildFlow(rows: FlowEdgeRow[], liveLed: Map<string, SankeyNode["led"]>) {
+function buildFlow(rows: FlowEdgeRow[], liveLed: Map<string, SankeyNode["led"]>, colorByName: ColorOf) {
   // History outlives keys, so deleted ones fold into a single node rather than
   // one identical-looking row per departed key id.
   const DELETED = "deleted";
@@ -73,8 +86,7 @@ function buildFlow(rows: FlowEdgeRow[], liveLed: Map<string, SankeyNode["led"]>)
     label: trunc(mm, 11),
   }));
 
-  // Providers that actually appear in the range, ordered by volume so colours
-  // stay stable as the range changes. led means "serving traffic right now",
+  // Providers that actually appear in the range, largest first. led means "serving traffic right now",
   // which is still live information even when the volumes are historical.
   const provVol = new Map<string, { name: string; vol: number }>();
   for (const e of rows) {
@@ -89,7 +101,6 @@ function buildFlow(rows: FlowEdgeRow[], liveLed: Map<string, SankeyNode["led"]>)
     led: liveLed.get(id),
   }));
 
-  const colorByName = providerColors(provRanked.map(([, p]) => p.name));
   const colorOf = new Map(provRanked.map(([id, p]) => [id, colorByName(p.name)]));
 
   const agg = new Map<string, SankeyEdge>();
@@ -108,7 +119,17 @@ function buildFlow(rows: FlowEdgeRow[], liveLed: Map<string, SankeyNode["led"]>)
 }
 
 // ── Routing flow ─────────────────────────────────────────
-function RoutingFlow({ days, rangeLabel, isAdmin }: { days: number; rangeLabel: string; isAdmin: boolean }) {
+function RoutingFlow({
+  days,
+  rangeLabel,
+  isAdmin,
+  colorOf,
+}: {
+  days: number;
+  rangeLabel: string;
+  isAdmin: boolean;
+  colorOf: ColorOf;
+}) {
   const flowRows = useUsageFlow(days);
   const live = useLiveMetrics(isAdmin);
   // Volumes are historical; the LED still reports how each upstream is doing
@@ -118,8 +139,8 @@ function RoutingFlow({ days, rangeLabel, isAdmin }: { days: number; rangeLabel: 
     [live.data],
   );
   const flow = useMemo(
-    () => (flowRows.data ? buildFlow(flowRows.data, liveLed) : null),
-    [flowRows.data, liveLed],
+    () => (flowRows.data ? buildFlow(flowRows.data, liveLed, colorOf) : null),
+    [flowRows.data, liveLed, colorOf],
   );
   const hasTraffic = !!flow && flow.edges.length > 0;
 
@@ -149,7 +170,7 @@ function RoutingFlow({ days, rangeLabel, isAdmin }: { days: number; rangeLabel: 
 }
 
 // ── Daily spend by provider ──────────────────────────────────
-function ProviderSpend({ days }: { days: number }) {
+function ProviderSpend({ days, colorOf }: { days: number; colorOf: ColorOf }) {
   const byProvider = useUsageByProviderDaily(days);
 
   const rows = useMemo(
@@ -157,9 +178,7 @@ function ProviderSpend({ days }: { days: number }) {
     [byProvider.data],
   );
 
-  const names = byProvider.data?.providers ?? [];
-  const colorOf = providerColors(names);
-  const series = names.map((p) => ({ key: p, name: p, color: colorOf(p) }));
+  const series = (byProvider.data?.providers ?? []).map((p) => ({ key: p, name: p, color: colorOf(p) }));
 
   if (byProvider.isLoading) return <Loading />;
   if (byProvider.error)
@@ -368,6 +387,7 @@ export default function Dashboard() {
   // Same label the range control shows, so the card cannot claim a different window.
   const rangeLabel = RANGES.find((r) => r.v === String(days))?.label ?? `${days}d`;
   const [metric, setMetric] = useState<Metric>("cost_usd");
+  const providerColor = useProviderColors(days);
 
   const summary = useUsageSummary(days);
   const daily = useUsageDaily(days);
@@ -452,7 +472,7 @@ export default function Dashboard() {
 
           {/* Live cells */}
           <Grid columns={{ minWidth: 300, repeat: "fit" }} gap={4}>
-            <RoutingFlow days={days} rangeLabel={rangeLabel} isAdmin={isAdmin} />
+            <RoutingFlow days={days} rangeLabel={rangeLabel} isAdmin={isAdmin} colorOf={providerColor} />
             {isAdmin && <UpstreamHealth />}
             <SpendByTeam />
           </Grid>
@@ -512,7 +532,7 @@ export default function Dashboard() {
             </Card>
           </Grid>
 
-          <ProviderSpend days={days} />
+          <ProviderSpend days={days} colorOf={providerColor} />
 
           <RecentRequests />
         </VStack>
