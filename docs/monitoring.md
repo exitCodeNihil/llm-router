@@ -70,6 +70,10 @@ The control plane only:
 | `llmr_gateway_memory_limit_bytes` | gauge | `group`, `gateway` | A gateway's memory limit; absent without one |
 | `llmr_gateway_last_sync_age_seconds` | gauge | `group`, `gateway` | Seconds since a gateway last synced |
 | `llmr_gateway_info` | gauge | `group`, `gateway`, `version` | Always 1 |
+| `llmr_telemetry_destination_failing` | gauge | `destination`, `kind` | 1 while a [telemetry destination](observability.md)'s last export failed |
+| `llmr_telemetry_destination_queued` | gauge | `destination` | Spans waiting to be sent |
+| `llmr_telemetry_destination_delivered_total` | counter | `destination` | Spans the destination accepted |
+| `llmr_telemetry_destination_dropped_total` | counter | `destination`, `reason` | Spans lost: `overflow` (queue full), `rejected` (refused by the destination), `expired` (retries gave up) |
 
 The `llmr_gateway_*` series come from each gateway's sync, about every second, so scraping the
 control plane alone gives the whole fleet's connections and memory. `gateway` is the gateway's name

@@ -128,7 +128,7 @@ func run() error {
 	live := metrics.NewLive()
 	nodeStore := metrics.NewNodeStore()
 	httpm := metrics.NewHTTP()
-	promReg := newMetrics(httpm, nodeStore, writer)
+	promReg := newMetrics(httpm, nodeStore, writer, exporter)
 	events := &metrics.Events{}
 	go watchConfigEpoch(ctx, holder, events)
 	gw.Usage = usage.MultiWriter{writer, exporter, live}
