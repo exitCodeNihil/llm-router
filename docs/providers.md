@@ -121,8 +121,10 @@ Where the token comes from depends on your platform:
 | Keycloak, Zitadel, Okta or another OIDC provider | A small job that fetches a client-credentials token and writes it to the file well before each expiry, with an audience mapper for `https://api.anthropic.com` |
 | GitHub Actions, Cloud Run, Lambda, ECS, VMs | The platform's token ([Anthropic's guides](https://platform.claude.com/docs/en/manage-claude/workload-identity-federation#identity-providers)), written to the file by a sidecar or job. llm-router reads a file or variable; it doesn't call Google's metadata server, AWS STS or Azure IMDS itself |
 
-- Tokens are cached and refreshed two minutes before expiry. If that fails the current one keeps serving
-  until 30 seconds before expiry, then requests on that deployment fail over.
+- Tokens are cached and renewed in the background about halfway through their life, so requests don't wait
+  and an outage shorter than that goes unnoticed. If renewal keeps failing, it retries with growing pauses
+  up to 30 seconds while the current token keeps serving until 30 seconds before expiry; then requests on
+  that deployment fail over.
 - **Identity tokens with a `jti` claim are single use**, and Kubernetes and Keycloak tokens have one. A
   restarted process can't reuse the token its predecessor exchanged, so it fails until the file rotates.
   To avoid that window, turn off `check_jti` on the issuer, which removes replay protection for every
@@ -166,6 +168,12 @@ On AKS, new clusters on 1.34 or later have the issuer on. Otherwise run
    This runs llm-router as its own service account, `<release>-llm-router`, and sets
    `ANTHROPIC_IDENTITY_TOKEN_FILE`. To add gateways, create a group on the Gateways page, then add
    `--set gateway.enabled=true,gateway.joinToken=llmrg_…`.
+
+   Add `--set anthropicIdentity.source=kubernetes` to have each pod ask the Kubernetes API for a new token
+   whenever it renews, about once every half hour per pod, instead of reading the file. A crashed container
+   then recovers on its next request, and several rules can share a pod. The file stays as the fallback
+   while the API server is unreachable. It grants each pod `create` on its own `serviceaccounts/token`,
+   which lets it get tokens for its own service account with any audience.
 3. **Add the provider**: type *Anthropic*, auth *Workload identity*, with the rule, service account and
    organization IDs. Leave *Identity token file* empty. Picking a model from the list proves the exchange
    works; the Console's Authentication events tab shows why if it doesn't.
@@ -175,14 +183,16 @@ Good to know:
 - **A rule belongs to one issuer, and each cluster is its own issuer.** Gateways in a second cluster need
   their own rule and provider. Give each provider's deployments a region label so each cluster prefers its
   own.
-- **Restarts.** A rolling update is fine: a new pod gets a new token. A container that crashes and restarts in
-  the same pod gets the same token back, which is already used, so its Claude requests fail until the file
-  rotates, at most about 9 minutes with `expirationSeconds: 600`. The pod still counts as ready and keeps
-  receiving traffic. To recover at once, `kubectl delete pod` it, or turn off `check_jti` as above.
-- **Two rules in one pod** can't share a token file, because the second exchange is refused as a replay.
-  Providers with identical federation settings share a token, so they're fine. For different rules, mount a
-  second file through `extraVolumes` and `gateway.extraVolumes` with a different `expirationSeconds` (660, say) or audience, and set
-  that provider's *Identity token file*. A second file with identical settings holds the same token.
+- **Restarts.** A rolling update is fine: a new pod gets a new token. With the token file, a container that
+  crashes and restarts in the same pod gets the same token back, which is already used, so its Claude
+  requests fail until the file rotates, at most about 9 minutes with `expirationSeconds: 600`. The pod still
+  counts as ready and keeps receiving traffic. Use `source=kubernetes`, or `kubectl delete pod` it, or turn
+  off `check_jti` as above.
+- **Two rules in one pod** work with `source=kubernetes`. With the file they can't share it, because the
+  second exchange is refused as a replay; providers with identical federation settings share a token, so
+  they're fine. For different rules, mount a second file through `extraVolumes` and
+  `gateway.extraVolumes` with a different `expirationSeconds` (660, say) or audience, and set that
+  provider's *Identity token file*. A second file with identical settings holds the same token.
 - **Keep `expirationSeconds` between 600 and 3600**: Kubernetes' minimum, and the most an issuer accepts by
   default.
 - **Don't reuse the cloud's own token.** `AWS_WEB_IDENTITY_TOKEN_FILE` and `AZURE_FEDERATED_TOKEN_FILE` carry
