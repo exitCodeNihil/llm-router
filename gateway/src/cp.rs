@@ -48,6 +48,10 @@ pub struct ControlPlane {
     join_lock: tokio::sync::Mutex<()>,
     started: Instant,
     leaving: AtomicBool,
+    /// The sync loop's and the shutdown flush's one batch sequence: the
+    /// control plane skips a batch number it has seen, so a flush counting
+    /// from 1 again had its events acknowledged and dropped.
+    syncer: tokio::sync::Mutex<Syncer>,
 }
 
 #[derive(Deserialize)]
@@ -85,6 +89,7 @@ impl ControlPlane {
             join_lock: tokio::sync::Mutex::new(()),
             started: Instant::now(),
             leaving: AtomicBool::new(false),
+            syncer: tokio::sync::Mutex::new(Syncer::default()),
         }
     }
 
@@ -260,9 +265,8 @@ impl ControlPlane {
     }
 
     async fn sync_loop(self: Arc<Self>, st: &'static State) {
-        let mut syncer = Syncer::default();
         loop {
-            let synced = self.sync_once(&mut syncer).await;
+            let synced = self.sync_once(&mut *self.syncer.lock().await).await;
             if synced && st.config.load().is_some() {
                 st.ready.store(true, std::sync::atomic::Ordering::Relaxed);
             }
@@ -275,12 +279,21 @@ impl ControlPlane {
     }
 
     /// Upload until the queue is empty or `deadline` passes, for shutdown.
+    /// It continues the sync loop's batch sequence, including a batch that
+    /// is still unacknowledged.
     pub async fn flush(&self, deadline: Instant) {
         self.leaving.store(true, Ordering::Relaxed);
-        let mut syncer = Syncer::default();
-        while Instant::now() < deadline {
-            if self.sync_once(&mut syncer).await && usage::queued() == 0 && syncer.pending.is_none() {
-                return;
+        let deadline = tokio::time::Instant::from_std(deadline);
+        // Waits out a sync in progress, then keeps the lock so the loop can't
+        // interleave.
+        let Ok(mut syncer) = tokio::time::timeout_at(deadline, self.syncer.lock()).await else { return };
+        while tokio::time::Instant::now() < deadline {
+            let done = tokio::time::timeout_at(deadline, self.sync_once(&mut syncer)).await;
+            match done {
+                Ok(true) if usage::queued() == 0 && syncer.pending.is_none() => return,
+                Ok(true) => {}
+                Ok(false) => tokio::time::sleep(Duration::from_millis(200)).await,
+                Err(_) => return,
             }
         }
     }
@@ -495,6 +508,63 @@ fn is_local(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// A control plane that records each sync's batch number and fails the
+    /// second sync.
+    async fn recording_cp() -> (String, Arc<Mutex<Vec<i64>>>) {
+        use hyper::service::service_fn;
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use std::io::Read;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let s = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((conn, _)) = listener.accept().await {
+                let s = s.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
+                        let s = s.clone();
+                        async move {
+                            let gz = req.into_body().collect().await.unwrap().to_bytes();
+                            let mut json = Vec::new();
+                            flate2::read::GzDecoder::new(&gz[..]).read_to_end(&mut json).unwrap();
+                            let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+                            let n = {
+                                let mut seen = s.lock().unwrap();
+                                seen.push(v["batch"].as_i64().unwrap());
+                                seen.len()
+                            };
+                            let status = if n == 2 { 503 } else { 200 };
+                            Ok::<_, std::convert::Infallible>(
+                                http::Response::builder().status(status).body(Full::new(Bytes::from("{}"))).unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(conn), svc)
+                        .await;
+                });
+            }
+        });
+        (url, seen)
+    }
+
+    // The control plane skips a batch number it has already stored and still
+    // answers 200: a shutdown flush that counted from 1 again lost its events.
+    #[tokio::test]
+    async fn the_shutdown_flush_continues_the_batch_sequence() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (url, seen) = recording_cp().await;
+        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into());
+        assert!(cp.sync_once(&mut *cp.syncer.lock().await).await);
+        assert!(!cp.sync_once(&mut *cp.syncer.lock().await).await, "the mock fails the second sync");
+        cp.flush(Instant::now() + Duration::from_secs(5)).await;
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(&seen[..3], &[1, 2, 2], "the unacknowledged batch is resent as is: {seen:?}");
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]), "never counts from 1 again: {seen:?}");
+    }
 
     #[test]
     fn only_lasting_refusals_drop_a_batch() {
