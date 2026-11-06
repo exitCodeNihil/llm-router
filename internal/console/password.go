@@ -4,15 +4,20 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )
 
 // Password auth: first-run setup creates the initial admin; after that,
-// email+password login works alongside SSO and the bootstrap token.
-// ponytail: no login rate limiting beyond bcrypt's inherent cost; add a
-// per-IP limiter if this ever faces the open internet directly.
+// email+password login works alongside SSO and the bootstrap token. Attempts
+// are rate limited (ratelimit.go).
+
+func (a *Auth) signInLimits() *signInLimits {
+	a.limitsOnce.Do(func() { a.limits = newSignInLimits(a.TrustedProxies) })
+	return a.limits
+}
 
 func (a *Auth) registerPassword(mux *http.ServeMux) {
 	mux.HandleFunc("GET /auth/setup", a.handleSetupStatus)
@@ -41,6 +46,12 @@ func (a *Auth) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Auth) handleSetup(w http.ResponseWriter, r *http.Request) {
+	lim, now := a.signInLimits(), time.Now()
+	ip := lim.clientIP(r)
+	if lim.refuse(w, ip, "", now) {
+		return
+	}
+	lim.ip.add(ip, now)
 	needed, err := a.setupNeeded(r)
 	if err != nil || !needed {
 		http.Error(w, "setup is already complete", http.StatusForbidden)
@@ -88,6 +99,12 @@ func (a *Auth) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
+	lim, now := a.signInLimits(), time.Now()
+	ip, email := lim.clientIP(r), normEmail(req.Email)
+	if lim.refuse(w, ip, email, now) {
+		return
+	}
+	lim.ip.add(ip, now)
 	var userID string
 	var hash []byte
 	err := a.Store.Pool.QueryRow(r.Context(),
@@ -95,9 +112,11 @@ func (a *Auth) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 		Scan(&userID, &hash)
 	if err != nil || len(hash) == 0 ||
 		bcrypt.CompareHashAndPassword(hash, []byte(req.Password)) != nil {
+		lim.email.add(email, now)
 		http.Error(w, "incorrect email or password", http.StatusUnauthorized)
 		return
 	}
+	lim.email.reset(email)
 	setSessionCookie(w, r, a.EncryptionKey, a.CookieDomain, userID)
 	w.WriteHeader(http.StatusNoContent)
 }

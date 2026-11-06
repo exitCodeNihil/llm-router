@@ -4,6 +4,7 @@ package config
 import (
 	"flag"
 	"fmt"
+	"net/netip"
 	"os"
 	"strings"
 )
@@ -23,6 +24,9 @@ type Config struct {
 	// origin on a sibling hostname receives it. Empty = host-only cookie,
 	// which is right when the IDE differs from the console by port alone.
 	CookieDomain string
+	// TrustedProxies lists the proxies (addresses or CIDR ranges) whose
+	// X-Forwarded-For header names the client, for sign-in rate limits.
+	TrustedProxies []netip.Prefix
 }
 
 func Load(args []string) (*Config, error) {
@@ -37,6 +41,11 @@ func Load(args []string) (*Config, error) {
 		return nil, err
 	}
 	c.AdminToken = os.Getenv("LLMR_ADMIN_TOKEN")
+	trusted, err := parsePrefixes(os.Getenv("LLMR_TRUSTED_PROXIES"))
+	if err != nil {
+		return nil, fmt.Errorf("LLMR_TRUSTED_PROXIES: %w", err)
+	}
+	c.TrustedProxies = trusted
 	c.EncryptionKey = os.Getenv("LLMR_ENCRYPTION_KEY")
 
 	if c.DatabaseURL == "" {
@@ -84,4 +93,30 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// parsePrefixes reads a comma-separated list of addresses or CIDR ranges.
+func parsePrefixes(s string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, f := range strings.Split(s, ",") {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+		if !strings.Contains(f, "/") {
+			a, err := netip.ParseAddr(f)
+			if err != nil {
+				return nil, err
+			}
+			a = a.Unmap()
+			out = append(out, netip.PrefixFrom(a, a.BitLen()))
+			continue
+		}
+		p, err := netip.ParsePrefix(f)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p.Masked())
+	}
+	return out, nil
 }
