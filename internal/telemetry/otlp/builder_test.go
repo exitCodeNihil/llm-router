@@ -94,6 +94,16 @@ func TestSpanWithoutContent(t *testing.T) {
 	}
 }
 
+// A request refused before it named a model: the span is named after the
+// operation alone, without a trailing space.
+func TestSpanWithoutModel(t *testing.T) {
+	r := GoldenRecord()
+	r.E.ModelName, r.E.Operation = "", "embeddings"
+	if s := (Builder{}).Span(r); s.Name != "embeddings" {
+		t.Errorf("span name %q", s.Name)
+	}
+}
+
 func TestSpanError(t *testing.T) {
 	r := GoldenRecord()
 	r.E.StatusCode, r.E.ErrorCode = 502, "upstream_unavailable"

@@ -198,7 +198,11 @@ func Decorate(r *telemetry.Record, c *telemetry.Content, s *tracepb.Span) {
 	if e.UserID != "" {
 		a = append(a, otlp.Str(attrUserID, e.UserID))
 	}
-	a = append(a, otlp.Strs(attrTags, "llm-router", e.ModelName))
+	tags := []string{"llm-router"}
+	if e.ModelName != "" {
+		tags = append(tags, e.ModelName)
+	}
+	a = append(a, otlp.Strs(attrTags, tags...))
 	for _, m := range [][2]string{{"request_id", e.RequestID}, {"key_id", e.APIKeyID}, {"team_id", e.TeamID},
 		{"gateway_group", r.Group}, {"gateway_id", e.GatewayID}, {"deployment_id", e.DeploymentID},
 		{"provider_id", e.ProviderID}, {"rule_id", e.RuleID}} {
@@ -206,7 +210,10 @@ func Decorate(r *telemetry.Record, c *telemetry.Content, s *tracepb.Span) {
 			a = append(a, otlp.Str(attrTraceMeta+m[0], m[1]))
 		}
 	}
-	a = append(a, otlp.Str(attrModel, e.ModelName), otlp.Str(attrUsage, usageDetails(e.PromptTokens, e.CompletionTokens,
+	if e.ModelName != "" {
+		a = append(a, otlp.Str(attrModel, e.ModelName))
+	}
+	a = append(a, otlp.Str(attrUsage, usageDetails(e.PromptTokens, e.CompletionTokens,
 		e.CachedTokens, e.CacheWrite5m+e.CacheWrite1h)))
 	cost, _ := json.Marshal(map[string]float64{"total": e.CostUSD})
 	a = append(a, otlp.Str(attrCost, string(cost)))

@@ -86,6 +86,25 @@ func TestDecorate(t *testing.T) {
 	}
 }
 
+// Without a model: no empty tag or model name, and the trace is named
+// after the operation.
+func TestDecorateWithoutModel(t *testing.T) {
+	r := record(false)
+	r.E.ModelName = ""
+	s := (&sink{}).Builder.Span(r)
+	Decorate(r, nil, s)
+	a := attrs(s)
+	if a[attrTraceName].GetStringValue() != "chat" {
+		t.Errorf("trace name %q", a[attrTraceName].GetStringValue())
+	}
+	if _, ok := a[attrModel]; ok {
+		t.Error("empty model name set")
+	}
+	if tags := a[attrTags].GetArrayValue().GetValues(); len(tags) != 1 || tags[0].GetStringValue() != "llm-router" {
+		t.Errorf("tags %v", tags)
+	}
+}
+
 func bytesEqual(a, b []byte) bool { return string(a) == string(b) }
 
 func TestExportAndTraceURL(t *testing.T) {

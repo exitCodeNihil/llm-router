@@ -98,7 +98,10 @@ func (b Builder) Span(r *telemetry.Record) *tracepb.Span {
 	if op == "" {
 		op = "chat"
 	}
-	name := op + " " + e.ModelName
+	name := op // a request refused before it named a model
+	if e.ModelName != "" {
+		name += " " + e.ModelName
+	}
 	if r.SpanName != "" {
 		name = r.SpanName
 	}
