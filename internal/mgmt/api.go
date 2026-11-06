@@ -147,7 +147,7 @@ func (m *Server) Register(mux *http.ServeMux) {
 
 	mux.Handle("GET /api/token-issuers", h(m.listTokenIssuers))
 	mux.Handle("POST /api/token-issuers", h(m.createTokenIssuer))
-	mux.Handle("PATCH /api/token-issuers/{id}", h(m.patchRow("token_issuers", tokenIssuerPatchCols)))
+	mux.Handle("PATCH /api/token-issuers/{id}", h(m.patchTokenIssuer))
 	mux.Handle("DELETE /api/token-issuers/{id}", h(m.deleteRow("token_issuers")))
 
 	mux.Handle("POST /api/chat/completions", ha(m.chatCompletions))
