@@ -244,7 +244,8 @@ fn queue() -> &'static Mutex<Queue> {
 
 pub static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// Events that lost their content, or were never captured, because the
-/// content budget was spent.
+/// content budget was spent, or because a proxy refused even the smallest
+/// batch with it.
 pub static CONTENT_STRIPPED: AtomicU64 = AtomicU64::new(0);
 
 fn push(mut e: Event) {

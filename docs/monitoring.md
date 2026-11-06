@@ -53,10 +53,10 @@ Gateways only:
 | `llmr_upstream_attempts_total` | counter | `result` (`ok`, `error`, `timeout`, `retryable_status`) | Upstream attempts |
 | `llmr_limit_denials_total` | counter | `reason` (`budget_exceeded`, `rate_limit_exceeded`) | Requests refused by a budget or rate limit |
 | `llmr_sync_failures_total` | counter | | Failed syncs with the control plane |
-| `llmr_sync_refused_events_total` | counter | | Usage events dropped because the control plane refused their batch |
+| `llmr_sync_refused_events_total` | counter | | Usage events dropped because the control plane refused their batch, or a proxy refused one even alone and without content as too large |
 | `llmr_usage_queued_content_bytes` | gauge | | Captured prompts and responses the queued usage events hold |
 | `llmr_usage_inflight_content_bytes` | gauge | | Room for captured content that requests in flight have reserved: their prompt as captured, and their response up to the capture cap. With the queued content, at most 64 MiB |
-| `llmr_usage_content_stripped_total` | counter | | Usage events sent without their captured content because that 64 MiB was full: not captured at all, or put back in the queue after a failed sync and stripped |
+| `llmr_usage_content_stripped_total` | counter | | Usage events sent without their captured content: that 64 MiB was full (not captured at all, or put back in the queue after a failed sync), or a proxy refused even the smallest batch (64 KiB) as too large |
 | `llmr_config_version`, `llmr_workers` | gauge | | Config version in use; worker threads |
 
 The control plane only:
