@@ -149,16 +149,23 @@ interface HeaderRow {
   isStored: boolean;
 }
 
+/** Whether a row still needs its value typed: new, or stored but unusable. */
+const needsValue = (r: HeaderRow, storedLost: boolean) => (!r.isStored || storedLost) && !r.value;
+
 function HeadersEditor({
   rows,
   onChange,
   hint,
+  lostReason,
 }: {
   rows: HeaderRow[];
   onChange: (rows: HeaderRow[]) => void;
   hint?: string;
+  /** Set when stored values can't be kept; says why. */
+  lostReason?: string;
 }) {
   const patch = (id: string, p: Partial<HeaderRow>) => onChange(rows.map((r) => (r.id === id ? { ...r, ...p } : r)));
+  const lost = !!lostReason && rows.some((r) => r.isStored);
   return (
     <VStack gap={2}>
       <VStack gap={0}>
@@ -166,6 +173,7 @@ function HeadersEditor({
           Headers
         </Text>
         <Hint>{hint ? `${hint} Values are write-only.` : "Values are write-only."}</Hint>
+        {lost && <Hint>{`${lostReason} Enter each header value again, or remove the header.`}</Hint>}
       </VStack>
       {rows.map((r, i) => (
         <HStack key={r.id} gap={2} vAlign="start">
@@ -177,6 +185,8 @@ function HeadersEditor({
               onChange={(v) => patch(r.id, { name: v })}
               placeholder="Authorization"
               isDisabled={r.isStored}
+              isRequired
+              status={!r.name.trim() ? { type: "error", message: "Header name is required" } : undefined}
             />
           </div>
           <div style={{ flex: 1 }}>
@@ -186,9 +196,12 @@ function HeadersEditor({
               type="password"
               value={r.value}
               onChange={(v) => patch(r.id, { value: v })}
-              placeholder={r.isStored ? "unchanged" : "Value"}
+              placeholder={r.isStored && !lost ? "unchanged" : "Value"}
+              isRequired={!r.isStored || lost}
               status={
-                !r.isStored && r.name.trim() && !r.value ? { type: "error", message: "Enter a value" } : undefined
+                needsValue(r, lost) && r.name.trim()
+                  ? { type: "error", message: r.isStored ? "Enter the value again" : "Enter a value" }
+                  : undefined
               }
             />
           </div>
@@ -278,6 +291,24 @@ function ScopeRow({
 // ── Dialog ──────────────────────────────────────────────────────
 const KIB = 1024;
 
+/** Scheme, host and port, as the server compares them. */
+function origin(u: string) {
+  const m = /^(?:([a-z][a-z0-9+.-]*):)?(?:\/\/(?:[^@/?#]*@)?([^/?#]*))?/i.exec(u.trim());
+  return `${m?.[1] ?? ""}://${m?.[2] ?? ""}`.toLowerCase();
+}
+
+/**
+ * Whether the draft still sends where the stored destination did. Stored
+ * secrets and header values go only to the host they were entered for.
+ */
+function sameHosts(stored: TelemetryDestination, endpoint: string, tracesUrl: string) {
+  const traces = (e: string, t: string) => (t.trim() ? t : e);
+  return (
+    origin(stored.endpoint) === origin(endpoint) &&
+    origin(traces(stored.endpoint, stored.traces_url)) === origin(traces(endpoint, tracesUrl))
+  );
+}
+
 export function DestinationDialog({
   editing,
   kinds,
@@ -316,7 +347,20 @@ export function DestinationDialog({
 
   const kind = kinds.find((k) => k.name === kindName);
   const spec = specFor(kind);
-  const stored = new Set(editing?.secret_names ?? []);
+  const wasStored = new Set(editing?.secret_names ?? []);
+  // Stored secrets and header values can't be kept when they can't be read,
+  // or once the destination points somewhere else: they must be typed again.
+  const lostReason = !editing
+    ? undefined
+    : editing.error
+      ? "The stored values can't be decrypted."
+      : !sameHosts(editing, endpoint, tracesUrl)
+        ? "The endpoint changed, and stored values are only sent where they were entered."
+        : undefined;
+  const stored = lostReason ? new Set<string>() : wasStored;
+  /** A secret that was stored but now has to be entered again. */
+  const reenter = (f: FieldSpec) => f.source === "secret" && !!lostReason && wasStored.has(f.key!);
+  const required = (f: FieldSpec) => !!f.isRequired || reenter(f);
 
   const get = (f: FieldSpec) =>
     f.source === "endpoint"
@@ -337,14 +381,14 @@ export function DestinationDialog({
   // A required field is met by a value, a stored secret, or (for an OTLP
   // endpoint) a full traces URL.
   const missing = spec.fields.filter((f) => {
-    if (!f.isRequired || get(f).trim()) return false;
+    if (!required(f) || get(f).trim()) return false;
     if (f.source === "secret" && stored.has(f.key!)) return false;
     if (f.source === "endpoint" && kindName === "otlp" && tracesUrl.trim()) return false;
     return true;
   });
   const maxBytes = Number(maxKib) * KIB;
   const badMax = contentMode === "content" && (!Number.isInteger(Number(maxKib)) || maxBytes < KIB || maxBytes > KIB * KIB);
-  const badHeader = headers.some((h) => !h.name.trim() || (!h.isStored && !h.value));
+  const badHeader = headers.some((h) => !h.name.trim() || needsValue(h, !!lostReason));
   const trace = config.trace_link ?? "";
   const badLink = kindName === "otlp" && trace.trim() !== "" && !trace.includes("{trace_id}");
   const invalid = !name.trim() || !kind || missing.length > 0 || badMax || badHeader || badLink;
@@ -409,9 +453,15 @@ export function DestinationDialog({
         value={get(f)}
         onChange={(v) => set(f, v)}
         placeholder={isSet ? "set (unchanged)" : f.placeholder}
-        description={isSet ? "A value is stored. Leave blank to keep it." : f.description}
-        isRequired={f.isRequired && !isSet}
-        isOptional={!f.isRequired}
+        description={
+          isSet
+            ? "A value is stored. Leave blank to keep it."
+            : reenter(f)
+              ? `${lostReason} Enter it again.`
+              : f.description
+        }
+        isRequired={required(f) && !isSet}
+        isOptional={!required(f)}
         status={
           f.source === "config" && f.key === "trace_link" && badLink
             ? { type: "error", message: "Must contain {trace_id}" }
@@ -431,6 +481,7 @@ export function DestinationDialog({
         setHeaders(r);
       }}
       hint={spec.headerHint}
+      lostReason={lostReason}
     />
   );
   const advancedOpen =
