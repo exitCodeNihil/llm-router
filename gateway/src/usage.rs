@@ -84,7 +84,19 @@ fn push(e: Event) {
 pub fn take(max_events: usize, max_bytes: usize) -> Vec<Event> {
     let mut q = queue().lock().unwrap();
     let n = batch_len(q.iter().map(Event::encoded_size), max_events, max_bytes);
-    q.drain(..n).collect()
+    let batch = q.drain(..n).collect();
+    shrink(&mut q);
+    batch
+}
+
+/// The queue keeps the capacity a burst grew it to. Give most of it back once
+/// the queue is mostly empty again, keeping enough for ordinary traffic.
+const KEEP_CAPACITY: usize = 16_384;
+
+fn shrink(q: &mut VecDeque<Event>) {
+    if q.capacity() > KEEP_CAPACITY && q.len() < q.capacity() / 4 {
+        q.shrink_to((q.len() * 2).max(KEEP_CAPACITY));
+    }
 }
 
 /// How many leading items of the given sizes fit in one batch.
@@ -295,6 +307,18 @@ mod tests {
             .map(|e| e.request_id)
             .collect();
         assert_eq!(ids, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_drained_queue_gives_back_what_a_burst_grew() {
+        let mut q: VecDeque<Event> = VecDeque::with_capacity(KEEP_CAPACITY * 16);
+        q.push_back(event("x"));
+        shrink(&mut q);
+        assert!(q.capacity() >= KEEP_CAPACITY && q.capacity() < KEEP_CAPACITY * 2, "{}", q.capacity());
+        assert_eq!(q.len(), 1);
+        let cap = q.capacity();
+        shrink(&mut q);
+        assert_eq!(q.capacity(), cap, "never below what ordinary traffic needs");
     }
 
     #[test]
