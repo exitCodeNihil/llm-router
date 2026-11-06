@@ -29,12 +29,38 @@ const AUTHORITY: &str = "https://login.microsoftonline.com";
 const IMDS: &str = "http://169.254.169.254/metadata/identity/oauth2/token";
 const MAX_ASSERTION: u64 = 16 << 10;
 
-#[derive(Debug)]
 enum Method {
     ClientSecret { tenant: String, client_id: String, secret: String },
     Federated { tenant: String, client_id: String, file: String },
     AppService { endpoint: String, secret: String, client_id: Option<String> },
     Imds { endpoint: String, client_id: Option<String> },
+}
+
+/// Without the client secret or the identity header.
+impl std::fmt::Debug for Method {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Method::ClientSecret { tenant, client_id, .. } => f
+                .debug_struct("ClientSecret")
+                .field("tenant", tenant)
+                .field("client_id", client_id)
+                .finish_non_exhaustive(),
+            Method::Federated { tenant, client_id, file } => f
+                .debug_struct("Federated")
+                .field("tenant", tenant)
+                .field("client_id", client_id)
+                .field("file", file)
+                .finish(),
+            Method::AppService { endpoint, client_id, .. } => f
+                .debug_struct("AppService")
+                .field("endpoint", endpoint)
+                .field("client_id", client_id)
+                .finish_non_exhaustive(),
+            Method::Imds { endpoint, client_id } => {
+                f.debug_struct("Imds").field("endpoint", endpoint).field("client_id", client_id).finish()
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -331,6 +357,16 @@ mod tests {
         .err()
         .unwrap();
         assert!(err.detail.contains("AADSTS7000215") && !err.detail.contains("hunter2"), "{err:?}");
+    }
+
+    #[test]
+    fn debug_shows_no_secrets() {
+        let e = entra(&[("AZURE_TENANT_ID", "t"), ("AZURE_CLIENT_ID", "c"), ("AZURE_CLIENT_SECRET", "hunter2")]);
+        let shown = format!("{:?}", e.unwrap());
+        assert!(shown.contains("ClientSecret") && !shown.contains("hunter2"), "{shown}");
+        let e = entra(&[("IDENTITY_ENDPOINT", "http://localhost:1/msi"), ("IDENTITY_HEADER", "s3cret-header")]);
+        let shown = format!("{:?}", e.unwrap());
+        assert!(shown.contains("AppService") && !shown.contains("s3cret-header"), "{shown}");
     }
 
     #[tokio::test]
