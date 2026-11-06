@@ -7,14 +7,18 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
 	jose "github.com/go-jose/go-jose/v4"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/exitcodenihil/llm-router/internal/auth"
 	"github.com/exitcodenihil/llm-router/internal/limits"
@@ -225,4 +229,173 @@ func TestProvisionAgainstPostgres(t *testing.T) {
 	st.Pool.Exec(ctx, `DELETE FROM users WHERE email=$1`, email)
 	st.Pool.Exec(ctx, `DELETE FROM gateway_groups WHERE id=$1`, groupID)
 	st.Pool.Exec(ctx, `DELETE FROM teams WHERE id = ANY($1)`, []string{teamA, teamB})
+}
+
+// provisionEnv is a control plane with one gateway group limited to teamA, an
+// issuer that maps new users to teamA, and a joined gateway's session.
+type provisionEnv struct {
+	t                     *testing.T
+	ctx                   context.Context
+	st                    *store.Store
+	s                     *Server
+	idp                   *testIssuer
+	issuer                *snapshot.Issuer
+	srv                   *httptest.Server
+	groupID, teamA, teamB string
+	session               string
+	instance              string
+}
+
+func newProvisionEnv(t *testing.T) *provisionEnv {
+	t.Helper()
+	url := os.Getenv("LLMR_TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("LLMR_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := store.Open(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	e := &provisionEnv{t: t, ctx: ctx, st: st, idp: newTestIssuer(t),
+		groupID: uuid.NewString(), teamA: uuid.NewString(), teamB: uuid.NewString()}
+	for _, team := range []string{e.teamA, e.teamB} {
+		if _, err := st.Pool.Exec(ctx, `INSERT INTO teams (id, name) VALUES ($1,$2)`, team, "team-"+team); err != nil {
+			t.Fatal(err)
+		}
+	}
+	token := JoinTokenPrefix + "prov-" + e.groupID
+	hash := sha256.Sum256([]byte(token))
+	if _, err := st.Pool.Exec(ctx, `INSERT INTO gateway_groups (id, name, allowed_teams, join_token_hash) VALUES ($1,$2,$3,$4)`,
+		e.groupID, "prov-"+e.groupID, []string{e.teamA}, hash[:]); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		st.Pool.Exec(ctx, `DELETE FROM users WHERE email LIKE $1`, "%-"+e.groupID+"@example.com")
+		st.Pool.Exec(ctx, `DELETE FROM gateway_groups WHERE id=$1`, e.groupID)
+		st.Pool.Exec(ctx, `DELETE FROM teams WHERE id = ANY($1)`, []string{e.teamA, e.teamB})
+	})
+	e.issuer = &snapshot.Issuer{ID: "i1", Type: "oidc", IssuerURL: e.idp.srv.URL, Audience: "llmr", EmailClaim: "email",
+		Match: map[string]string{"tid": "tenant"}, MapToTeam: e.teamA, AutoCreateUser: true}
+	holder := &snapshot.Holder{}
+	holder.Set(&snapshot.Snapshot{
+		Version:      1,
+		KeysByHash:   map[[32]byte]*snapshot.Key{},
+		UsersByID:    map[string]*snapshot.User{},
+		UsersByEmail: map[string]*snapshot.User{},
+		TeamsByID:    map[string]*snapshot.Team{e.teamA: {ID: e.teamA}, e.teamB: {ID: e.teamB}},
+		Issuers:      []*snapshot.Issuer{e.issuer},
+		GatewayGroups: map[string]*snapshot.GatewayGroup{e.groupID: {ID: e.groupID, Name: "prov",
+			AllowedTeams: map[string]bool{e.teamA: true}}},
+	})
+	e.s = &Server{Store: st, Snapshots: holder, Limits: limits.New(), Key: auth.DeriveKey("llmr-gw-session", "test")}
+	mux := http.NewServeMux()
+	e.s.Register(mux)
+	e.srv = httptest.NewServer(mux)
+	t.Cleanup(e.srv.Close)
+	code, body := e.post("/gw/v1/join", token, map[string]any{"name": "gw", "schema": 2})
+	if code != 200 {
+		t.Fatalf("join: %d %s", code, body)
+	}
+	var joined sessionResponse
+	json.Unmarshal(body, &joined)
+	e.session, e.instance = joined.Session, joined.InstanceID
+	return e
+}
+
+func (e *provisionEnv) post(path, bearer string, body any) (int, []byte) {
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest("POST", e.srv.URL+path, bytes.NewReader(b))
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		e.t.Error(err)
+		return 0, nil
+	}
+	defer res.Body.Close()
+	var out bytes.Buffer
+	out.ReadFrom(res.Body)
+	return res.StatusCode, out.Bytes()
+}
+
+func (e *provisionEnv) email(name string) string { return name + "-" + e.groupID + "@example.com" }
+
+// TestProvisionConcurrentFirstCalls: several gateways (or requests) provisioning
+// one new person at once all get the same user, already in the issuer's team.
+func TestProvisionConcurrentFirstCalls(t *testing.T) {
+	e := newProvisionEnv(t)
+	v := auth.NewCloudValidator(e.st.Pool)
+	for round := range 5 {
+		email := e.email(fmt.Sprintf("race%d", round))
+		var wg sync.WaitGroup
+		got := make([]*snapshot.User, 8)
+		errs := make([]error, len(got))
+		for i := range got {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				got[i], errs[i] = v.ProvisionUser(e.ctx, email, e.teamA)
+			}()
+		}
+		wg.Wait()
+		for i, u := range got {
+			if errs[i] != nil {
+				t.Fatalf("round %d caller %d: %v", round, i, errs[i])
+			}
+			if u.ID != got[0].ID {
+				t.Fatalf("round %d: two users for one email: %s, %s", round, u.ID, got[0].ID)
+			}
+			if !slices.Equal(u.TeamIDs, []string{e.teamA}) {
+				t.Fatalf("round %d caller %d: team ids %v, want [%s]", round, i, u.TeamIDs, e.teamA)
+			}
+		}
+	}
+}
+
+// TestProvisionJoinFailureCreatesNoUser: a user is never left without the team
+// their issuer maps them to.
+func TestProvisionJoinFailureCreatesNoUser(t *testing.T) {
+	e := newProvisionEnv(t)
+	v := auth.NewCloudValidator(e.st.Pool)
+	email := e.email("nojoin")
+	if _, err := v.ProvisionUser(e.ctx, email, uuid.NewString()); err == nil {
+		t.Fatal("provisioning into a team that does not exist succeeded")
+	}
+	var n int
+	e.st.Pool.QueryRow(e.ctx, `SELECT count(*) FROM users WHERE email=$1`, email).Scan(&n)
+	if n != 0 {
+		t.Fatal("a failed team join left the user behind")
+	}
+	u, err := v.ProvisionUser(e.ctx, email, e.teamA)
+	if err != nil || !slices.Equal(u.TeamIDs, []string{e.teamA}) {
+		t.Fatalf("retry: %+v %v", u, err)
+	}
+}
+
+// TestProvisionExistingNonMember: an account that exists but is in none of the
+// group's teams is refused, and provisioning doesn't add it to one.
+func TestProvisionExistingNonMember(t *testing.T) {
+	e := newProvisionEnv(t)
+	email := e.email("existing")
+	id := uuid.NewString()
+	if _, err := e.st.Pool.Exec(e.ctx, `INSERT INTO users (id, email, role) VALUES ($1,$2,'member')`, id, email); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.st.Pool.Exec(e.ctx, `INSERT INTO team_members (team_id, user_id, role) VALUES ($1,$2,'member')`, e.teamB, id); err != nil {
+		t.Fatal(err)
+	}
+	tok := e.idp.sign(t, e.idp.key, map[string]any{"email": email})
+	if code, body := e.post("/gw/v1/provision", e.session, map[string]string{"token": tok}); code != http.StatusForbidden {
+		t.Fatalf("existing user outside the group: %d %s", code, body)
+	}
+	var teams []string
+	rows, _ := e.st.Pool.Query(e.ctx, `SELECT team_id::text FROM team_members WHERE user_id=$1`, id)
+	teams, _ = pgx.CollectRows(rows, pgx.RowTo[string])
+	if !slices.Equal(teams, []string{e.teamB}) {
+		t.Fatalf("provisioning changed an existing account's teams: %v", teams)
+	}
 }

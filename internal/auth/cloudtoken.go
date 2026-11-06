@@ -168,44 +168,53 @@ var ErrUserDisabled = errors.New("user is disabled")
 // and every gateway get them. An account that already exists is returned with
 // its memberships unchanged; a disabled one is ErrUserDisabled. The returned
 // user carries their team ids.
+//
+// The user and their team membership are written in one transaction, so a
+// failed join leaves no user behind, and a concurrent first call for the same
+// email waits on the email's unique index until that transaction commits:
+// every caller sees the user with their team.
 func (v *CloudValidator) ProvisionUser(ctx context.Context, email, teamID string) (*snapshot.User, error) {
-	// users.email is citext, so this finds the account whatever its case.
-	const find = `SELECT id, disabled FROM users WHERE email=$1`
+	tx, err := v.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
 	var userID string
-	var disabled bool
-	created := false
-	err := v.Pool.QueryRow(ctx, find, email).Scan(&userID, &disabled)
-	if errors.Is(err, pgx.ErrNoRows) {
-		tag, err := v.Pool.Exec(ctx,
-			`INSERT INTO users (id, email, role) VALUES ($1,$2,'member') ON CONFLICT (email) DO NOTHING`,
-			uuid.New(), email)
-		if err != nil {
+	var disabled, created bool
+	err = tx.QueryRow(ctx,
+		`INSERT INTO users (id, email, role) VALUES ($1,$2,'member') ON CONFLICT (email) DO NOTHING RETURNING id`,
+		uuid.New(), email).Scan(&userID)
+	switch {
+	case err == nil:
+		created = true
+	case errors.Is(err, pgx.ErrNoRows):
+		// users.email is citext, so this finds the account whatever its case.
+		if err := tx.QueryRow(ctx, `SELECT id, disabled FROM users WHERE email=$1`, email).Scan(&userID, &disabled); err != nil {
 			return nil, fmt.Errorf("auto-provision failed: %w", err)
 		}
-		created = tag.RowsAffected() == 1
-		if err := v.Pool.QueryRow(ctx, find, email).Scan(&userID, &disabled); err != nil {
-			return nil, err
-		}
-	} else if err != nil {
-		return nil, err
+	default:
+		return nil, fmt.Errorf("auto-provision failed: %w", err)
 	}
 	if disabled {
 		return nil, ErrUserDisabled
 	}
-	if teamID != "" && created {
-		if _, err := v.Pool.Exec(ctx,
+	if created && teamID != "" {
+		if _, err := tx.Exec(ctx,
 			`INSERT INTO team_members (team_id, user_id, role) VALUES ($1,$2,'member') ON CONFLICT DO NOTHING`,
 			teamID, userID); err != nil {
-			slog.Warn("auto-provision team join failed", "team", teamID, "err", err)
+			return nil, fmt.Errorf("auto-provision failed: joining team %s: %w", teamID, err)
 		}
 	}
-	rows, err := v.Pool.Query(ctx, `SELECT team_id::text FROM team_members WHERE user_id=$1 ORDER BY team_id`, userID)
+	rows, err := tx.Query(ctx, `SELECT team_id::text FROM team_members WHERE user_id=$1 ORDER BY team_id`, userID)
 	if err != nil {
 		return nil, err
 	}
 	teams, err := pgx.CollectRows(rows, pgx.RowTo[string])
 	if err != nil {
 		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("auto-provision failed: %w", err)
 	}
 	if created {
 		if err := (&store.Store{Pool: v.Pool}).BumpConfigVersion(ctx); err != nil {
