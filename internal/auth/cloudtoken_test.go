@@ -113,12 +113,12 @@ func TestCloudTokenValidation(t *testing.T) {
 	}
 
 	cases := map[string]string{
-		"wrong tenant":    iss.mint(t, map[string]any{"preferred_username": "dev@example.com", "tid": "evil"}),
-		"wrong audience":  iss.mint(t, map[string]any{"preferred_username": "dev@example.com", "tid": "tenant-1", "aud": "api://other"}),
-		"unknown user":    iss.mint(t, map[string]any{"preferred_username": "stranger@example.com", "tid": "tenant-1"}),
-		"missing email":   iss.mint(t, map[string]any{"tid": "tenant-1"}),
-		"expired":         iss.mint(t, map[string]any{"preferred_username": "dev@example.com", "tid": "tenant-1", "exp": time.Now().Add(-time.Hour).Unix()}),
-		"garbage":         "not.a.jwt",
+		"wrong tenant":   iss.mint(t, map[string]any{"preferred_username": "dev@example.com", "tid": "evil"}),
+		"wrong audience": iss.mint(t, map[string]any{"preferred_username": "dev@example.com", "tid": "tenant-1", "aud": "api://other"}),
+		"unknown user":   iss.mint(t, map[string]any{"preferred_username": "stranger@example.com", "tid": "tenant-1"}),
+		"missing email":  iss.mint(t, map[string]any{"tid": "tenant-1"}),
+		"expired":        iss.mint(t, map[string]any{"preferred_username": "dev@example.com", "tid": "tenant-1", "exp": time.Now().Add(-time.Hour).Unix()}),
+		"garbage":        "not.a.jwt",
 	}
 	for name, tok := range cases {
 		if _, err := v.Validate(ctx, s, tok); err == nil {
