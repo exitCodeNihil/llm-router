@@ -39,10 +39,15 @@ type Server struct {
 	// IDE is served from this mux, which shares the console's origin).
 	IDEOrigin string
 
-	rtMu      sync.Mutex
-	rt        workspace.Runtime
-	rtCfg     workspace.Config
-	rtAt      time.Time
+	rtMu  sync.Mutex
+	rt    workspace.Runtime
+	rtCfg workspace.Config
+	rtAt  time.Time
+	// TokenGuard limits failed admin-token attempts per client address.
+	TokenGuard interface {
+		AdminTokenBlocked(http.ResponseWriter, *http.Request) bool
+		AdminTokenFailed(*http.Request)
+	}
 	Live      *metrics.Live
 	NodeStore *metrics.NodeStore
 	HTTP      *metrics.HTTP // the control plane's own listener

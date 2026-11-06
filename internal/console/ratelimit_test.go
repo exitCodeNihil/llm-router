@@ -1,6 +1,7 @@
 package console
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"sync"
@@ -114,5 +115,29 @@ func TestAdmit(t *testing.T) {
 	l.succeeded("203.0.113.7", "admin@example.com")
 	if !l.admit(httptest.NewRecorder(), "203.0.113.7", "admin@example.com", now) {
 		t.Fatal("success did not clear the failures")
+	}
+}
+
+// Guesses at the admin token over the API are limited like passwords, and a
+// blocked address is refused before its token is even compared.
+func TestAdminTokenGuesses(t *testing.T) {
+	a := &Auth{}
+	req := func(addr string) *http.Request {
+		r := httptest.NewRequest("GET", "/api/users", nil)
+		r.RemoteAddr = addr
+		return r
+	}
+	for i := 0; i < failuresPerEmail; i++ {
+		if a.AdminTokenBlocked(httptest.NewRecorder(), req("198.51.100.7:1234")) {
+			t.Fatalf("blocked after %d failures", i)
+		}
+		a.AdminTokenFailed(req("198.51.100.7:1234"))
+	}
+	w := httptest.NewRecorder()
+	if !a.AdminTokenBlocked(w, req("198.51.100.7:1234")) || w.Code != http.StatusTooManyRequests || w.Header().Get("Retry-After") == "" {
+		t.Fatalf("not blocked after %d failures: %d", failuresPerEmail, w.Code)
+	}
+	if a.AdminTokenBlocked(httptest.NewRecorder(), req("203.0.113.9:1234")) {
+		t.Error("another address must not be blocked")
 	}
 }

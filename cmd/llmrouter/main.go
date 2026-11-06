@@ -167,8 +167,10 @@ func run() error {
 	} else {
 		slog.Warn("LLMR_IDE_ORIGIN is not set: workspace IDEs share the console origin; set LLMR_IDE_LISTEN/LLMR_IDE_ORIGIN in production")
 	}
-	(&console.Auth{Store: st, EncryptionKey: cfg.EncryptionKey, CookieDomain: cfg.CookieDomain,
-		TrustedProxies: cfg.TrustedProxies}).Register(mux)
+	consoleAuth := &console.Auth{Store: st, EncryptionKey: cfg.EncryptionKey, CookieDomain: cfg.CookieDomain,
+		TrustedProxies: cfg.TrustedProxies}
+	consoleAuth.Register(mux)
+	mg.TokenGuard = consoleAuth
 	(&gwsync.Server{Store: st, Snapshots: holder, Limits: lim, Export: usage.MultiWriter{exporter, live}, Nodes: nodeStore,
 		Key: auth.DeriveKey("llmr-gw-session", cfg.EncryptionKey)}).Register(mux)
 	mux.Handle("/", console.SPA())

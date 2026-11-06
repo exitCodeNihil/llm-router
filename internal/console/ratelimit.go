@@ -51,6 +51,17 @@ func (w *window) take(key string, now time.Time) time.Duration {
 	return 0
 }
 
+// full returns how long until key may try again, or zero, without recording
+// an attempt.
+func (w *window) full(key string, now time.Time) time.Duration {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if ev := w.live(key, now); len(ev) >= w.max {
+		return ev[len(ev)-w.max].Add(w.span).Sub(now)
+	}
+	return 0
+}
+
 func (w *window) reset(key string) {
 	w.mu.Lock()
 	delete(w.events, key)
@@ -188,3 +199,28 @@ func failureKey(ip, email string) string { return ip + " " + email }
 const maxEmail = 254
 
 func normEmail(e string) string { return strings.ToLower(strings.TrimSpace(e)) }
+
+// adminToken stands in for an email: failures against the bootstrap admin
+// token count per address like a password's, so it can't be guessed over the
+// API either.
+const adminToken = "\x00admin-token"
+
+// AdminTokenBlocked answers 429 and returns true when r's address has used up
+// its failed admin-token attempts. It is checked before the token is compared,
+// so a blocked address learns nothing from further guesses.
+func (a *Auth) AdminTokenBlocked(w http.ResponseWriter, r *http.Request) bool {
+	lim := a.signInLimits()
+	wait := lim.email.full(failureKey(lim.clientIP(r), adminToken), time.Now())
+	if wait <= 0 {
+		return false
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+	http.Error(w, "too many failed attempts; try again later", http.StatusTooManyRequests)
+	return true
+}
+
+// AdminTokenFailed counts a request whose bearer token was not the admin token.
+func (a *Auth) AdminTokenFailed(r *http.Request) {
+	lim := a.signInLimits()
+	lim.email.take(failureKey(lim.clientIP(r), adminToken), time.Now())
+}
