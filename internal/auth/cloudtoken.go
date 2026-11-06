@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -13,9 +14,11 @@ import (
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
+	"github.com/exitcodenihil/llm-router/internal/store"
 )
 
 // CloudValidator verifies inbound Azure Entra ID / GCP identity tokens against
@@ -44,19 +47,20 @@ func NewCloudValidator(pool *pgxpool.Pool) *CloudValidator {
 	}
 }
 
-// Validate implements gateway.CloudTokenValidator.
-func (v *CloudValidator) Validate(ctx context.Context, s *snapshot.Snapshot, token string) (*Identity, error) {
+// Verified is what a verified identity token says about its caller.
+type Verified struct {
+	Issuer *snapshot.Issuer
+	Email  string // the email claim, lowercased
+	Expiry time.Time
+}
+
+// Verify checks a token against the configured issuer it names: the signature
+// against the issuer's published keys, expiry, audience, the issuer's match
+// claims and its email claim. It looks no user up and creates none.
+func (v *CloudValidator) Verify(ctx context.Context, s *snapshot.Snapshot, token string) (*Verified, error) {
 	if len(s.Issuers) == 0 {
 		return nil, fmt.Errorf("no token issuers configured")
 	}
-	tokenHash := sha256.Sum256([]byte(token))
-	v.mu.Lock()
-	if c, ok := v.cache[tokenHash]; ok && time.Now().Before(c.exp) {
-		v.mu.Unlock()
-		return c.id, nil
-	}
-	v.mu.Unlock()
-
 	iss, err := unverifiedIssuer(token)
 	if err != nil {
 		return nil, err
@@ -94,14 +98,30 @@ func (v *CloudValidator) Validate(ctx context.Context, s *snapshot.Snapshot, tok
 	if email == "" {
 		return nil, fmt.Errorf("token has no %s claim", emailClaim)
 	}
-	email = strings.ToLower(email)
+	return &Verified{Issuer: issuer, Email: strings.ToLower(email), Expiry: idToken.Expiry}, nil
+}
 
+// Validate implements gateway.CloudTokenValidator.
+func (v *CloudValidator) Validate(ctx context.Context, s *snapshot.Snapshot, token string) (*Identity, error) {
+	tokenHash := sha256.Sum256([]byte(token))
+	v.mu.Lock()
+	if c, ok := v.cache[tokenHash]; ok && time.Now().Before(c.exp) {
+		v.mu.Unlock()
+		return c.id, nil
+	}
+	v.mu.Unlock()
+
+	vt, err := v.Verify(ctx, s, token)
+	if err != nil {
+		return nil, err
+	}
+	issuer, email := vt.Issuer, vt.Email
 	user := s.UsersByEmail[email]
 	if user == nil {
 		if !issuer.AutoCreateUser || v.Pool == nil {
 			return nil, fmt.Errorf("no gateway user for %s", email)
 		}
-		created, err := v.provisionUser(ctx, email, issuer.MapToTeam)
+		created, err := v.ProvisionUser(ctx, email, issuer.MapToTeam)
 		if err != nil {
 			return nil, err
 		}
@@ -112,7 +132,7 @@ func (v *CloudValidator) Validate(ctx context.Context, s *snapshot.Snapshot, tok
 		id.Team = s.TeamsByID[issuer.MapToTeam]
 	}
 
-	exp := idToken.Expiry
+	exp := vt.Expiry
 	if max := time.Now().Add(5 * time.Minute); exp.After(max) {
 		exp = max
 	}
@@ -139,26 +159,61 @@ func (v *CloudValidator) provider(ctx context.Context, issuerURL string) (*oidc.
 	return p, nil
 }
 
-func (v *CloudValidator) provisionUser(ctx context.Context, email, teamID string) (*snapshot.User, error) {
-	id := uuid.New()
-	if _, err := v.Pool.Exec(ctx,
-		`INSERT INTO users (id, email, role) VALUES ($1,$2,'member') ON CONFLICT (email) DO NOTHING`,
-		id, email); err != nil {
-		return nil, fmt.Errorf("auto-provision failed: %w", err)
-	}
+// ErrUserDisabled is returned for a disabled account: an identity token never
+// brings one back.
+var ErrUserDisabled = errors.New("user is disabled")
+
+// ProvisionUser creates the user for a verified email on first use, joined to
+// teamID when one is set, and bumps the config version so the control plane
+// and every gateway get them. An account that already exists is returned with
+// its memberships unchanged; a disabled one is ErrUserDisabled. The returned
+// user carries their team ids.
+func (v *CloudValidator) ProvisionUser(ctx context.Context, email, teamID string) (*snapshot.User, error) {
+	// users.email is citext, so this finds the account whatever its case.
+	const find = `SELECT id, disabled FROM users WHERE email=$1`
 	var userID string
-	if err := v.Pool.QueryRow(ctx, `SELECT id FROM users WHERE email=$1`, email).Scan(&userID); err != nil {
+	var disabled bool
+	created := false
+	err := v.Pool.QueryRow(ctx, find, email).Scan(&userID, &disabled)
+	if errors.Is(err, pgx.ErrNoRows) {
+		tag, err := v.Pool.Exec(ctx,
+			`INSERT INTO users (id, email, role) VALUES ($1,$2,'member') ON CONFLICT (email) DO NOTHING`,
+			uuid.New(), email)
+		if err != nil {
+			return nil, fmt.Errorf("auto-provision failed: %w", err)
+		}
+		created = tag.RowsAffected() == 1
+		if err := v.Pool.QueryRow(ctx, find, email).Scan(&userID, &disabled); err != nil {
+			return nil, err
+		}
+	} else if err != nil {
 		return nil, err
 	}
-	if teamID != "" {
+	if disabled {
+		return nil, ErrUserDisabled
+	}
+	if teamID != "" && created {
 		if _, err := v.Pool.Exec(ctx,
 			`INSERT INTO team_members (team_id, user_id, role) VALUES ($1,$2,'member') ON CONFLICT DO NOTHING`,
 			teamID, userID); err != nil {
 			slog.Warn("auto-provision team join failed", "team", teamID, "err", err)
 		}
 	}
-	slog.Info("auto-provisioned user from cloud token", "email", email)
-	return &snapshot.User{ID: userID, Email: email, Role: "member"}, nil
+	rows, err := v.Pool.Query(ctx, `SELECT team_id::text FROM team_members WHERE user_id=$1 ORDER BY team_id`, userID)
+	if err != nil {
+		return nil, err
+	}
+	teams, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, err
+	}
+	if created {
+		if err := (&store.Store{Pool: v.Pool}).BumpConfigVersion(ctx); err != nil {
+			slog.Error("bump config version after auto-provision failed", "err", err)
+		}
+		slog.Info("auto-provisioned user from cloud token", "email", email)
+	}
+	return &snapshot.User{ID: userID, Email: email, Role: "member", TeamIDs: teams}, nil
 }
 
 // unverifiedIssuer reads the iss claim without verifying the signature, to
