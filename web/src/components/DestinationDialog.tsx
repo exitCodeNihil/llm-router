@@ -309,6 +309,9 @@ function sameHosts(stored: TelemetryDestination, endpoint: string, tracesUrl: st
   );
 }
 
+/** OTLP first: it is the general case, the rest are named products. */
+const byPreference = (a: TelemetryKind, b: TelemetryKind) => Number(b.name === "otlp") - Number(a.name === "otlp");
+
 export function DestinationDialog({
   editing,
   kinds,
@@ -329,7 +332,8 @@ export function DestinationDialog({
   const showToast = useToast();
 
   const [name, setName] = useState(editing?.name ?? "");
-  const [kindName, setKindName] = useState(editing?.kind ?? kinds[0]?.name ?? "");
+  const ordered = useMemo(() => [...kinds].sort(byPreference), [kinds]);
+  const [kindName, setKindName] = useState(editing?.kind ?? ordered[0]?.name ?? "");
   const [endpoint, setEndpoint] = useState(editing?.endpoint ?? "");
   const [tracesUrl, setTracesUrl] = useState(editing?.traces_url ?? "");
   const [config, setConfig] = useState<Record<string, string>>(editing?.config ?? {});
@@ -519,7 +523,7 @@ export function DestinationDialog({
               Kind
             </Text>
             <Grid columns={{ minWidth: 200, repeat: "fit" }} gap={3}>
-              {kinds.map((k) => (
+              {ordered.map((k) => (
                 <SelectableCard
                   key={k.name}
                   label={k.label}
