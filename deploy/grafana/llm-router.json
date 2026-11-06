@@ -1280,7 +1280,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "llmr_usage_queued{namespace=~\"$namespace\"}",
+          "expr": "llmr_usage_queued{namespace=~\"$namespace\"} * on (instance) group_left llmr_build_info{runtime=\"control_plane\"}",
           "legendFormat": "{{instance}} queued",
           "refId": "A",
           "range": true
@@ -1290,7 +1290,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "llmr_usage_queue_capacity{namespace=~\"$namespace\"}",
+          "expr": "llmr_usage_queue_capacity{namespace=~\"$namespace\"} * on (instance) group_left llmr_build_info{runtime=\"control_plane\"}",
           "legendFormat": "{{instance}} capacity",
           "refId": "B",
           "range": true
@@ -1506,7 +1506,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (instance) (increase(llmr_usage_dropped_total{namespace=~\"$namespace\"}[$__rate_interval]))",
+          "expr": "sum by (instance) (increase(llmr_usage_dropped_total{namespace=~\"$namespace\"}[$__rate_interval]) * on (instance) group_left llmr_build_info{runtime=\"control_plane\"})",
           "legendFormat": "{{instance}}",
           "refId": "A",
           "range": true
