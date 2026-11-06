@@ -452,6 +452,8 @@ export interface RequestRow {
   ttft_ms: number | null;
   /** List value when the request itself was free (subscription pass-through). */
   notional_cost_usd: number | null;
+  /** OTel trace id; null on rows from before 0.3.0. */
+  trace_id: string | null;
 }
 export interface RequestFilters {
   limit?: number;
@@ -600,6 +602,7 @@ export interface UsageByModel {
 export interface UsageRecent {
   ts: string;
   request_id: string;
+  trace_id: string | null;
   model_name: string;
   api_key_id: string | null;
   user_id: string | null;
