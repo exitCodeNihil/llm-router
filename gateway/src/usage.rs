@@ -54,8 +54,10 @@ pub struct Event {
 
     /// The caller's trace, or a new one (32 hex); `parent_span_id` is the
     /// caller's span (16 hex), 0 for none.
+    /// Bytes, big-endian, not a u128: that would align every queued event
+    /// to 16 bytes.
     #[serde(serialize_with = "hex_trace")]
-    pub trace_id: u128,
+    pub trace_id: [u8; 16],
     #[serde(skip_serializing_if = "is_zero_u64", serialize_with = "hex_span")]
     pub parent_span_id: u64,
     /// gen_ai.operation.name.
@@ -139,8 +141,8 @@ fn is_zero_u8(n: &u8) -> bool {
 fn is_false(b: &bool) -> bool {
     !*b
 }
-fn hex_trace<S: Serializer>(n: &u128, s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(std::str::from_utf8(&telemetry::hex128(*n)).unwrap_or_default())
+fn hex_trace<S: Serializer>(n: &[u8; 16], s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(std::str::from_utf8(&telemetry::hex128(u128::from_be_bytes(*n))).unwrap_or_default())
 }
 fn hex_span<S: Serializer>(n: &u64, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(std::str::from_utf8(&telemetry::hex64(*n)).unwrap_or_default())
@@ -660,7 +662,7 @@ impl Emit {
             attempts: self.attempts,
             error_code,
             ttft_ms,
-            trace_id: self.trace.id,
+            trace_id: self.trace.id.to_be_bytes(),
             parent_span_id: self.trace.parent,
             operation: self.operation,
             reported: (!u.geo.is_empty() || !u.speed.is_empty())
@@ -793,7 +795,7 @@ mod tests {
             attempts: 3,
             ttft_ms: 12_345,
             error_code: "upstream_rate_limited",
-            trace_id: u128::MAX,
+            trace_id: [0xff; 16],
             parent_span_id: u64::MAX,
             operation: Operation::TextCompletion,
             reported: Some(Box::new(Reported {
@@ -833,7 +835,7 @@ mod tests {
                 attempts: i64::MAX,
                 ttft_ms: i64::MAX,
                 error_code: "upstream_rate_limited",
-                trace_id: u128::MAX,
+                trace_id: [0xff; 16],
                 parent_span_id: u64::MAX,
                 operation: Operation::TextCompletion,
                 reported: Some(Box::new(Reported {
@@ -851,10 +853,17 @@ mod tests {
         }
     }
 
+    /// The queue holds up to 200,000 of them.
+    #[test]
+    fn events_stay_small() {
+        assert_eq!(std::mem::align_of::<Event>(), 8);
+        assert!(std::mem::size_of::<Event>() <= 320, "{}", std::mem::size_of::<Event>());
+    }
+
     #[test]
     fn serializes_trace_and_content() {
         let e = Event {
-            trace_id: 0x4bf92f3577b34da6a3ce929d0e0e4736,
+            trace_id: 0x4bf92f3577b34da6a3ce929d0e0e4736u128.to_be_bytes(),
             operation: Operation::Chat,
             reported: Some(Box::new(Reported { inference_geo: Tag::new("us"), ..Reported::default() })),
             content: content(r#"[{"role":"user","content":"hi"}]"#, None, "answer"),

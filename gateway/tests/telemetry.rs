@@ -172,7 +172,7 @@ async fn captures_content_within_the_cap() {
                 let evs = events(&model);
                 assert_eq!(evs.len(), 1, "{what}");
                 let e = &evs[0];
-                assert_eq!(e.trace_id, 0x4bf92f3577b34da6a3ce929d0e0e4736, "{what}");
+                assert_eq!(u128::from_be_bytes(e.trace_id), 0x4bf92f3577b34da6a3ce929d0e0e4736, "{what}");
                 assert_eq!(e.parent_span_id, 0x00f067aa0ba902b7, "{what}");
                 assert_eq!((e.operation.as_str(), e.cost_basis), ("chat", 1), "{what}");
                 if flavor == "anthropic" {
@@ -248,7 +248,10 @@ async fn traceparent_places_but_never_decides() {
     let (_, h, _) = call(format!("{gw}/v1/messages"), &body, Some(unsampled)).await;
     assert_eq!(h["x-llmr-trace-id"], "4bf92f3577b34da6a3ce929d0e0e4736");
     let e = &events(model)[0];
-    assert_eq!((e.trace_id, e.parent_span_id), (0x4bf92f3577b34da6a3ce929d0e0e4736, 0x00f067aa0ba902b7));
+    assert_eq!(
+        (u128::from_be_bytes(e.trace_id), e.parent_span_id),
+        (0x4bf92f3577b34da6a3ce929d0e0e4736, 0x00f067aa0ba902b7)
+    );
     assert!(e.content.is_some(), "the policy decides, not the caller");
 
     let (_, h, _) = call(format!("{gw}/v1/messages"), &body, Some("00-nonsense")).await;
@@ -256,7 +259,7 @@ async fn traceparent_places_but_never_decides() {
     assert!(id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{id}");
     assert_ne!(id, "4bf92f3577b34da6a3ce929d0e0e4736");
     let e = &events(model)[0];
-    assert_eq!(format!("{:032x}", e.trace_id), id);
+    assert_eq!(format!("{:032x}", u128::from_be_bytes(e.trace_id)), id);
     assert_eq!(e.parent_span_id, 0);
     assert!(e.content.is_some(), "a tag rule with content, sampled at 100");
 
