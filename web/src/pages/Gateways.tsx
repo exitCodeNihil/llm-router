@@ -473,7 +473,7 @@ function GatewayGroups({ onNew }: { onNew: () => void }) {
       renderCell: (g) =>
         g.data_rule === "inherit" ? (
           <Text type="supporting" color="secondary">
-            Settings
+            Capture policy
           </Text>
         ) : (
           <Badge variant="warning" label={g.data_rule === "no_export" ? "never exported" : "no content"} />
