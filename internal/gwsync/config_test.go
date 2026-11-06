@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -60,7 +61,7 @@ func keyIDs(c Config) []string {
 }
 
 func TestConfigForAllTeams(t *testing.T) {
-	b := buildConfig(fixture(), &snapshot.GatewayGroup{ID: "g", Name: "all"})
+	b := buildConfig(fixture(), &snapshot.GatewayGroup{ID: "g", Name: "all"}, schemaVersion)
 	if got := strings.Join(keyIDs(b.cfg), ","); got != "k-alice-own,k-alice-team,k-bob-team,k-carol" {
 		t.Fatalf("keys = %s", got)
 	}
@@ -84,7 +85,7 @@ func TestConfigForAllTeams(t *testing.T) {
 // only the deployments those callers can reach: no other team's credentials.
 func TestConfigForOneTeam(t *testing.T) {
 	g := &snapshot.GatewayGroup{ID: "g", Name: "team-a", AllowedTeams: map[string]bool{"A": true}}
-	b := buildConfig(fixture(), g)
+	b := buildConfig(fixture(), g, schemaVersion)
 	if got := strings.Join(keyIDs(b.cfg), ","); got != "k-alice-own,k-alice-team" {
 		t.Fatalf("keys = %s", got)
 	}
@@ -107,11 +108,11 @@ func TestConfigForOneTeam(t *testing.T) {
 }
 
 func TestConfigRegionFirst(t *testing.T) {
-	b := buildConfig(fixture(), &snapshot.GatewayGroup{ID: "g", Name: "eu", Region: "eu"})
+	b := buildConfig(fixture(), &snapshot.GatewayGroup{ID: "g", Name: "eu", Region: "eu"}, schemaVersion)
 	if b.cfg.Deployments[0].ID != "d-a-eu" || b.cfg.Deployments[1].ID != "d-a-us" {
 		t.Fatalf("eu gateways should try the eu deployment first: %+v", b.cfg.Deployments)
 	}
-	b = buildConfig(fixture(), &snapshot.GatewayGroup{ID: "g", Name: "none"})
+	b = buildConfig(fixture(), &snapshot.GatewayGroup{ID: "g", Name: "none"}, schemaVersion)
 	if b.cfg.Deployments[0].ID != "d-a-us" {
 		t.Fatalf("without a region the snapshot order stands: %+v", b.cfg.Deployments)
 	}
@@ -134,8 +135,8 @@ func TestReachablePattern(t *testing.T) {
 // or an expired one never opens a gateway endpoint.
 func TestSessionRejects(t *testing.T) {
 	s := &Server{Key: auth.DeriveKey("llmr-gw-session", "enc")}
-	h := s.session(func(w http.ResponseWriter, r *http.Request, instance, group string) {
-		w.Write([]byte(instance + "/" + group))
+	h := s.session(func(w http.ResponseWriter, r *http.Request, p peer) {
+		w.Write([]byte(p.instance + "/" + p.group + "/" + strconv.Itoa(p.schema)))
 	})
 	call := func(token string) (int, string) {
 		r := httptest.NewRequest("GET", "/gw/v1/config", nil)
@@ -144,9 +145,13 @@ func TestSessionRejects(t *testing.T) {
 		h.ServeHTTP(w, r)
 		return w.Code, w.Body.String()
 	}
-	good := auth.SignToken(s.Key, "i1:g1", time.Now().Add(time.Minute))
-	if code, body := call(good); code != 200 || body != "i1/g1" {
+	good := auth.SignToken(s.Key, "i1:g1:2", time.Now().Add(time.Minute))
+	if code, body := call(good); code != 200 || body != "i1/g1/2" {
 		t.Fatalf("valid session: %d %s", code, body)
+	}
+	// A session from 0.2.x has no schema and speaks schema 1.
+	if code, body := call(auth.SignToken(s.Key, "i1:g1", time.Now().Add(time.Minute))); code != 200 || body != "i1/g1/1" {
+		t.Fatalf("0.2.x session: %d %s", code, body)
 	}
 	console := auth.SignToken(auth.DeriveKey("llmr-session", "enc"), "i1:g1", time.Now().Add(time.Minute))
 	expired := auth.SignToken(s.Key, "i1:g1", time.Now().Add(-time.Second))

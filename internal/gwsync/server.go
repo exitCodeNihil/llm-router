@@ -67,17 +67,28 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.Handle("POST /gw/v1/sync", s.session(s.sync))
 }
 
-type sessionHandler func(w http.ResponseWriter, r *http.Request, instance, group string)
+// peer is the gateway a session belongs to, and the wire schema it speaks.
+type peer struct {
+	instance, group string
+	schema          int
+}
+
+type sessionHandler func(w http.ResponseWriter, r *http.Request, p peer)
 
 func (s *Server) session(next sessionHandler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sub, err := auth.VerifyToken(s.Key, bearer(r))
-		instance, group, ok := strings.Cut(sub, ":")
-		if err != nil || !ok {
+		parts := strings.Split(sub, ":")
+		if err != nil || len(parts) < 2 || len(parts) > 3 {
 			http.Error(w, "invalid or expired session: join again", http.StatusUnauthorized)
 			return
 		}
-		next(w, r, instance, group)
+		p := peer{instance: parts[0], group: parts[1], schema: 1} // sessions from 0.2.x carry no schema
+		if len(parts) == 3 {
+			p.schema, _ = strconv.Atoi(parts[2])
+			p.schema = min(max(p.schema, 1), schemaVersion)
+		}
+		next(w, r, p)
 	})
 }
 
@@ -94,9 +105,10 @@ type sessionResponse struct {
 	Schema         int    `json:"schema,omitempty"`
 }
 
-func (s *Server) newSession(instance, group string) sessionResponse {
+func (s *Server) newSession(p peer) sessionResponse {
 	exp := time.Now().Add(sessionTTL)
-	return sessionResponse{Session: auth.SignToken(s.Key, instance+":"+group, exp), ExpiresAtMS: exp.UnixMilli()}
+	sub := p.instance + ":" + p.group + ":" + strconv.Itoa(p.schema)
+	return sessionResponse{Session: auth.SignToken(s.Key, sub, exp), ExpiresAtMS: exp.UnixMilli()}
 }
 
 // join registers a new gateway instance in the group whose token it presents.
@@ -137,27 +149,31 @@ func (s *Server) join(w http.ResponseWriter, r *http.Request) {
 	// Autoscaled replicas come and go: forget the ones gone for a week.
 	s.Store.Pool.Exec(r.Context(), `DELETE FROM gateway_instances WHERE group_id=$1 AND last_seen_at < $2`,
 		g.ID, time.Now().Add(-staleInstance))
-	resp := s.newSession(id, g.ID)
-	resp.InstanceID, resp.Group, resp.SyncIntervalMS, resp.Schema = id, &g, syncInterval.Milliseconds(), schemaVersion
+	// A gateway that sends no schema is a 0.2.x one, which speaks schema 1.
+	schema := min(max(req.Schema, 1), schemaVersion)
+	resp := s.newSession(peer{instance: id, group: g.ID, schema: schema})
+	resp.InstanceID, resp.Group, resp.SyncIntervalMS, resp.Schema = id, &g, syncInterval.Milliseconds(), schema
 	writeJSON(w, http.StatusOK, resp)
 }
 
 // renew extends a session for an instance that still exists. Rotating the
 // join token keeps running gateways going; deleting the group or the instance
 // ends them at their next renew.
-func (s *Server) renew(w http.ResponseWriter, r *http.Request, instance, group string) {
+func (s *Server) renew(w http.ResponseWriter, r *http.Request, p peer) {
+	instance, group := p.instance, p.group
 	var one int
 	if err := s.Store.Pool.QueryRow(r.Context(),
 		`SELECT 1 FROM gateway_instances WHERE id=$1 AND group_id=$2`, instance, group).Scan(&one); err != nil {
 		http.Error(w, "instance removed: join again", http.StatusUnauthorized)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.newSession(instance, group))
+	writeJSON(w, http.StatusOK, s.newSession(p))
 }
 
 // config long-polls: it answers 304 until the config version differs from the
 // gateway's If-None-Match ("v<version>"), or the wait (seconds) runs out.
-func (s *Server) config(w http.ResponseWriter, r *http.Request, instance, group string) {
+func (s *Server) config(w http.ResponseWriter, r *http.Request, p peer) {
+	group := p.group
 	have, _ := strconv.ParseInt(strings.TrimPrefix(strings.Trim(r.Header.Get("If-None-Match"), `"`), "v"), 10, 64)
 	wait, _ := strconv.Atoi(r.URL.Query().Get("wait"))
 	deadline := time.Now().Add(min(time.Duration(max(wait, 0))*time.Second, maxWait))
@@ -169,7 +185,7 @@ func (s *Server) config(w http.ResponseWriter, r *http.Request, instance, group 
 				return
 			}
 			if snap.Version != have {
-				enc := s.encoded(snap, group)
+				enc := s.encoded(snap, group, p.schema)
 				h := w.Header()
 				h.Set("Content-Type", "application/json")
 				h.Set("Content-Encoding", "gzip")
@@ -196,13 +212,14 @@ func (s *Server) config(w http.ResponseWriter, r *http.Request, instance, group 
 
 // encoded returns the group's config for this snapshot, building it once per
 // version.
-func (s *Server) encoded(snap *snapshot.Snapshot, group string) *encoded {
+func (s *Server) encoded(snap *snapshot.Snapshot, group string, schema int) *encoded {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if e := s.cache[group]; e != nil && e.version == snap.Version {
+	key := group + ":" + strconv.Itoa(schema)
+	if e := s.cache[key]; e != nil && e.version == snap.Version {
 		return e
 	}
-	b := buildConfig(snap, snap.GatewayGroups[group])
+	b := buildConfig(snap, snap.GatewayGroups[group], schema)
 	var buf bytes.Buffer
 	gz, _ := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
 	json.NewEncoder(gz).Encode(b.cfg)
@@ -216,7 +233,7 @@ func (s *Server) encoded(snap *snapshot.Snapshot, group string) *encoded {
 		}
 	}
 	e := &encoded{version: snap.Version, gz: buf.Bytes(), built: b}
-	s.cache[group] = e
+	s.cache[key] = e
 	return e
 }
 
@@ -255,7 +272,8 @@ type Stats struct {
 	Workers  int     `json:"workers"`
 }
 
-func (s *Server) sync(w http.ResponseWriter, r *http.Request, instance, group string) {
+func (s *Server) sync(w http.ResponseWriter, r *http.Request, p peer) {
+	instance, group := p.instance, p.group
 	snap := s.Snapshots.Get()
 	if snap == nil {
 		http.Error(w, "control plane starting", http.StatusServiceUnavailable)
@@ -286,7 +304,7 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request, instance, group st
 	}
 
 	// A gateway can only report usage for callers its group serves.
-	enc := s.encoded(snap, group)
+	enc := s.encoded(snap, group, p.schema)
 	events := make([]usage.Event, 0, len(req.Events))
 	dropped, clamped, fixed := 0, 0, 0
 	now := time.Now()

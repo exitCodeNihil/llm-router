@@ -15,7 +15,7 @@ use crate::health::{self, Health};
 use crate::limits::{self, Scope};
 
 /// The wire schema this gateway speaks (gwsync.schemaVersion).
-pub const SCHEMA: i64 = 1;
+pub const SCHEMA: i64 = 2;
 
 // ---- wire ---------------------------------------------------------------------------------
 

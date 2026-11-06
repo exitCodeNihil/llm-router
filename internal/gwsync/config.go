@@ -10,9 +10,12 @@ import (
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
 )
 
-// schemaVersion is the config and sync wire format. A gateway that sends a
-// newer one is refused at join, so an old control plane never half-serves it.
-const schemaVersion = 1
+// schemaVersion is the newest config and sync wire format. A gateway that
+// sends a newer one is refused at join, so an old control plane never
+// half-serves it. Older gateways get the schema they speak: 1 is 0.2.x.
+// Schema 2 adds Vertex and Entra credentials, identity-token issuers and the
+// telemetry policy, which a schema 1 gateway can't use and so never receives.
+const schemaVersion = 2
 
 // Config is what a gateway runs on: the keys, users and teams its group
 // serves, the deployments they can reach in the group's routing order, and the
@@ -114,10 +117,10 @@ type built struct {
 // limited to some teams gets their keys (and the personal keys of their
 // members), those users and teams, and only the deployments those callers can
 // reach, so a team's gateway never holds credentials for another team's models.
-func buildConfig(s *snapshot.Snapshot, g *snapshot.GatewayGroup) built {
+func buildConfig(s *snapshot.Snapshot, g *snapshot.GatewayGroup, schema int) built {
 	b := built{keys: map[string]*snapshot.Key{}}
 	c := &b.cfg
-	c.Schema, c.Version = schemaVersion, s.Version
+	c.Schema, c.Version = schema, s.Version
 	// Empty lists, not null, so a gateway never has to tell the two apart.
 	c.Keys, c.Users, c.Teams, c.Providers, c.Deployments = []Key{}, []User{}, []Team{}, []Provider{}, []Deployment{}
 	c.Group = Group{ID: g.ID, Name: g.Name, Region: g.Region, DataRule: g.DataRule}
