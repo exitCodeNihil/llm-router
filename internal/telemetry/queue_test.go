@@ -208,3 +208,52 @@ func TestWorkerRun(t *testing.T) {
 		t.Fatalf("shutdown left %d batches delivered, want 2", len(s.batches))
 	}
 }
+
+// blockingSink holds its first export until the worker is stopped.
+type blockingSink struct {
+	entered chan struct{}
+	fakeSink
+}
+
+func (s *blockingSink) Export(ctx context.Context, b []*Record) error {
+	s.mu.Lock()
+	first := s.calls == 0
+	s.mu.Unlock()
+	if first {
+		s.mu.Lock()
+		s.calls++
+		s.mu.Unlock()
+		close(s.entered)
+		<-ctx.Done()
+		return &ExportError{Msg: ctx.Err().Error()}
+	}
+	return s.fakeSink.Export(ctx, b)
+}
+
+// A batch in flight when the process stops is sent by the final flush, not
+// counted as lost.
+func TestInFlightBatchFlushedAtShutdown(t *testing.T) {
+	for _, retrying := range []bool{false, true} {
+		s := &blockingSink{entered: make(chan struct{}), fakeSink: fakeSink{got: make(chan []*Record, 10)}}
+		if retrying { // stopped while waiting to retry, not mid-export
+			s.calls = 1
+			s.errs = []error{&ExportError{Retryable: true, Status: 503}}
+			close(s.entered)
+		}
+		p := fastPolicy()
+		p.BackoffMin, p.BackoffMax = time.Minute, time.Minute
+		w := testWorker(p, s)
+		ctx, cancel := context.WithCancel(context.Background())
+		go w.run(ctx)
+		w.q.push(rec("1"))
+		<-s.entered
+		time.Sleep(20 * time.Millisecond)
+		w.flushOn.Store(true)
+		cancel()
+		<-w.done
+		h := w.health()
+		if h.Delivered != 1 || h.Dropped != (Dropped{}) {
+			t.Fatalf("retrying=%v: health %+v", retrying, h)
+		}
+	}
+}

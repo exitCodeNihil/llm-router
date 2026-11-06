@@ -32,8 +32,11 @@ type Manager struct {
 	Recorder  *Recorder     // optional: the console's "exported right now" feed
 	p         policy
 
-	mu      sync.Mutex // reconcile
+	mu sync.Mutex // reconcile
+	// ctx is what workers run under. Not Run's: shutdown must set flushOn
+	// before a worker sees it is stopped.
 	ctx     context.Context
+	closed  bool
 	seen    *snapshot.Snapshot
 	workers atomic.Pointer[map[string]*worker]
 	deps    atomic.Pointer[map[string]upstream] // by deployment id
@@ -43,12 +46,10 @@ func NewManager(h *snapshot.Holder, pool *pgxpool.Pool) *Manager {
 	return &Manager{Snapshots: h, Pool: pool, p: defaultPolicy, ctx: context.Background()}
 }
 
-// Run applies destination changes from the snapshot as they arrive, and on
-// shutdown makes one last attempt at what is queued.
+// Run applies destination changes from the snapshot as they arrive. When ctx
+// ends it makes one last attempt at what is queued, about 5 seconds at most,
+// and returns once that is done: cancel it after the last event is written.
 func (m *Manager) Run(ctx context.Context) {
-	m.mu.Lock()
-	m.ctx = ctx
-	m.mu.Unlock()
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	status := time.NewTicker(statusInterval)
@@ -68,6 +69,9 @@ func (m *Manager) Run(ctx context.Context) {
 }
 
 func (m *Manager) shutdown() {
+	m.mu.Lock()
+	m.closed = true // no worker starts after this
+	m.mu.Unlock()
 	ws := m.loadWorkers()
 	for _, w := range ws {
 		w.flushOn.Store(true)
@@ -95,7 +99,7 @@ func (m *Manager) Reconcile() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	snap := m.Snapshots.Get()
-	if snap == nil || snap == m.seen {
+	if snap == nil || snap == m.seen || m.closed {
 		return
 	}
 	m.seen = snap

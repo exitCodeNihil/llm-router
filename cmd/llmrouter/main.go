@@ -124,7 +124,15 @@ func run() error {
 	recorder := telemetry.NewRecorder()
 	exporter := telemetry.NewManager(holder, st.Pool)
 	exporter.Recorder = recorder
-	go exporter.Run(ctx)
+	// Stopped only once the HTTP server has drained, so the events of the
+	// last requests are in the queues it flushes.
+	exportCtx, stopExport := context.WithCancel(context.Background())
+	defer stopExport()
+	exportDone := make(chan struct{})
+	go func() {
+		exporter.Run(exportCtx)
+		close(exportDone)
+	}()
 	live := metrics.NewLive()
 	nodeStore := metrics.NewNodeStore()
 	httpm := metrics.NewHTTP()
@@ -178,16 +186,25 @@ func run() error {
 		ReadHeaderTimeout: 10 * time.Second,
 		ConnState:         httpm.ConnState,
 	}
+	drained := make(chan struct{})
 	go func() {
 		<-ctx.Done()
 		shCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		srv.Shutdown(shCtx)
+		close(drained)
 	}()
 
 	slog.Info("llm-router listening", "addr", cfg.Listen)
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		return err
+	}
+	<-drained
+	stopExport()
+	select {
+	case <-exportDone:
+	case <-time.After(7 * time.Second):
+		slog.Warn("telemetry export did not finish flushing before exit")
 	}
 	return nil
 }

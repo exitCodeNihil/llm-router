@@ -87,6 +87,16 @@ func (q *queue) take() []*Record {
 	return batch
 }
 
+// requeue puts a batch that couldn't be sent back at the head of the queue.
+func (q *queue) requeue(batch []*Record) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, r := range batch {
+		q.bytes += int64(r.Size())
+	}
+	q.items = append(append(make([]*Record, 0, len(batch)+len(q.items)), batch...), q.items...)
+}
+
 // clear drops everything queued.
 func (q *queue) clear() {
 	q.mu.Lock()
@@ -174,7 +184,8 @@ func (w *worker) linger(ctx context.Context) {
 	}
 }
 
-// final makes one quick attempt at what is still queued at shutdown.
+// final makes one quick attempt at what is still queued at shutdown,
+// including a batch that was in flight when the worker was stopped.
 func (w *worker) final() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -216,6 +227,10 @@ func (w *worker) deliver(ctx context.Context, batch []*Record) {
 			w.st.ok(len(batch))
 			return
 		}
+		if ctx.Err() != nil { // stopped mid-export: final sends it, if anything does
+			w.q.requeue(batch)
+			return
+		}
 		var xe *ExportError
 		if !errors.As(err, &xe) {
 			xe = &ExportError{Msg: err.Error()}
@@ -244,7 +259,7 @@ func (w *worker) deliver(ctx context.Context, batch []*Record) {
 		case <-t.C:
 		case <-ctx.Done():
 			t.Stop()
-			w.st.failed(err, &w.st.expired, len(batch))
+			w.q.requeue(batch)
 			return
 		}
 	}

@@ -353,3 +353,35 @@ func TestDisableDropsQueue(t *testing.T) {
 	}
 	nothingFor(t, sinkFor(t, "disable"), 400*time.Millisecond)
 }
+
+// Run returns once what was queued when it was stopped has been sent.
+func TestRunFlushesOnShutdown(t *testing.T) {
+	for i := range 20 {
+		d := dest(fmt.Sprint("flush-", i), false)
+		fakes.Lock()
+		delete(fakes.sinks, d.Name)
+		fakes.Unlock()
+		h := &snapshot.Holder{}
+		h.Set(&snapshot.Snapshot{Destinations: []*snapshot.Destination{d}})
+		m := NewManager(h, nil)
+		m.p.Linger = time.Hour
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			m.Run(ctx)
+			close(done)
+		}()
+		for len(m.loadWorkers()) == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		m.Write(usage.Event{RequestID: "r", Export: true})
+		time.Sleep(time.Millisecond)
+		cancel()
+		<-done
+		select {
+		case <-sinkFor(t, d.Name).got:
+		default:
+			t.Fatalf("run %d: the queued record was not flushed before Run returned", i)
+		}
+	}
+}
