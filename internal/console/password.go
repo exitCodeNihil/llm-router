@@ -46,12 +46,10 @@ func (a *Auth) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Auth) handleSetup(w http.ResponseWriter, r *http.Request) {
-	lim, now := a.signInLimits(), time.Now()
-	ip := lim.clientIP(r)
-	if lim.refuse(w, ip, "", now) {
+	lim := a.signInLimits()
+	if !lim.admit(w, lim.clientIP(r), "", time.Now()) {
 		return
 	}
-	lim.ip.add(ip, now)
 	needed, err := a.setupNeeded(r)
 	if err != nil || !needed {
 		http.Error(w, "setup is already complete", http.StatusForbidden)
@@ -99,12 +97,18 @@ func (a *Auth) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
-	lim, now := a.signInLimits(), time.Now()
-	ip, email := lim.clientIP(r), normEmail(req.Email)
-	if lim.refuse(w, ip, email, now) {
+	email := normEmail(req.Email)
+	if email == "" || len(email) > maxEmail {
+		http.Error(w, "incorrect email or password", http.StatusUnauthorized)
 		return
 	}
-	lim.ip.add(ip, now)
+	lim := a.signInLimits()
+	ip := lim.clientIP(r)
+	// A failure is reserved before the password is checked, and given back on
+	// success, so concurrent guesses cannot all slip in under the limit.
+	if !lim.admit(w, ip, email, time.Now()) {
+		return
+	}
 	var userID string
 	var hash []byte
 	err := a.Store.Pool.QueryRow(r.Context(),
@@ -112,11 +116,10 @@ func (a *Auth) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 		Scan(&userID, &hash)
 	if err != nil || len(hash) == 0 ||
 		bcrypt.CompareHashAndPassword(hash, []byte(req.Password)) != nil {
-		lim.email.add(email, now)
 		http.Error(w, "incorrect email or password", http.StatusUnauthorized)
 		return
 	}
-	lim.email.reset(email)
+	lim.succeeded(ip, email)
 	setSessionCookie(w, r, a.EncryptionKey, a.CookieDomain, userID)
 	w.WriteHeader(http.StatusNoContent)
 }

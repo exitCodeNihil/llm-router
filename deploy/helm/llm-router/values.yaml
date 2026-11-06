@@ -11,6 +11,12 @@ image:
 replicas: 1
 allowMultipleReplicas: false
 
+# Proxies in front of the console (addresses or CIDR ranges, e.g. your ingress
+# controller's pod range) whose X-Forwarded-For header names the client. Sign-in
+# attempts are rate limited per client, so without this everyone behind the
+# ingress shares one limit. Each proxy must append to X-Forwarded-For.
+trustedProxies: []
+
 databaseUrl: ""      # postgres://user:pass@host:5432/db — or use existingSecret
 adminToken: ""
 encryptionKey: ""

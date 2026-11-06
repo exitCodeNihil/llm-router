@@ -46,6 +46,10 @@ spec:
               value: {{ . | quote }}
             {{- end }}
             {{- end }}
+            {{- with .Values.trustedProxies }}
+            - name: LLMR_TRUSTED_PROXIES
+              value: {{ join "," . | quote }}
+            {{- end }}
             {{- if .Values.anthropicIdentity.enabled }}
             {{- include "llm-router.anthropicIdentityEnv" . | nindent 12 }}
             {{- end }}

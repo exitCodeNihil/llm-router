@@ -33,24 +33,22 @@ func newWindow(span time.Duration, max int) *window {
 	return &window{span: span, max: max, events: map[string][]time.Time{}}
 }
 
-// wait reports how long until key may try again; zero means now.
-func (w *window) wait(key string, now time.Time) time.Duration {
+// take records an attempt for key and returns zero, or, when key has used
+// up the window, records nothing and returns how long until it may try
+// again. Checking and recording under one lock means a burst of concurrent
+// attempts cannot all slip in before the first is counted.
+func (w *window) take(key string, now time.Time) time.Duration {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	ev := w.live(key, now)
-	if len(ev) < w.max {
-		return 0
+	if len(ev) >= w.max {
+		return ev[len(ev)-w.max].Add(w.span).Sub(now)
 	}
-	return ev[0].Add(w.span).Sub(now)
-}
-
-func (w *window) add(key string, now time.Time) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
 	if len(w.events) >= maxTrackedClients {
 		w.prune(now)
 	}
-	w.events[key] = append(w.live(key, now), now)
+	w.events[key] = append(ev, now)
+	return 0
 }
 
 func (w *window) reset(key string) {
@@ -107,13 +105,16 @@ func (l *signInLimits) clientIP(r *http.Request) string {
 		host = r.RemoteAddr
 	}
 	addr, err := netip.ParseAddr(host)
-	if err != nil || !l.isTrusted(addr) {
+	if err != nil {
 		return host
+	}
+	if !l.isTrusted(addr) {
+		return clientKey(addr)
 	}
 	hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
 	for i := len(hops) - 1; i >= 0; i-- {
-		hop, err := netip.ParseAddr(strings.TrimSpace(hops[i]))
-		if err != nil {
+		hop, ok := parseHop(hops[i])
+		if !ok {
 			break
 		}
 		addr = hop
@@ -121,7 +122,30 @@ func (l *signInLimits) clientIP(r *http.Request) string {
 			break
 		}
 	}
-	return addr.Unmap().String()
+	return clientKey(addr)
+}
+
+// parseHop reads one X-Forwarded-For entry: an address, optionally with a
+// port, as some proxies send it.
+func parseHop(h string) (netip.Addr, bool) {
+	h = strings.TrimSpace(h)
+	if ap, err := netip.ParseAddrPort(h); err == nil {
+		return ap.Addr(), true
+	}
+	a, err := netip.ParseAddr(h)
+	return a, err == nil
+}
+
+// clientKey is the address limits count against. IPv6 clients are counted
+// per /64, the block one subscriber usually gets, so cycling addresses within
+// it does not buy fresh attempts.
+func clientKey(a netip.Addr) string {
+	a = a.Unmap()
+	if a.Is6() {
+		p, _ := a.Prefix(64)
+		return p.String()
+	}
+	return a.String()
 }
 
 func (l *signInLimits) isTrusted(a netip.Addr) bool {
@@ -134,16 +158,33 @@ func (l *signInLimits) isTrusted(a netip.Addr) bool {
 	return false
 }
 
-// refuse answers 429 when ip or email has used up its attempts. The answer is
-// the same either way, so it does not reveal whether an account exists.
-func (l *signInLimits) refuse(w http.ResponseWriter, ip, email string, now time.Time) bool {
-	wait := max(l.ip.wait(ip, now), l.email.wait(normEmail(email), now))
+// admit counts an attempt from ip and, when email is set, reserves one of the
+// failures allowed for that email from that address; a successful sign-in
+// gives it back (succeeded). Failures are counted per email and address, so a
+// stranger cannot lock someone else out. When either limit is used up it
+// answers 429, the same either way, so it does not reveal whether an account
+// exists, and returns false.
+func (l *signInLimits) admit(w http.ResponseWriter, ip, email string, now time.Time) bool {
+	wait := l.ip.take(ip, now)
+	if wait == 0 && email != "" {
+		wait = l.email.take(failureKey(ip, email), now)
+	}
 	if wait <= 0 {
-		return false
+		return true
 	}
 	w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
 	http.Error(w, "too many sign-in attempts; try again later", http.StatusTooManyRequests)
-	return true
+	return false
 }
+
+// succeeded clears the failures counted for this email from this address.
+func (l *signInLimits) succeeded(ip, email string) {
+	l.email.reset(failureKey(ip, email))
+}
+
+func failureKey(ip, email string) string { return ip + " " + email }
+
+// maxEmail is the longest address worth looking up (RFC 5321's path limit).
+const maxEmail = 254
 
 func normEmail(e string) string { return strings.ToLower(strings.TrimSpace(e)) }

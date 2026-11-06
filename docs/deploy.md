@@ -58,7 +58,12 @@ helm install llm-router ./deploy/helm/llm-router --set existingSecret=llm-router
   --set ingress.enabled=true,ingress.host=router.example.com,ingress.className=nginx
 ```
 
-Add `ingress.tls` for HTTPS. Keep one control-plane replica and scale with [gateways](#gateways). For
+Add `ingress.tls` for HTTPS. Set `trustedProxies` to your ingress controller's addresses, so sign-in
+limits count each client rather than the ingress (`--set 'trustedProxies={10.0.0.0/8}'`).
+
+Keep one control-plane replica and scale with [gateways](#gateways). Rate limits, budget counters,
+live metrics and telemetry queues live in its memory, so the chart refuses `replicas` above 1 unless
+you set `allowMultipleReplicas=true`, and then each replica enforces limits on its own traffic only. For
 [workspaces](workspaces.md#kubernetes) add `--set workspaces.enabled=true,workspaces.ideOrigin=https://ide.example.com`.
 
 ## Gateways
@@ -126,6 +131,7 @@ For llm-router itself (the gateways have [their own](#gateways)):
 | `LLMR_ENCRYPTION_KEY` | Encrypts provider keys and signs sessions; 16+ characters, required |
 | `LLMR_ADMIN_TOKEN` | Bootstrap admin token, 12+ characters (optional) |
 | `LLMR_LISTEN` | Listen address, default `:8080` |
+| `LLMR_TRUSTED_PROXIES` | Comma-separated addresses or CIDR ranges of proxies whose `X-Forwarded-For` names the client. Console sign-in is limited to 20 attempts a minute per client address (IPv6 per /64) and 5 failures per 15 minutes per email and address. Each proxy must append to `X-Forwarded-For` |
 | `LLMR_SEED_CLAUDE_SUBSCRIPTION` | `1` adds the [subscription pass-through](clients.md#on-your-claudeai-subscription) provider and models |
 | `LLMR_IDE_LISTEN`, `LLMR_IDE_ORIGIN`, `LLMR_COOKIE_DOMAIN` | [Workspace IDE](workspaces.md) listener, its public origin, and the session cookie domain when it is another hostname |
 | `LLMR_WORKSPACE_NETWORK` | Docker network shared with workspaces, so a containerised llm-router reaches each IDE by name (set by `docker-compose.workspaces.yml`). Unset, the IDE is published on the host's loopback |
