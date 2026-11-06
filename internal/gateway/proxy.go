@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -198,9 +199,11 @@ func contentCap(snap *snapshot.Snapshot, id *auth.Identity, dec snapshot.Decisio
 }
 
 // capContent bounds captured content to limit bytes per part: the output is
-// cut, a larger system prompt is dropped, and the input keeps its newest
-// messages that fit. Destinations cut further to their own caps; this keeps a
-// queued event from holding a 10 MB prompt. cut reports anything left out.
+// cut, a larger system prompt has its text cut, and the input keeps its newest
+// messages that fit, or the newest alone with its text cut when not even that
+// fits. Destinations cut further to their own caps; this keeps a queued event
+// from holding a 10 MB prompt. cut reports anything left out. The Rust
+// gateway's capture_request follows the same rule.
 func capContent(limit int, input, system json.RawMessage, output string) (json.RawMessage, json.RawMessage, string, bool) {
 	if limit <= 0 {
 		return nil, nil, "", false
@@ -210,7 +213,7 @@ func capContent(limit int, input, system json.RawMessage, output string) (json.R
 		output, cut = truncateUTF8(output, limit), true
 	}
 	if len(system) > limit {
-		system, cut = nil, true
+		system, cut = cutJSON(system, limit), true
 	}
 	if len(input) > limit {
 		var msgs []json.RawMessage
@@ -220,12 +223,88 @@ func capContent(limit int, input, system json.RawMessage, output string) (json.R
 			n += len(msgs[i-1]) + 1
 			i--
 		}
-		input, cut = nil, cut || i > 0 || len(msgs) == 0
-		if i < len(msgs) {
+		input, cut = nil, true
+		switch {
+		case i < len(msgs):
 			input, _ = json.Marshal(msgs[i:])
+		case len(msgs) > 0: // not even the newest fits: keep it, its text cut
+			if m := cutJSON(msgs[len(msgs)-1], limit-2); m != nil {
+				input = append(append(json.RawMessage("["), m...), ']')
+			}
 		}
 	}
 	return input, system, output, cut
+}
+
+// cutJSON fits a JSON value in limit bytes by shortening its strings, the
+// longest first, leaving "role" and "type" alone; nil when even empty strings
+// don't fit. Only an oversized part takes this path: it is re-encoded.
+func cutJSON(raw json.RawMessage, limit int) json.RawMessage {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if dec.Decode(&v) != nil {
+		return nil
+	}
+	type ref struct {
+		s   string
+		set func(string)
+	}
+	var refs []ref
+	var walk func(v any, set func(string))
+	walk = func(v any, set func(string)) {
+		switch x := v.(type) {
+		case string:
+			refs = append(refs, ref{x, set})
+		case []any:
+			for i := range x {
+				walk(x[i], func(s string) { x[i] = s })
+			}
+		case map[string]any:
+			keys := make([]string, 0, len(x))
+			for k := range x {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				if k != "role" && k != "type" {
+					walk(x[k], func(s string) { x[k] = s })
+				}
+			}
+		}
+	}
+	walk(v, func(s string) { v = s })
+	out, err := marshalNoEscape(v)
+	if err != nil {
+		return nil
+	}
+	excess := len(out) - limit
+	sort.SliceStable(refs, func(i, j int) bool { return len(refs[i].s) > len(refs[j].s) })
+	// Every byte of text takes at least a byte encoded, so cutting n bytes of
+	// text saves at least n.
+	for _, r := range refs {
+		if excess <= 0 {
+			break
+		}
+		c := truncateUTF8(r.s, max(len(r.s)-excess, 0))
+		r.set(c)
+		excess -= len(r.s) - len(c)
+	}
+	if out, err = marshalNoEscape(v); err != nil || len(out) > limit {
+		return nil
+	}
+	return out
+}
+
+// marshalNoEscape is json.Marshal without HTML escaping, which would grow the text.
+func marshalNoEscape(v any) (json.RawMessage, error) {
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(b.Bytes(), []byte("\n")), nil
 }
 
 func truncateUTF8(s string, n int) string {

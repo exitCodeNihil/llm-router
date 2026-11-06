@@ -153,7 +153,7 @@ func TestAnthropicCapturesSystem(t *testing.T) {
 func TestCapContent(t *testing.T) {
 	in := json.RawMessage(`[{"role":"user","content":"aaaaaaaaaa"},{"role":"user","content":"b"}]`)
 	got, sys, out, cut := capContent(40, in, json.RawMessage(`"`+strings.Repeat("s", 50)+`"`), strings.Repeat("o", 50))
-	if string(got) != `[{"role":"user","content":"b"}]` || sys != nil || len(out) != 40 || !cut {
+	if string(got) != `[{"role":"user","content":"b"}]` || string(sys) != `"`+strings.Repeat("s", 38)+`"` || len(out) != 40 || !cut {
 		t.Fatalf("got %s %s %d %v", got, sys, len(out), cut)
 	}
 	if got, _, _, cut := capContent(1000, in, nil, "x"); string(got) != string(in) || cut {
@@ -161,5 +161,51 @@ func TestCapContent(t *testing.T) {
 	}
 	if got, sys, out, cut := capContent(0, in, in, "x"); got != nil || sys != nil || out != "" || cut {
 		t.Fatal("no cap means no content")
+	}
+}
+
+// The same cases as the Rust gateway's captures_requests_within_the_cap.
+func TestCapContentCutsTheNewest(t *testing.T) {
+	msgs := json.RawMessage(`[{"role":"user","content":"first"}, {"role":"assistant","content":"second"},{"role":"user","content":"third"}]`)
+	sys := json.RawMessage(`"you are terse"`)
+	// Not even the newest message fits: it stays, its text cut to fit.
+	in, s, _, cut := capContent(32, msgs, sys, "")
+	if string(in) != `[{"content":"th","role":"user"}]` || string(s) != `"you are terse"` || !cut {
+		t.Fatalf("input %s system %s cut %v", in, s, cut)
+	}
+	in, s, _, cut = capContent(10, msgs, sys, "")
+	if in != nil || string(s) != `"you are "` || !cut {
+		t.Fatalf("a message whose structure alone is over the cap: input %s system %s cut %v", in, s, cut)
+	}
+
+	// Blocks: the longest text gives way first; role and type never do.
+	big := strings.Repeat("é", 400)
+	sys, _ = json.Marshal([]any{map[string]string{"type": "text", "text": big}})
+	msgs, _ = json.Marshal([]any{map[string]any{"role": "user", "content": []any{
+		map[string]string{"type": "text", "text": "keep"}, map[string]string{"type": "text", "text": big}}}})
+	in, s, _, cut = capContent(200, msgs, sys, "")
+	if len(in) > 200 || len(s) > 200 || !cut {
+		t.Fatalf("over the cap: %s %s", in, s)
+	}
+	var v []struct {
+		Role    string `json:"role"`
+		Content []struct{ Type, Text string }
+	}
+	if err := json.Unmarshal(in, &v); err != nil || v[0].Role != "user" || v[0].Content[0].Text != "keep" ||
+		v[0].Content[1].Text == "" || !strings.HasPrefix(big, v[0].Content[1].Text) {
+		t.Fatalf("input %s: %v", in, err)
+	}
+	var sv []struct{ Type, Text string }
+	if err := json.Unmarshal(s, &sv); err != nil || sv[0].Type != "text" || !strings.HasPrefix(big, sv[0].Text) {
+		t.Fatalf("system %s: %v", s, err)
+	}
+	// Escapes count: a cut text still fits once encoded.
+	quotes, _ := json.Marshal([]any{map[string]string{"role": "user", "content": strings.Repeat("\"\n", 300)}})
+	if in, _, _, _ := capContent(100, quotes, nil, ""); in == nil || len(in) > 100 {
+		t.Fatalf("escaped input %d bytes: %s", len(in), in)
+	}
+	// Not a list of messages at all: nothing, and it says so.
+	if in, _, _, cut := capContent(10, json.RawMessage(`"not a list of messages at all"`), nil, ""); in != nil || !cut {
+		t.Fatalf("input %s cut %v", in, cut)
 	}
 }
