@@ -342,10 +342,7 @@ function DestinationsCard({ policyCapturesContent }: { policyCapturesContent: bo
       <VStack gap={0}>
         <HStack padding={4} hAlign="between" vAlign="center" gap={3} wrap="wrap">
           <VStack gap={0}>
-            <HStack gap={2} vAlign="center">
-              <Heading level={4}>Destinations</Heading>
-              <Badge variant="info" label="Beta" />
-            </HStack>
+            <Heading level={4}>Destinations</Heading>
             <Text type="supporting" color="secondary">
               Each destination receives the traffic the capture policy exports, narrowed by its own scope.
             </Text>
