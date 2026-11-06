@@ -1248,18 +1248,92 @@ impl<'a> JStr<'a> {
         &r[1..r.len() - 1]
     }
 
+    /// The text. A surrogate escape without its pair, which serde_json
+    /// refuses, reads as U+FFFD, as Go's encoding/json reads it.
     fn value(self) -> Cow<'a, str> {
         let inner = self.inner();
-        if inner.contains('\\') {
-            Cow::Owned(serde_json::from_str(self.raw()).unwrap_or_default())
-        } else {
-            Cow::Borrowed(inner)
+        if !inner.contains('\\') {
+            return Cow::Borrowed(inner);
         }
+        Cow::Owned(serde_json::from_str(self.raw()).unwrap_or_else(|_| {
+            let mut s = String::with_capacity(inner.len());
+            unescape_into(inner, &mut s, usize::MAX);
+            s
+        }))
     }
 
     fn is(self, s: &str) -> bool {
         self.value() == s
     }
+}
+
+/// Appends the text of an escaped JSON string body to `out`, at most `max`
+/// bytes of it, cut at a character; whether any was left out. Lenient as Go's
+/// encoding/json is: an unpaired surrogate escape, or any escape that isn't
+/// JSON, reads as U+FFFD and the rest of the text is kept.
+fn unescape_into(inner: &str, out: &mut String, max: usize) -> bool {
+    let b = inner.as_bytes();
+    let start = out.len();
+    let room = |out: &String| max - (out.len() - start);
+    let mut i = 0;
+    while i < b.len() {
+        let end = memchr::memchr(b'\\', &b[i..]).map_or(b.len(), |n| i + n);
+        if end > i {
+            let run = &inner[i..end];
+            if run.len() > room(out) {
+                out.push_str(&run[..floor_boundary(run, room(out))]);
+                return true;
+            }
+            out.push_str(run);
+            i = end;
+            continue;
+        }
+        let (c, next) = match b.get(i + 1) {
+            Some(b'"') => ('"', i + 2),
+            Some(b'\\') => ('\\', i + 2),
+            Some(b'/') => ('/', i + 2),
+            Some(b'b') => ('\u{8}', i + 2),
+            Some(b'f') => ('\u{c}', i + 2),
+            Some(b'n') => ('\n', i + 2),
+            Some(b'r') => ('\r', i + 2),
+            Some(b't') => ('\t', i + 2),
+            Some(b'u') => match hex4(b, i + 2) {
+                Some(hi @ 0xd800..0xdc00) => match (b.get(i + 6..i + 8), hex4(b, i + 8)) {
+                    (Some(br"\u"), Some(lo @ 0xdc00..0xe000)) => {
+                        let c = char::from_u32(0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00));
+                        (c.unwrap_or(char::REPLACEMENT_CHARACTER), i + 12)
+                    }
+                    _ => (char::REPLACEMENT_CHARACTER, i + 6),
+                },
+                // a trailing surrogate on its own is no char either
+                Some(u) => (char::from_u32(u).unwrap_or(char::REPLACEMENT_CHARACTER), i + 6),
+                None => (char::REPLACEMENT_CHARACTER, i + 2),
+            },
+            // not JSON: drop the backslash, keep what follows
+            _ => (char::REPLACEMENT_CHARACTER, i + 1),
+        };
+        if c.len_utf8() > room(out) {
+            return true;
+        }
+        out.push(c);
+        i = next;
+    }
+    false
+}
+
+/// Four hex digits at `at`.
+fn hex4(b: &[u8], at: usize) -> Option<u32> {
+    let digits = b.get(at..at + 4)?;
+    digits.iter().try_fold(0u32, |n, &c| Some(n << 4 | (c as char).to_digit(16)?))
+}
+
+/// The longest prefix of `s` of at most `n` bytes that ends at a character.
+fn floor_boundary(s: &str, n: usize) -> usize {
+    let mut n = n.min(s.len());
+    while !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    n
 }
 
 impl<'de: 'a, 'a> Deserialize<'de> for JStr<'a> {
@@ -1731,4 +1805,62 @@ struct UsageChunk {
     usage: Option<OaiUsage>,
     #[serde(default, deserialize_with = "nul")]
     choices: Vec<IgnoredAny>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jstr(raw: &str) -> String {
+        JStr(Some(raw)).value().into_owned()
+    }
+
+    /// What serde_json reads, it reads the same; what it refuses for an
+    /// unpaired surrogate, it reads as Go does, U+FFFD in its place.
+    #[test]
+    fn unescapes_like_go() {
+        for s in ["", "plain", "a\"b\\c/d\u{8}\u{c}\n\r\t", "\u{1}\u{1f}é😀\u{ffff}", "x\u{7f}y", "\\u0041"] {
+            let raw = serde_json::to_string(s).unwrap();
+            assert_eq!(jstr(&raw), s, "{raw}");
+            let mut out = String::new();
+            assert!(!unescape_into(&raw[1..raw.len() - 1], &mut out, usize::MAX));
+            assert_eq!(out, s, "{raw}");
+        }
+        let mut out = String::new();
+        unescape_into(r"é😀\/", &mut out, usize::MAX);
+        assert_eq!(out, "é😀/");
+        assert_eq!(jstr(r#""a\ud83d""#), "a\u{fffd}");
+        assert_eq!(jstr(r#""\ude00 tail""#), "\u{fffd} tail");
+        assert_eq!(jstr(r#""\ud83d😀!""#), "\u{fffd}😀!");
+        assert_eq!(jstr(r#""\ud83dx\n""#), "\u{fffd}x\n");
+        // not JSON at all, but never a panic
+        assert_eq!(jstr(r#""\q\u12""#), "\u{fffd}q\u{fffd}12");
+        let mut out = String::new();
+        unescape_into("é\\", &mut out, usize::MAX);
+        assert_eq!(out, "é\u{fffd}");
+    }
+
+    /// A surrogate pair split across two deltas: each delta keeps its text.
+    #[test]
+    fn a_split_surrogate_keeps_the_delta() {
+        let mut t = OaiPassthrough::new(false).capturing(100);
+        let mut out = Vec::new();
+        for d in [r"a\ud83d", r"\ude00 tail"] {
+            t.event(format!(r#"data: {{"choices":[{{"delta":{{"content":"{d}"}}}}]}}"#).as_bytes(), &mut out);
+        }
+        assert_eq!(t.take_output(), "a\u{fffd}\u{fffd} tail");
+    }
+
+    #[test]
+    fn unescapes_within_a_limit() {
+        let mut out = String::from("ab");
+        assert!(unescape_into(r"cé\n", &mut out, 2));
+        assert_eq!(out, "abc", "é doesn't fit in what is left");
+        let mut out = String::new();
+        assert!(unescape_into(r"\n😀", &mut out, 4));
+        assert_eq!(out, "\n");
+        let mut out = String::new();
+        assert!(!unescape_into(r"\n😀", &mut out, 5));
+        assert_eq!(out, "\n😀");
+    }
 }
