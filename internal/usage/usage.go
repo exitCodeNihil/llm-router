@@ -95,6 +95,9 @@ func NewPGWriter(pool *pgxpool.Pool) *PGWriter {
 const flushBatchSize = 1000
 
 func (w *PGWriter) Write(e Event) {
+	// Content is never stored; dropping it here keeps up to 65k queued events
+	// from holding on to request and response bodies.
+	e.Input, e.Output = nil, ""
 	for {
 		select {
 		case w.ch <- e:
