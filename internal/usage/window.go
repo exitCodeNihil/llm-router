@@ -55,7 +55,7 @@ func Sanitize(e *Event) int {
 	for _, f := range []struct {
 		s *string
 		n int
-	}{{&e.RequestID, 64}, {&e.ModelName, 256}, {&e.ErrorCode, 64}} {
+	}{{&e.RequestID, 64}, {&e.ModelName, 256}, {&e.ErrorCode, 64}, {&e.InferenceGeo, 32}, {&e.Speed, 32}} {
 		v := *f.s
 		if strings.ContainsRune(v, 0) || !utf8.ValidString(v) {
 			v = strings.ToValidUTF8(strings.ReplaceAll(v, "\x00", ""), "")
@@ -67,6 +67,18 @@ func Sanitize(e *Event) int {
 			*f.s = v
 			fixed++
 		}
+	}
+	if e.TraceID != "" && !ValidTraceID(e.TraceID) {
+		e.TraceID = ""
+		fixed++
+	}
+	if e.ParentSpanID != "" && !ValidSpanID(e.ParentSpanID) {
+		e.ParentSpanID = ""
+		fixed++
+	}
+	if e.CostBasis < 0 || e.CostBasis > math.MaxInt16 {
+		e.CostBasis = 0
+		fixed++
 	}
 	if e.RequestID == "" {
 		e.RequestID = "unknown"

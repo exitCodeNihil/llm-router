@@ -38,6 +38,19 @@ type Event struct {
 	StatusCode       int       `json:"status_code"`
 	Stream           bool      `json:"stream"`
 	GatewayID        string    `json:"gateway_id,omitempty"` // the gateway instance that served it; "" = the control plane
+	// GatewayGroupID is the instance's group, set by the control plane when a
+	// gateway syncs; "" = the control plane. Telemetry scopes use it; not stored.
+	GatewayGroupID string `json:"gateway_group_id,omitempty"`
+
+	// TraceID (32 hex) comes from the caller's traceparent or is new;
+	// ParentSpanID (16 hex) is the caller's span, not stored.
+	TraceID      string `json:"trace_id,omitempty"`
+	ParentSpanID string `json:"parent_span_id,omitempty"`
+	// InferenceGeo and Speed are what an Anthropic upstream reported. CostBasis
+	// is the pricing CostUSD was computed with (CostBasisCurrent); 0 = unknown.
+	InferenceGeo string `json:"inference_geo,omitempty"`
+	Speed        string `json:"speed,omitempty"`
+	CostBasis    int    `json:"cost_basis,omitempty"`
 
 	// Attempts is 1 when the first-choice deployment answered, higher after
 	// failover. ErrorCode is the gateway's own reason for a failure, which
@@ -65,7 +78,13 @@ type Event struct {
 	// enabled. Consumed by telemetry exporters; never written to Postgres.
 	Input  json.RawMessage `json:"input,omitempty"`
 	Output string          `json:"output,omitempty"`
+	System json.RawMessage `json:"system,omitempty"` // Anthropic's top-level system
+	// ContentTruncated is set when captured content was cut to the cap.
+	ContentTruncated bool `json:"content_truncated,omitempty"`
 }
+
+// CostBasisCurrent marks costs computed with 0.3.0's pricing.
+const CostBasisCurrent = 1
 
 type Writer interface {
 	Write(e Event) // must never block the request path
@@ -101,7 +120,7 @@ func (w *PGWriter) Capacity() int { return cap(w.ch) }
 func (w *PGWriter) Write(e Event) {
 	// Content is never stored; dropping it here keeps up to 65k queued events
 	// from holding on to request and response bodies.
-	e.Input, e.Output = nil, ""
+	e.Input, e.Output, e.System = nil, "", nil
 	for {
 		select {
 		case w.ch <- e:
@@ -287,14 +306,16 @@ func queueRow(b *pgx.Batch, e Event) {
 	b.Queue(`INSERT INTO usage_events
 		(ts, request_id, api_key_id, user_id, team_id, model_name, deployment_id, provider_id,
 		 prompt_tokens, completion_tokens, cached_tokens, cost_usd, unpriced, latency_ms, status_code, stream, gateway_id,
-		 attempts, error_code, ttft_ms, notional_cost_usd, cache_write_5m_tokens, cache_write_1h_tokens)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+		 attempts, error_code, ttft_ms, notional_cost_usd, cache_write_5m_tokens, cache_write_1h_tokens,
+		 trace_id, inference_geo, speed, cost_basis)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)`,
 		e.TS, e.RequestID, nilIfEmpty(e.APIKeyID), nilIfEmpty(e.UserID), nilIfEmpty(e.TeamID),
 		e.ModelName, nilIfEmpty(e.DeploymentID), nilIfEmpty(e.ProviderID),
 		e.PromptTokens, e.CompletionTokens, e.CachedTokens, e.CostUSD, e.Unpriced,
 		e.LatencyMS, e.StatusCode, e.Stream, nilIfEmpty(e.GatewayID),
 		zeroIfNil(e.Attempts), nilIfEmpty(e.ErrorCode), zeroIfNil(e.TTFTMs), zeroFloatIfNil(e.NotionalCostUSD),
-		e.CacheWrite5m, e.CacheWrite1h)
+		e.CacheWrite5m, e.CacheWrite1h,
+		nilIfEmpty(e.TraceID), nilIfEmpty(e.InferenceGeo), nilIfEmpty(e.Speed), zeroIfNil(e.CostBasis))
 }
 
 // writeCounters adds the events' spend: one upsert per (scope, day).
