@@ -283,32 +283,47 @@ pub fn allow_loopback_token_uri_for_tests() {
     LOOPBACK_TOKEN_URI.store(true, Ordering::Relaxed);
 }
 
-/// The token for a gcp_sa provider's key. Outlives config reloads, so a reload
-/// doesn't mint again; a re-pasted key is a new entry.
-pub fn service_account(provider: &str, json: &str) -> Arc<dyn Bearer> {
-    type Keys = HashMap<(String, [u8; 32]), Arc<dyn Bearer>>;
-    static KEYS: OnceLock<Mutex<Keys>> = OnceLock::new();
+/// Each gcp_sa provider's current key, by provider id: the SHA-256 of its JSON
+/// and its token.
+type StoredKeys = HashMap<String, ([u8; 32], Arc<dyn Bearer>)>;
+
+fn stored_keys() -> &'static Mutex<StoredKeys> {
+    static KEYS: OnceLock<Mutex<StoredKeys>> = OnceLock::new();
+    KEYS.get_or_init(Default::default)
+}
+
+fn sha256(b: &[u8]) -> [u8; 32] {
     let mut digest = [0u8; 32];
-    digest.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, json.as_bytes()).as_ref());
-    let mut keys = KEYS.get_or_init(Default::default).lock().unwrap();
-    keys.entry((provider.to_string(), digest))
-        .or_insert_with(|| {
-            let parsed = if json.trim().is_empty() {
-                Err("no service account JSON stored".to_string())
-            } else {
-                parse_with(json, false, LOOPBACK_TOKEN_URI.load(Ordering::Relaxed))
-            };
-            match parsed {
-                Ok(Creds::ServiceAccount(sa)) => Arc::new(RefreshingToken::new(Key(*sa))),
-                Ok(Creds::AuthorizedUser { .. }) => unreachable!("not allowed for a stored key"),
-                Err(e) => {
-                    let e = format!("provider {provider:?}: google credentials: {e}");
-                    eprintln!("{e}");
-                    Arc::new(Refused(e))
-                }
-            }
-        })
-        .clone()
+    digest.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, b).as_ref());
+    digest
+}
+
+/// The token for a gcp_sa provider's key. Outlives config reloads, so a reload
+/// doesn't mint again; a re-pasted key replaces the provider's old one.
+pub fn service_account(provider: &str, json: &str) -> Arc<dyn Bearer> {
+    let digest = sha256(json.as_bytes());
+    let mut keys = stored_keys().lock().unwrap();
+    if let Some((d, bearer)) = keys.get(provider)
+        && *d == digest
+    {
+        return bearer.clone();
+    }
+    let parsed = if json.trim().is_empty() {
+        Err("no service account JSON stored".to_string())
+    } else {
+        parse_with(json, false, LOOPBACK_TOKEN_URI.load(Ordering::Relaxed))
+    };
+    let bearer: Arc<dyn Bearer> = match parsed {
+        Ok(Creds::ServiceAccount(sa)) => Arc::new(RefreshingToken::new(Key(*sa))),
+        Ok(Creds::AuthorizedUser { .. }) => unreachable!("not allowed for a stored key"),
+        Err(e) => {
+            let e = format!("provider {provider:?}: google credentials: {e}");
+            eprintln!("{e}");
+            Arc::new(Refused(e))
+        }
+    };
+    keys.insert(provider.to_string(), (digest, bearer.clone()));
+    bearer
 }
 
 #[cfg(test)]
@@ -403,6 +418,17 @@ mod tests {
         let err = service_account("gcp", &key_json(PKCS8, "http://127.0.0.1:9/token")).bearer().await.unwrap_err();
         assert!(err.contains("https"), "{err}");
         assert!(service_account("gcp", "{").bearer().await.is_err());
+    }
+
+    #[test]
+    fn a_new_key_replaces_the_providers_old_one() {
+        let jsons = [key_json(PKCS8, TOKEN_URI), key_json(PKCS1, TOKEN_URI), "{".to_string()];
+        for json in &jsons {
+            service_account("replaced", json);
+        }
+        let keys = stored_keys().lock().unwrap();
+        let (digest, _) = &keys["replaced"];
+        assert_eq!(digest, &sha256(jsons[2].as_bytes()), "the last key is the one kept");
     }
 
     #[test]
