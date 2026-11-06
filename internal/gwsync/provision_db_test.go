@@ -1,0 +1,228 @@
+package gwsync
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	jose "github.com/go-jose/go-jose/v4"
+	"github.com/google/uuid"
+
+	"github.com/exitcodenihil/llm-router/internal/auth"
+	"github.com/exitcodenihil/llm-router/internal/limits"
+	"github.com/exitcodenihil/llm-router/internal/snapshot"
+	"github.com/exitcodenihil/llm-router/internal/store"
+)
+
+// testIssuer serves OIDC discovery and a JWKS with one RSA key, and signs
+// tokens with any key under that key's kid.
+type testIssuer struct {
+	srv *httptest.Server
+	key *rsa.PrivateKey
+}
+
+func newTestIssuer(t *testing.T) *testIssuer {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ti := &testIssuer{key: key}
+	mux := http.NewServeMux()
+	ti.srv = httptest.NewServer(mux)
+	t.Cleanup(ti.srv.Close)
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"issuer": ti.srv.URL, "jwks_uri": ti.srv.URL + "/jwks",
+			"id_token_signing_alg_values_supported": []string{"RS256"}})
+	})
+	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{
+			{Key: &key.PublicKey, KeyID: "k1", Algorithm: "RS256", Use: "sig"}}})
+	})
+	return ti
+}
+
+func (ti *testIssuer) sign(t *testing.T, key *rsa.PrivateKey, claims map[string]any) string {
+	t.Helper()
+	base := map[string]any{"iss": ti.srv.URL, "aud": "llmr", "exp": time.Now().Add(time.Hour).Unix(),
+		"iat": time.Now().Unix(), "tid": "tenant"}
+	for k, v := range claims {
+		base[k] = v
+	}
+	payload, _ := json.Marshal(base)
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: key},
+		(&jose.SignerOptions{}).WithHeader("kid", "k1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig, err := signer.Sign(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := sig.CompactSerialize()
+	return out
+}
+
+// TestProvisionAgainstPostgres: a gateway can create the user behind a valid
+// identity token, once, and nobody else; it needs LLMR_TEST_DATABASE_URL.
+func TestProvisionAgainstPostgres(t *testing.T) {
+	url := os.Getenv("LLMR_TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("LLMR_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := store.Open(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	idp := newTestIssuer(t)
+	groupID, teamA, teamB := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	for _, team := range []string{teamA, teamB} {
+		if _, err := st.Pool.Exec(ctx, `INSERT INTO teams (id, name) VALUES ($1,$2)`, team, "team-"+team); err != nil {
+			t.Fatal(err)
+		}
+	}
+	token := JoinTokenPrefix + "prov-" + groupID
+	hash := sha256.Sum256([]byte(token))
+	if _, err := st.Pool.Exec(ctx, `INSERT INTO gateway_groups (id, name, allowed_teams, join_token_hash) VALUES ($1,$2,$3,$4)`,
+		groupID, "prov-"+groupID, []string{teamA}, hash[:]); err != nil {
+		t.Fatal(err)
+	}
+	issuer := &snapshot.Issuer{ID: "i1", Type: "oidc", IssuerURL: idp.srv.URL, Audience: "llmr", EmailClaim: "email",
+		Match: map[string]string{"tid": "tenant"}, MapToTeam: teamA, AutoCreateUser: true}
+	holder := &snapshot.Holder{}
+	holder.Set(&snapshot.Snapshot{
+		Version:       1,
+		KeysByHash:    map[[32]byte]*snapshot.Key{},
+		UsersByID:     map[string]*snapshot.User{},
+		UsersByEmail:  map[string]*snapshot.User{},
+		TeamsByID:     map[string]*snapshot.Team{teamA: {ID: teamA}, teamB: {ID: teamB}},
+		Issuers:       []*snapshot.Issuer{issuer},
+		GatewayGroups: map[string]*snapshot.GatewayGroup{groupID: {ID: groupID, Name: "prov", AllowedTeams: map[string]bool{teamA: true}}},
+	})
+	s := &Server{Store: st, Snapshots: holder, Limits: limits.New(), Key: auth.DeriveKey("llmr-gw-session", "test")}
+	mux := http.NewServeMux()
+	s.Register(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	post := func(path, bearer string, body any) (int, []byte) {
+		b, _ := json.Marshal(body)
+		req, _ := http.NewRequest("POST", srv.URL+path, bytes.NewReader(b))
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		var out bytes.Buffer
+		out.ReadFrom(res.Body)
+		return res.StatusCode, out.Bytes()
+	}
+	code, body := post("/gw/v1/join", token, map[string]any{"name": "gw", "schema": 2})
+	if code != 200 {
+		t.Fatalf("join: %d %s", code, body)
+	}
+	var joined sessionResponse
+	json.Unmarshal(body, &joined)
+	version := func() (v int64) {
+		st.Pool.QueryRow(ctx, `SELECT (value::text)::bigint FROM settings WHERE key='config_version'`).Scan(&v)
+		return v
+	}
+	users := func(email string) (n int) {
+		st.Pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE email=$1`, email).Scan(&n)
+		return n
+	}
+	email := "new-" + groupID + "@example.com"
+
+	if code, _ := post("/gw/v1/provision", "not-a-session", map[string]string{"token": "x"}); code != 401 {
+		t.Fatalf("no session: %d", code)
+	}
+	// A gateway can't mint a user: a token it signed itself, under the
+	// issuer's name and kid, is refused, as is one for another audience.
+	forger, _ := rsa.GenerateKey(rand.Reader, 2048)
+	for name, tok := range map[string]string{
+		"forged":         idp.sign(t, forger, map[string]any{"email": email}),
+		"wrong audience": idp.sign(t, idp.key, map[string]any{"email": email, "aud": "other"}),
+		"wrong tenant":   idp.sign(t, idp.key, map[string]any{"email": email, "tid": "evil"}),
+		"expired":        idp.sign(t, idp.key, map[string]any{"email": email, "exp": time.Now().Add(-time.Minute).Unix()}),
+	} {
+		if code, body := post("/gw/v1/provision", joined.Session, map[string]string{"token": tok}); code != 403 {
+			t.Errorf("%s token: %d %s", name, code, body)
+		}
+	}
+	if users(email) != 0 {
+		t.Fatal("a refused token created a user")
+	}
+
+	before := version()
+	good := idp.sign(t, idp.key, map[string]any{"email": email})
+	var first ProvisionResponse
+	for i := range 2 { // the snapshot doesn't have the user yet the second time either
+		code, body := post("/gw/v1/provision", joined.Session, map[string]string{"token": good})
+		if code != 200 {
+			t.Fatalf("provision %d: %d %s", i, code, body)
+		}
+		var got ProvisionResponse
+		json.Unmarshal(body, &got)
+		if i == 0 {
+			first = got
+		} else if got.UserID != first.UserID {
+			t.Fatalf("second provision made another user: %s vs %s", got.UserID, first.UserID)
+		}
+	}
+	if users(email) != 1 {
+		t.Fatalf("users with %s = %d, want 1", email, users(email))
+	}
+	if len(first.TeamIDs) != 1 || first.TeamIDs[0] != teamA {
+		t.Fatalf("team ids = %v, want the issuer's team", first.TeamIDs)
+	}
+	if got := version(); got != before+1 {
+		t.Fatalf("config version %d -> %d: a new user must bump it once", before, got)
+	}
+
+	// A disabled account stays disabled.
+	st.Pool.Exec(ctx, `UPDATE users SET disabled=true WHERE id=$1`, first.UserID)
+	if code, body := post("/gw/v1/provision", joined.Session, map[string]string{"token": good}); code != 403 {
+		t.Fatalf("disabled user: %d %s", code, body)
+	}
+
+	// A group whose teams new users don't join can't create them.
+	issuer.MapToTeam = teamB
+	other := idp.sign(t, idp.key, map[string]any{"email": "b-" + email})
+	if code, body := post("/gw/v1/provision", joined.Session, map[string]string{"token": other}); code != 403 {
+		t.Fatalf("team B user from team A's group: %d %s", code, body)
+	}
+	if users("b-"+email) != 0 {
+		t.Fatal("a group created a user it doesn't serve")
+	}
+
+	// Provisioning is rate-limited per gateway.
+	limited := false
+	for range 2 * provisionPerMinute {
+		if code, _ := post("/gw/v1/provision", joined.Session, map[string]string{}); code == http.StatusTooManyRequests {
+			limited = true
+			break
+		}
+	}
+	if !limited {
+		t.Fatal("provisioning was never rate-limited")
+	}
+
+	st.Pool.Exec(ctx, `DELETE FROM users WHERE email=$1`, email)
+	st.Pool.Exec(ctx, `DELETE FROM gateway_groups WHERE id=$1`, groupID)
+	st.Pool.Exec(ctx, `DELETE FROM teams WHERE id = ANY($1)`, []string{teamA, teamB})
+}

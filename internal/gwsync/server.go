@@ -15,6 +15,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,9 +48,17 @@ type Server struct {
 	Export    usage.Writer    // exporters and live metrics; rows are written here directly
 	Nodes     *metrics.NodeStore
 	Key       []byte // session signing key
+	// Tokens verifies callers' identity tokens for /gw/v1/provision; nil
+	// makes one on first use.
+	Tokens *auth.CloudValidator
 
 	mu    sync.Mutex
 	cache map[string]*encoded // by group id
+
+	tokensOnce sync.Once
+	provMu     sync.Mutex
+	provMinute int64
+	provCount  map[string]int // by instance, this minute
 }
 
 // encoded is one group's config at one snapshot version, gzipped once for
@@ -65,6 +74,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.Handle("POST /gw/v1/renew", s.session(s.renew))
 	mux.Handle("GET /gw/v1/config", s.session(s.config))
 	mux.Handle("POST /gw/v1/sync", s.session(s.sync))
+	mux.Handle("POST /gw/v1/provision", s.session(s.provision))
 }
 
 // peer is the gateway a session belongs to, and the wire schema it speaks.
@@ -310,7 +320,8 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request, p peer) {
 	now := time.Now()
 	for _, se := range req.Events {
 		e := se.Event
-		if g.AllowedTeams != nil && enc.keys[e.APIKeyID] == nil && !g.AllowedTeams[e.TeamID] {
+		if g.AllowedTeams != nil && enc.keys[e.APIKeyID] == nil && !g.AllowedTeams[e.TeamID] &&
+			!memberOfAllowed(snap, g, e.UserID) {
 			dropped++
 			continue
 		}
@@ -363,6 +374,106 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request, p peer) {
 			CPUPct: req.Stats.CPUPct, MemPct: req.Stats.MemPct})
 	}
 	writeJSON(w, http.StatusOK, s.Limits.Export(snap, req.Cursor))
+}
+
+// provisionPerMinute caps provisioning per gateway instance. It's a first
+// sign-in path, so a gateway asking for more is broken or compromised.
+const provisionPerMinute = 30
+
+// ProvisionResponse is the user a provisioned identity token resolves to.
+type ProvisionResponse struct {
+	UserID  string   `json:"user_id"`
+	TeamIDs []string `json:"team_ids"`
+}
+
+// provision creates the user behind a caller's identity token on first use,
+// for an issuer with auto-create on. The gateway has verified the token
+// already; the control plane verifies it again, so a gateway can only create
+// users it holds a valid token for, never mint one. The new user reaches
+// gateways with the next config version.
+func (s *Server) provision(w http.ResponseWriter, r *http.Request, p peer) {
+	if !s.allowProvision(p.instance) {
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "too many provisioning requests from this gateway", http.StatusTooManyRequests)
+		return
+	}
+	snap := s.Snapshots.Get()
+	if snap == nil {
+		http.Error(w, "control plane starting", http.StatusServiceUnavailable)
+		return
+	}
+	g := snap.GatewayGroups[p.group]
+	if g == nil {
+		http.Error(w, "gateway group removed", http.StatusUnauthorized)
+		return
+	}
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil || req.Token == "" {
+		http.Error(w, "invalid provision request", http.StatusBadRequest)
+		return
+	}
+	s.tokensOnce.Do(func() {
+		if s.Tokens == nil {
+			s.Tokens = auth.NewCloudValidator(s.Store.Pool)
+		}
+	})
+	vt, err := s.Tokens.Verify(r.Context(), snap, req.Token)
+	if err != nil {
+		slog.Warn("gateway sent an identity token that does not verify", "instance", p.instance, "err", err)
+		http.Error(w, "invalid identity token: "+err.Error(), http.StatusForbidden)
+		return
+	}
+	if u := snap.UsersByEmail[vt.Email]; u != nil {
+		if !servesUser(g, u) {
+			http.Error(w, "this gateway group does not serve "+vt.Email, http.StatusForbidden)
+			return
+		}
+		writeJSON(w, http.StatusOK, ProvisionResponse{UserID: u.ID, TeamIDs: sortedOrEmpty(u.TeamIDs)})
+		return
+	}
+	if !vt.Issuer.AutoCreateUser {
+		http.Error(w, "no gateway user for "+vt.Email, http.StatusForbidden)
+		return
+	}
+	if g.AllowedTeams != nil && !g.AllowedTeams[vt.Issuer.MapToTeam] {
+		http.Error(w, "this gateway group does not serve the team new users join", http.StatusForbidden)
+		return
+	}
+	u, err := s.Tokens.ProvisionUser(r.Context(), vt.Email, vt.Issuer.MapToTeam)
+	if errors.Is(err, auth.ErrUserDisabled) {
+		http.Error(w, vt.Email+" is disabled", http.StatusForbidden)
+		return
+	}
+	if err != nil {
+		slog.Error("gateway provisioning failed", "instance", p.instance, "err", err)
+		http.Error(w, "provisioning failed", http.StatusInternalServerError)
+		return
+	}
+	// An existing account the snapshot doesn't have yet keeps its own
+	// memberships, which may not be this group's.
+	if !servesUser(g, u) {
+		http.Error(w, "this gateway group does not serve "+vt.Email, http.StatusForbidden)
+		return
+	}
+	writeJSON(w, http.StatusOK, ProvisionResponse{UserID: u.ID, TeamIDs: sortedOrEmpty(u.TeamIDs)})
+}
+
+func (s *Server) allowProvision(instance string) bool {
+	s.provMu.Lock()
+	defer s.provMu.Unlock()
+	if m := time.Now().Unix() / 60; m != s.provMinute || s.provCount == nil {
+		s.provMinute, s.provCount = m, map[string]int{}
+	}
+	s.provCount[instance]++
+	return s.provCount[instance] <= provisionPerMinute
+}
+
+func sortedOrEmpty(ids []string) []string {
+	out := append([]string{}, ids...)
+	slices.Sort(out)
+	return out
 }
 
 // record writes a new batch's events and moves the instance's batch number on,
