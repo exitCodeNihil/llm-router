@@ -10,6 +10,7 @@ pub mod dns;
 pub mod health;
 pub mod limits;
 pub mod metrics;
+pub mod resources;
 pub mod server;
 pub mod translate;
 pub mod upstream;

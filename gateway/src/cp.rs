@@ -4,7 +4,7 @@
 
 use std::io::{Read, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -44,6 +44,7 @@ pub struct ControlPlane {
     sync_interval_ms: AtomicU64,
     join_lock: tokio::sync::Mutex<()>,
     started: Instant,
+    leaving: AtomicBool,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +81,7 @@ impl ControlPlane {
             sync_interval_ms: AtomicU64::new(2000),
             join_lock: tokio::sync::Mutex::new(()),
             started: Instant::now(),
+            leaving: AtomicBool::new(false),
         }
     }
 
@@ -271,6 +273,7 @@ impl ControlPlane {
 
     /// Upload until the queue is empty or `deadline` passes, for shutdown.
     pub async fn flush(&self, deadline: Instant) {
+        self.leaving.store(true, Ordering::Relaxed);
         let mut syncer = Syncer::default();
         while Instant::now() < deadline {
             if self.sync_once(&mut syncer).await && usage::queued() == 0 && syncer.pending.is_none() {
@@ -287,11 +290,17 @@ impl ControlPlane {
             let (rates, scopes) = limits::freeze();
             s.batch += 1;
             let (batch, cursor) = (s.batch, s.cursor.clone());
+            let mem = crate::resources::memory();
             let stats = Stats {
                 version: VERSION,
                 uptime_s: self.started.elapsed().as_secs(),
                 in_flight: metrics::IN_FLIGHT.load(Ordering::Relaxed),
                 workers: metrics::WORKERS.load(Ordering::Relaxed),
+                open_connections: metrics::OPEN_CONNECTIONS.load(Ordering::Relaxed),
+                mem_bytes: mem.used,
+                mem_limit_bytes: mem.limit,
+                cpu_pct: crate::resources::cpu_pct(),
+                leaving: self.leaving.load(Ordering::Relaxed),
             };
             // Encoding a large batch takes milliseconds: keep it off the request
             // threads. JSON first, then one gzip pass; serde's many small writes
@@ -448,6 +457,14 @@ struct Stats {
     uptime_s: u64,
     in_flight: i64,
     workers: i64,
+    open_connections: i64,
+    mem_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mem_limit_bytes: Option<u64>,
+    cpu_pct: f64,
+    /// Shutting down: these are its last syncs, so the control plane can
+    /// forget it at once instead of reporting it as missing.
+    leaving: bool,
 }
 
 fn load(headers: &http::HeaderMap, bytes: &[u8]) -> Result<Config, String> {

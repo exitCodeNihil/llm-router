@@ -76,7 +76,9 @@ fn main() {
                     let Ok((stream, _)) = accepted else { continue };
                     let _ = stream.set_nodelay(true);
                     let builder = builder.clone();
+                    let conn = metrics::Connection::open();
                     tokio::spawn(async move {
+                        let _conn = conn;
                         let svc = service_fn(move |req| server::handle(st, req));
                         let _ = builder.serve_connection(TokioIo::new(stream), svc).await;
                     });

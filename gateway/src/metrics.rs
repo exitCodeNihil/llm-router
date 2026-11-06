@@ -10,6 +10,25 @@ pub static SYNC_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub static SYNC_REFUSED_EVENTS: AtomicU64 = AtomicU64::new(0);
 pub static CONFIG_VERSION: AtomicI64 = AtomicI64::new(0);
 pub static WORKERS: AtomicI64 = AtomicI64::new(0);
+pub static OPEN_CONNECTIONS: AtomicI64 = AtomicI64::new(0);
+pub static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// An accepted client connection, counted while it is open.
+pub struct Connection(());
+
+impl Connection {
+    pub fn open() -> Connection {
+        CONNECTIONS.fetch_add(1, Relaxed);
+        OPEN_CONNECTIONS.fetch_add(1, Relaxed);
+        Connection(())
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        OPEN_CONNECTIONS.fetch_sub(1, Relaxed);
+    }
+}
 
 /// Routes the request counter is split by.
 #[derive(Clone, Copy)]
@@ -79,6 +98,17 @@ pub fn render(ready: bool, usage_queued: usize, usage_capacity: usize, usage_dro
     gauge("llmr_workers", "Worker threads", WORKERS.load(Relaxed));
     gauge("llmr_usage_queued", "Usage events waiting for the next sync", usage_queued as i64);
     gauge("llmr_usage_queue_capacity", "Usage events the queue holds memory for", usage_capacity as i64);
+    gauge("llmr_open_connections", "Client connections open", OPEN_CONNECTIONS.load(Relaxed));
+    let mem = crate::resources::memory();
+    gauge("llmr_memory_bytes", "Memory in use: the cgroup's working set, or the process's RSS", mem.used as i64);
+    if let Some(limit) = mem.limit {
+        gauge("llmr_memory_limit_bytes", "The cgroup's memory limit (absent: no limit)", limit as i64);
+    }
+    let _ = writeln!(
+        s,
+        "# HELP llmr_build_info The gateway's version\n# TYPE llmr_build_info gauge\nllmr_build_info{{runtime=\"gateway\",version=\"{}\"}} 1",
+        crate::cp::VERSION.replace(['\\', '"', '\n'], "_")
+    );
 
     let _ = writeln!(s, "# HELP llmr_requests_total Requests served\n# TYPE llmr_requests_total counter");
     for (r, route) in ROUTES.iter().enumerate() {
@@ -106,6 +136,7 @@ pub fn render(ready: bool, usage_queued: usize, usage_capacity: usize, usage_dro
     let mut counter = |name: &str, help: &str, v: u64| {
         let _ = writeln!(s, "# HELP {name} {help}\n# TYPE {name} counter\n{name} {v}");
     };
+    counter("llmr_connections_total", "Client connections accepted", CONNECTIONS.load(Relaxed));
     counter("llmr_shed_total", "Requests refused because too many were in flight", SHED.load(Relaxed));
     counter("llmr_sync_failures_total", "Failed syncs with the control plane", SYNC_FAILURES.load(Relaxed));
     counter(
@@ -129,4 +160,22 @@ pub fn render(ready: bool, usage_queued: usize, usage_capacity: usize, usage_dro
     let _ = writeln!(s, "llmr_request_duration_seconds_sum {}", LATENCY_SUM_MS.load(Relaxed) as f64 / 1000.0);
     let _ = writeln!(s, "llmr_request_duration_seconds_count {cum}");
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_connections_and_memory() {
+        let before = OPEN_CONNECTIONS.load(Relaxed);
+        let c = Connection::open();
+        let out = render(true, 0, 0, 0);
+        assert!(out.contains("# TYPE llmr_open_connections gauge\nllmr_open_connections "));
+        assert!(out.contains("# TYPE llmr_connections_total counter\nllmr_connections_total "));
+        assert!(out.contains("# TYPE llmr_memory_bytes gauge\nllmr_memory_bytes "));
+        assert!(out.contains("llmr_build_info{runtime=\"gateway\",version=\""));
+        assert!(OPEN_CONNECTIONS.load(Relaxed) > before);
+        drop(c);
+    }
 }
