@@ -120,23 +120,32 @@ func (c *Client) post(ctx context.Context, body []byte, gz bool) error {
 		logPartial(c.URL, resp.Header.Get("Content-Type"), data)
 		return nil
 	case s >= 300 && s < 400:
-		return &telemetry.ExportError{Status: s, Msg: "redirects are not followed (Location: " + resp.Header.Get("Location") + "): set the final URL"}
-	case s == 408 || s == 429 || s >= 500:
+		// Not the Location: it may carry a token, and it lands in last_error.
+		return &telemetry.ExportError{Status: s, Msg: "redirects are not followed: set the final URL"}
+	case s == 429 || s == 502 || s == 503 || s == 504:
+		// The statuses OTLP/HTTP says to retry; any other is final.
 		return &telemetry.ExportError{Retryable: true, Status: s, RetryAfter: retryAfter(resp.Header.Get("Retry-After")), Msg: snippet(data)}
 	default:
 		return &telemetry.ExportError{Status: s, Msg: snippet(data)}
 	}
 }
 
+// maxRetryAfter bounds a backend's Retry-After.
+const maxRetryAfter = 5 * time.Minute
+
 func retryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
 	if v == "" {
 		return 0
 	}
-	if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
-		return time.Duration(n) * time.Second
+	if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+		// Compared before multiplying: a huge value would overflow.
+		return time.Duration(min(n, uint64(maxRetryAfter/time.Second))) * time.Second
+	} else if errors.Is(err, strconv.ErrRange) {
+		return maxRetryAfter
 	}
 	if t, err := http.ParseTime(v); err == nil {
-		return max(time.Until(t), 0)
+		return min(max(time.Until(t), 0), maxRetryAfter)
 	}
 	return 0
 }

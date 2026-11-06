@@ -119,10 +119,15 @@ func TestClientClassifiesFailures(t *testing.T) {
 		retryable  bool
 		wait       time.Duration
 	}{
-		{408, "", true, 0},
+		// OTLP/HTTP: 429, 502, 503 and 504 are retried; nothing else is.
 		{429, "7", true, 7 * time.Second},
+		{502, "", true, 0},
 		{503, "", true, 0},
-		{500, "", true, 0},
+		{504, "", true, 0},
+		{500, "", false, 0},
+		{501, "", false, 0},
+		{408, "", false, 0},
+		{400, "", false, 0},
 		{401, "", false, 0},
 		{404, "", false, 0},
 		{413, "", false, 0},
@@ -201,5 +206,39 @@ func TestErrorsRedactTheQuery(t *testing.T) {
 	}
 	if r := Redact("https://u:p@x.example.com/p?token=1#f"); r != "https://x.example.com/p?redacted" {
 		t.Errorf("redact %s", r)
+	}
+}
+
+// Retry-After is capped, and a huge value doesn't overflow into a negative
+// or tiny wait.
+func TestRetryAfterBounds(t *testing.T) {
+	for v, want := range map[string]time.Duration{
+		"":                              0,
+		"0":                             0,
+		"30":                            30 * time.Second,
+		"300":                           5 * time.Minute,
+		"301":                           5 * time.Minute,
+		"9223372036":                    5 * time.Minute,
+		"99999999999999999999999":       5 * time.Minute,
+		"-5":                            0,
+		"soon":                          0,
+		"Fri, 31 Dec 9999 23:59:59 GMT": 5 * time.Minute,
+		"Thu, 01 Jan 1970 00:00:00 GMT": 0,
+	} {
+		if got := retryAfter(v); got != want {
+			t.Errorf("Retry-After %q: %v, want %v", v, got, want)
+		}
+	}
+}
+
+// A redirect's Location may carry a token: it isn't repeated in the error.
+func TestRedirectErrorOmitsLocation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://elsewhere.example.com/v1/traces?sig=s3cret", http.StatusFound)
+	}))
+	defer srv.Close()
+	err := NewClient(srv.URL, nil).Send(context.Background(), payload())
+	if err == nil || strings.Contains(err.Error(), "s3cret") || strings.Contains(err.Error(), "elsewhere") {
+		t.Fatalf("err %v", err)
 	}
 }
