@@ -32,7 +32,12 @@ serviceAccount:
 anthropicIdentity:
   enabled: false
   audience: https://api.anthropic.com
-  expirationSeconds: 600   # 600 to 3600
+  expirationSeconds: 600   # 600 to 3600, for the token file
+  # file: the kubelet's token file. kubernetes: ask the API server for a new token
+  # for each exchange, so a restarted container recovers at once and several rules
+  # can share a pod; the file stays as the fallback. Grants the pods create on
+  # their own serviceaccounts/token.
+  source: file
 
 # Rust gateways (docs/deploy.md#gateways). Create a group on the console's Gateways page
 # and pass its join token here or in existingSecret (key: join-token).
