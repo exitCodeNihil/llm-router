@@ -27,8 +27,11 @@ pub const VERSION: &str = match option_env!("LLMR_VERSION") {
 
 /// The most events one sync uploads, and about the most bytes before gzip; a
 /// backlog goes out in back-to-back syncs. The control plane reads at most
-/// 32 MiB of a sync, so the byte cap keeps a batch at half that. A proxy that
-/// refuses a batch as too large (413) halves the cap, down to MIN_BATCH_BYTES.
+/// 32 MiB of a sync, so the byte cap keeps a batch at half that. Event sizes
+/// count captured content, escapes included, and one event holds under 10 MiB
+/// of it (three parts of at most 1 MiB, the output up to 6x once escaped), so
+/// even a batch of one fits. A proxy that refuses a batch as too large (413) halves the cap, down
+/// to MIN_BATCH_BYTES.
 const MAX_BATCH: usize = 50_000;
 const MAX_BATCH_BYTES: usize = 16 << 20;
 const MIN_BATCH_BYTES: usize = 64 << 10;

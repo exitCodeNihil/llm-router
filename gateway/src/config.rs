@@ -42,6 +42,9 @@ pub struct Wire {
     /// Hex SHA-256 of a lowercased email → user id (schema 2).
     #[serde(default)]
     pub emails: HashMap<String, String>,
+    /// The capture policy and this group's content scopes (schema 2).
+    #[serde(default)]
+    pub telemetry: Option<crate::telemetry::WireTelemetry>,
 }
 
 /// An identity-token issuer (gwsync.Issuer).
@@ -85,6 +88,8 @@ pub struct WireKey {
     pub tpm_limit: Option<i64>,
     #[serde(default)]
     pub expires_at: i64,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +104,8 @@ pub struct WireUser {
     pub tpm_limit: Option<i64>,
     #[serde(default)]
     pub team_ids: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +115,8 @@ pub struct WireTeam {
     pub budget_usd: Option<f64>,
     pub rpm_limit: Option<i64>,
     pub tpm_limit: Option<i64>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,6 +188,8 @@ pub struct Team {
     pub id: String,
     pub allowed_models: Policy,
     pub scope: Option<Arc<Scope>>,
+    /// For the telemetry policy's tag rules, as are a user's and a key's.
+    pub tags: Vec<String>,
 }
 
 pub struct User {
@@ -189,6 +200,7 @@ pub struct User {
     pub memberships: HashMap<String, Arc<Scope>>,
     pub scope: Option<Arc<Scope>>,
     pub team_ids: Vec<String>,
+    pub tags: Vec<String>,
 }
 
 pub struct Key {
@@ -200,6 +212,7 @@ pub struct Key {
     pub allowed_models: Policy,
     pub expires_at: i64,
     pub scope: Option<Arc<Scope>>,
+    pub tags: Vec<String>,
 }
 
 impl Key {
@@ -340,6 +353,8 @@ pub struct Config {
     pub issuers: Vec<Issuer>,
     /// SHA-256 of a lowercased email → the user, for identity-token callers.
     pub emails: HashMap<[u8; 32], Arc<User>>,
+    pub telemetry: crate::telemetry::Policy,
+    pub data_rule: crate::telemetry::DataRule,
 }
 
 /// What a requested model name resolves to.
@@ -360,7 +375,10 @@ impl Config {
             .into_iter()
             .map(|t| {
                 let scope = limits::scope(format!("team:{}", t.id), t.budget_usd, t.rpm_limit, t.tpm_limit);
-                (t.id.clone(), Arc::new(Team { id: t.id, allowed_models: policy(t.allowed_models), scope }))
+                (
+                    t.id.clone(),
+                    Arc::new(Team { id: t.id, allowed_models: policy(t.allowed_models), scope, tags: t.tags }),
+                )
             })
             .collect();
         let users: HashMap<String, Arc<User>> = w
@@ -383,6 +401,7 @@ impl Config {
                     memberships,
                     scope,
                     team_ids: u.team_ids,
+                    tags: u.tags,
                 };
                 (u.id, Arc::new(user))
             })
@@ -405,6 +424,7 @@ impl Config {
                 allowed_models: policy(k.allowed_models),
                 expires_at: k.expires_at,
                 scope,
+                tags: k.tags,
             };
             keys.insert(hash, Arc::new(key));
         }
@@ -454,6 +474,8 @@ impl Config {
         names.sort();
         Ok(Config {
             version: w.version,
+            data_rule: crate::telemetry::DataRule::parse(&w.group.data_rule),
+            telemetry: crate::telemetry::Policy::from_wire(w.telemetry),
             group: w.group,
             keys,
             models,

@@ -159,6 +159,7 @@ impl Identities {
             allowed_models: None,
             expires_at: 0,
             scope: None,
+            tags: Vec::new(),
         });
         let until_ms = ((v.exp * 1000.0) as i64).min(now + CACHE_MS);
         let mut tokens = lock(&self.tokens);
@@ -435,6 +436,7 @@ fn provisional_user(cfg: &Config, p: &Provisioned) -> Arc<User> {
         memberships: HashMap::new(),
         scope: None,
         team_ids: p.team_ids.clone(),
+        tags: Vec::new(),
     })
 }
 

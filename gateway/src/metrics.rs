@@ -98,6 +98,11 @@ pub fn render(ready: bool, usage_queued: usize, usage_capacity: usize, usage_dro
     gauge("llmr_workers", "Worker threads", WORKERS.load(Relaxed));
     gauge("llmr_usage_queued", "Usage events waiting for the next sync", usage_queued as i64);
     gauge("llmr_usage_queue_capacity", "Usage events the queue holds memory for", usage_capacity as i64);
+    gauge(
+        "llmr_usage_queued_content_bytes",
+        "Captured telemetry content the queued usage events hold",
+        crate::usage::queued_content() as i64,
+    );
     gauge("llmr_open_connections", "Client connections open", OPEN_CONNECTIONS.load(Relaxed));
     let mem = crate::resources::memory();
     gauge("llmr_memory_bytes", "Memory in use: the cgroup's working set, or the process's RSS", mem.used as i64);
@@ -145,6 +150,11 @@ pub fn render(ready: bool, usage_queued: usize, usage_capacity: usize, usage_dro
         SYNC_REFUSED_EVENTS.load(Relaxed),
     );
     counter("llmr_usage_dropped_total", "Usage events dropped because the queue was full", usage_dropped);
+    counter(
+        "llmr_usage_content_stripped_total",
+        "Usage events sent without their captured content because the queue's content budget was spent",
+        crate::usage::CONTENT_STRIPPED.load(Relaxed),
+    );
 
     let _ = writeln!(
         s,

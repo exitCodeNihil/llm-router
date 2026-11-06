@@ -33,6 +33,9 @@ pub struct Usage {
     /// Request options that raise every rate.
     pub us_inference: bool,
     pub fast: bool,
+    /// inference_geo and speed as an Anthropic upstream reported them.
+    pub geo: Tag,
+    pub speed: Tag,
 }
 
 impl Usage {
@@ -46,6 +49,104 @@ impl Usage {
         }
         self.us_inference |= n.us_inference;
         self.fast |= n.fast;
+        if !n.geo.is_empty() {
+            self.geo = n.geo;
+        }
+        if !n.speed.is_empty() {
+            self.speed = n.speed;
+        }
+    }
+}
+
+/// A short string an upstream reports, such as inference_geo, kept inline so
+/// [`Usage`] stays `Copy` and reading it allocates nothing. Longer values are
+/// cut at 31 bytes.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tag {
+    len: u8,
+    buf: [u8; 31],
+}
+
+impl Tag {
+    pub fn new(s: &str) -> Tag {
+        let mut n = s.len().min(31);
+        while !s.is_char_boundary(n) {
+            n -= 1;
+        }
+        let mut t = Tag { len: n as u8, buf: [0; 31] };
+        t.buf[..n].copy_from_slice(&s.as_bytes()[..n]);
+        t
+    }
+
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.buf[..self.len as usize]).unwrap_or_default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl std::fmt::Debug for Tag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
+
+impl serde::Serialize for Tag {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Tag {
+    /// A string, or null for none.
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl de::Visitor<'_> for V {
+            type Value = Tag;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Tag, E> {
+                Ok(Tag::new(v))
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Tag, E> {
+                Ok(Tag::default())
+            }
+            fn visit_none<E: de::Error>(self) -> Result<Tag, E> {
+                Ok(Tag::default())
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// Response text kept for telemetry: whole deltas while fewer than `cap`
+/// bytes are kept (Go: output.Len() < capture), cut to the cap when the
+/// event is sent. A cap of 0 keeps nothing and costs nothing.
+#[derive(Default)]
+pub struct Capture {
+    cap: usize,
+    text: String,
+}
+
+impl Capture {
+    pub fn new(cap: usize) -> Capture {
+        Capture { cap, text: String::new() }
+    }
+
+    #[inline]
+    fn wants(&self) -> bool {
+        self.text.len() < self.cap
+    }
+
+    fn push(&mut self, s: JStr) {
+        self.text.push_str(&s.value());
+    }
+
+    fn take(&mut self) -> String {
+        std::mem::take(&mut self.text)
     }
 }
 
@@ -513,6 +614,24 @@ pub fn anth_json_usage(body: &[u8]) -> Usage {
     }
 }
 
+/// The assistant text of an OpenAI chat-completion JSON, for telemetry (Go:
+/// copyJSON, writeAnthResponse).
+pub fn oai_json_text(body: &[u8]) -> String {
+    match parse::<OaiResponse>(body) {
+        Ok(r) => r.choices.first().map(|c| c.message.content.value().into_owned()).unwrap_or_default(),
+        Err(_) => String::new(),
+    }
+}
+
+/// The text blocks of an Anthropic message JSON, joined, for telemetry (Go:
+/// passthroughAnthJSON, anthRespToOAI).
+pub fn anth_json_text(body: &[u8]) -> String {
+    match parse::<AnthResponse>(body) {
+        Ok(r) => r.content.iter().filter(|b| b.typ.is("text")).map(|b| b.text.value()).collect(),
+        Err(_) => String::new(),
+    }
+}
+
 /// A streaming converter, fed one event at a time.
 pub trait SseTransform: Send {
     /// One upstream event (lines joined by "\n", no trailing blank line).
@@ -521,6 +640,10 @@ pub trait SseTransform: Send {
     fn finish(&mut self, out: &mut Vec<u8>);
     /// Usage seen so far.
     fn usage(&self) -> Usage;
+    /// The response text captured for telemetry; empty unless asked for.
+    fn take_output(&mut self) -> String {
+        String::new()
+    }
 }
 
 /// OpenAI SSE passthrough that reads usage (Go: streamSSE). With
@@ -529,11 +652,18 @@ pub trait SseTransform: Send {
 pub struct OaiPassthrough {
     drop_usage_chunk: bool,
     usage: Usage,
+    capture: Capture,
 }
 
 impl OaiPassthrough {
     pub fn new(drop_usage_chunk: bool) -> Self {
-        Self { drop_usage_chunk, usage: Usage::default() }
+        Self { drop_usage_chunk, usage: Usage::default(), capture: Capture::default() }
+    }
+
+    /// Keep up to `cap` bytes of the response text for telemetry.
+    pub fn capturing(mut self, cap: usize) -> Self {
+        self.capture = Capture::new(cap);
+        self
     }
 }
 
@@ -541,6 +671,15 @@ impl SseTransform for OaiPassthrough {
     fn event(&mut self, ev: &[u8], out: &mut Vec<u8>) {
         let start = out.len();
         for line in lines(ev) {
+            if self.capture.wants()
+                && let Some(data) = line.strip_prefix(b"data: ")
+                && data != b"[DONE]"
+                && memmem::find(data, br#""content""#).is_some()
+                && let Ok(chunk) = parse::<DeltaChunk>(data)
+                && let Some(c) = chunk.choices.first()
+            {
+                self.capture.push(c.delta.content);
+            }
             if let Some(data) = line.strip_prefix(b"data: ")
                 && data != b"[DONE]"
                 && memmem::find(data, br#""usage""#).is_some()
@@ -563,16 +702,26 @@ impl SseTransform for OaiPassthrough {
     fn usage(&self) -> Usage {
         self.usage
     }
+    fn take_output(&mut self) -> String {
+        self.capture.take()
+    }
 }
 
 /// Anthropic SSE passthrough that reads usage (Go: streamAnthPassthrough).
 pub struct AnthPassthrough {
     usage: Usage,
+    capture: Capture,
 }
 
 impl AnthPassthrough {
     pub fn new() -> Self {
-        Self { usage: Usage::default() }
+        Self { usage: Usage::default(), capture: Capture::default() }
+    }
+
+    /// Keep up to `cap` bytes of the response text for telemetry.
+    pub fn capturing(mut self, cap: usize) -> Self {
+        self.capture = Capture::new(cap);
+        self
     }
 }
 
@@ -608,6 +757,13 @@ impl SseTransform for AnthPassthrough {
                     }
                 }
             }
+            if self.capture.wants()
+                && let Some(data) = line.strip_prefix(b"data: ")
+                && memmem::find(data, br#""text_delta""#).is_some()
+                && let Ok(bd) = parse::<DeltaChoice>(data)
+            {
+                self.capture.push(bd.delta.text);
+            }
             out.extend_from_slice(line);
             out.push(b'\n');
         }
@@ -618,6 +774,9 @@ impl SseTransform for AnthPassthrough {
     fn finish(&mut self, _out: &mut Vec<u8>) {}
     fn usage(&self) -> Usage {
         self.usage
+    }
+    fn take_output(&mut self) -> String {
+        self.capture.take()
     }
 }
 
@@ -632,6 +791,7 @@ pub struct OaiToAnthStream {
     tools: Vec<(i64, i64)>,
     stop_reason: &'static str,
     usage: Usage,
+    capture: Capture,
 }
 
 impl OaiToAnthStream {
@@ -651,7 +811,14 @@ impl OaiToAnthStream {
             tools: Vec::new(),
             stop_reason: "end_turn",
             usage: Usage::default(),
+            capture: Capture::default(),
         }
+    }
+
+    /// Keep up to `cap` bytes of the response text for telemetry.
+    pub fn capturing(mut self, cap: usize) -> Self {
+        self.capture = Capture::new(cap);
+        self
     }
 
     fn started(&mut self, out: &mut Vec<u8>) {
@@ -693,6 +860,9 @@ impl OaiToAnthStream {
             self.stop_reason = anth_stop_reason(c.finish_reason);
         }
         if !c.delta.content.is_empty() {
+            if self.capture.wants() {
+                self.capture.push(c.delta.content);
+            }
             if !self.in_text {
                 self.block_start(out);
                 put(out, r#"{"type":"text","text":""}}"#);
@@ -762,6 +932,9 @@ impl SseTransform for OaiToAnthStream {
     fn usage(&self) -> Usage {
         self.usage
     }
+    fn take_output(&mut self) -> String {
+        self.capture.take()
+    }
 }
 
 /// Anthropic SSE upstream -> OpenAI SSE client (Go: anthStreamToOAI).
@@ -776,6 +949,7 @@ pub struct AnthToOaiStream {
     /// Anthropic block index -> OpenAI tool_calls index.
     tools: Vec<(i64, i64)>,
     usage: Usage,
+    capture: Capture,
 }
 
 #[derive(Clone, Copy)]
@@ -804,7 +978,14 @@ impl AnthToOaiStream {
             tool_index: -1,
             tools: Vec::new(),
             usage: Usage::default(),
+            capture: Capture::default(),
         }
+    }
+
+    /// Keep up to `cap` bytes of the response text for telemetry.
+    pub fn capturing(mut self, cap: usize) -> Self {
+        self.capture = Capture::new(cap);
+        self
     }
 
     /// Writes a chunk's opening; the caller writes the delta, then `chunk_end`.
@@ -859,6 +1040,9 @@ impl AnthToOaiStream {
                     return;
                 };
                 if bd.delta.typ.is("text_delta") {
+                    if self.capture.wants() {
+                        self.capture.push(bd.delta.text);
+                    }
                     self.chunk(out);
                     put(out, r#"{"content":"#);
                     put(out, bd.delta.text.raw());
@@ -923,6 +1107,9 @@ impl SseTransform for AnthToOaiStream {
     }
     fn usage(&self) -> Usage {
         self.usage
+    }
+    fn take_output(&mut self) -> String {
+        self.capture.take()
     }
 }
 
@@ -1203,9 +1390,9 @@ struct AnthUsage {
     #[serde(default)]
     cache_creation: Option<CacheCreation>,
     #[serde(default)]
-    inference_geo: Option<String>,
+    inference_geo: Tag,
     #[serde(default)]
-    speed: Option<String>,
+    speed: Tag,
 }
 
 #[derive(Deserialize, Default)]
@@ -1229,8 +1416,10 @@ impl AnthUsage {
             cached: self.cache_read_input_tokens,
             write_5m: self.cache_creation_input_tokens.wrapping_sub(write_1h),
             write_1h,
-            us_inference: self.inference_geo.as_deref() == Some("us"),
-            fast: self.speed.as_deref() == Some("fast"),
+            us_inference: self.inference_geo.as_str() == "us",
+            fast: self.speed.as_str() == "fast",
+            geo: self.inference_geo,
+            speed: self.speed,
         }
     }
 }
@@ -1513,6 +1702,28 @@ struct OaiToolDelta<'a> {
     id: JStr<'a>,
     #[serde(default, borrow, deserialize_with = "nul")]
     function: OaiFunction<'a>,
+}
+
+/// The text of a streamed delta, as the Go gateway captures it: an OpenAI
+/// chunk's choices[].delta.content, an Anthropic text_delta's delta.text.
+#[derive(Deserialize, Default)]
+struct DeltaChunk<'a> {
+    #[serde(default, borrow, deserialize_with = "nul")]
+    choices: Vec<DeltaChoice<'a>>,
+}
+
+#[derive(Deserialize, Default)]
+struct DeltaChoice<'a> {
+    #[serde(default, borrow, deserialize_with = "nul")]
+    delta: DeltaText<'a>,
+}
+
+#[derive(Deserialize, Default)]
+struct DeltaText<'a> {
+    #[serde(default, borrow)]
+    content: JStr<'a>,
+    #[serde(default, borrow)]
+    text: JStr<'a>,
 }
 
 #[derive(Deserialize, Default)]

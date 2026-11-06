@@ -12,6 +12,7 @@ pub mod limits;
 pub mod metrics;
 pub mod resources;
 pub mod server;
+pub mod telemetry;
 pub mod translate;
 pub mod upstream;
 pub mod usage;

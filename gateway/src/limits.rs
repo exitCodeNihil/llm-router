@@ -325,6 +325,7 @@ mod tests {
             allowed_models: None,
             expires_at: 0,
             scope: scope(format!("key:{name}"), budget, rpm, None),
+            tags: Vec::new(),
         }
     }
 

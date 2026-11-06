@@ -27,6 +27,7 @@ use serde_json::value::RawValue;
 use crate::body::{Body, InFlight, Sse};
 use crate::config::{AuthMode, Config, Deployment, Flavor, Key};
 use crate::metrics::{self, Attempt, Route};
+use crate::telemetry::{self, Trace};
 use crate::translate::{self, BadRequest, SseTransform};
 use crate::upstream::{self, BuildError, Inbound};
 use crate::usage::Emit;
@@ -171,30 +172,56 @@ async fn dispatch(st: &'static State, req: Request<Incoming>) -> Response<Body> 
                     Err(e) => return auth_error(&format!("invalid identity token: {e}")),
                 },
             };
-            let route = route_of(req.method(), path);
-            if let Err(d) = limits::check(&key) {
-                metrics::denial(d.code);
-                let mut r = oai_error(StatusCode::TOO_MANY_REQUESTS, "insufficient_quota", d.code, &d.message);
-                if let Some(s) = d.retry_after_s {
-                    r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(s));
-                }
-                // Recorded, so "how often is this key throttled" has an answer;
-                // the body isn't read yet, so the model is blank.
-                emit(&cfg, &key, String::new(), false).send(429, d.code, Default::default(), 0);
-                return r;
+            // Every authenticated response names its trace, so a caller can
+            // find it whether or not it sent a traceparent.
+            let trace = Trace::read(req.headers());
+            let mut resp = serve(cfg, key, inbound, req, trace).await;
+            if let Ok(v) = HeaderValue::from_bytes(&trace.hex()) {
+                resp.headers_mut().insert("x-llmr-trace-id", v);
             }
-            match route {
-                Route::Chat => proxy_openai(cfg, key, inbound, req, "/chat/completions").await,
-                Route::Completions => proxy_openai(cfg, key, inbound, req, "/completions").await,
-                Route::Embeddings => proxy_openai(cfg, key, inbound, req, "/embeddings").await,
-                Route::Messages => proxy_anthropic(cfg, key, inbound, req).await,
-                Route::Models => models(&cfg, &key, &inbound),
-                Route::CountTokens => count_tokens(req).await,
-                Route::Other => not_found(),
-            }
+            resp
         }
         _ => not_found(),
     }
+}
+
+async fn serve(
+    cfg: Arc<Config>,
+    key: Arc<Key>,
+    inbound: Inbound,
+    req: Request<Incoming>,
+    trace: Trace,
+) -> Response<Body> {
+    let path = req.uri().path();
+    let route = route_of(req.method(), path);
+    let rq = Rq { trace, operation: telemetry::operation(path) };
+    if let Err(d) = limits::check(&key) {
+        metrics::denial(d.code);
+        let mut r = oai_error(StatusCode::TOO_MANY_REQUESTS, "insufficient_quota", d.code, &d.message);
+        if let Some(s) = d.retry_after_s {
+            r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(s));
+        }
+        // Recorded, so "how often is this key throttled" has an answer;
+        // the body isn't read yet, so the model is blank.
+        emit(&cfg, &key, String::new(), false, rq).send(429, d.code, Default::default(), 0);
+        return r;
+    }
+    match route {
+        Route::Chat => proxy_openai(cfg, key, inbound, req, "/chat/completions", rq).await,
+        Route::Completions => proxy_openai(cfg, key, inbound, req, "/completions", rq).await,
+        Route::Embeddings => proxy_openai(cfg, key, inbound, req, "/embeddings", rq).await,
+        Route::Messages => proxy_anthropic(cfg, key, inbound, req, rq).await,
+        Route::Models => models(&cfg, &key, &inbound),
+        Route::CountTokens => count_tokens(req).await,
+        Route::Other => not_found(),
+    }
+}
+
+/// A request's trace and operation, for its usage event.
+#[derive(Clone, Copy)]
+struct Rq {
+    trace: Trace,
+    operation: &'static str,
 }
 
 /// Who a request says it is: a gateway key, resolved, or an identity token,
@@ -247,12 +274,14 @@ fn authenticate(cfg: &Config, h: &HeaderMap) -> Result<(Caller, Inbound), Respon
     Ok((caller, inbound))
 }
 
-fn emit(cfg: &Arc<Config>, key: &Arc<Key>, model: String, stream: bool) -> Emit {
+fn emit(cfg: &Arc<Config>, key: &Arc<Key>, model: String, stream: bool, rq: Rq) -> Emit {
+    let request_id = format!("req_{:016x}", fastrand::u64(..));
+    let verdict = telemetry::decide(&cfg.telemetry, cfg.data_rule, key, &request_id, rq.trace.sampled);
     Emit {
         cfg: cfg.clone(),
         key: key.clone(),
         model,
-        request_id: format!("req_{:016x}", fastrand::u64(..)),
+        request_id,
         stream,
         start: Instant::now(),
         // The control plane's clock, so a gateway's own skew can't move usage
@@ -260,6 +289,11 @@ fn emit(cfg: &Arc<Config>, key: &Arc<Key>, model: String, stream: bool) -> Emit 
         ts_ms: limits::cp_now_ms(),
         deployment: None,
         attempts: 0,
+        trace: rq.trace,
+        operation: rq.operation,
+        verdict,
+        content: None,
+        output: String::new(),
     }
 }
 
@@ -379,6 +413,7 @@ async fn proxy_openai(
     inbound: Inbound,
     req: Request<Incoming>,
     path: &str,
+    rq: Rq,
 ) -> Response<Body> {
     let body = match read_body(req).await {
         Ok(b) => b,
@@ -391,7 +426,7 @@ async fn proxy_openai(
     if p.model.is_empty() {
         return oai_error(StatusCode::BAD_REQUEST, "invalid_request_error", "missing_model", "model field is required");
     }
-    let mut em = emit(&cfg, &key, p.model.clone(), p.stream);
+    let mut em = emit(&cfg, &key, p.model.clone(), p.stream, rq);
     let Some(resolved) = cfg.resolve(&p.model) else {
         if !key.model_allowed(&[&p.model]) {
             return refuse_oai(em, "model_not_allowed");
@@ -441,20 +476,31 @@ async fn proxy_openai(
     };
     em.deployment = Some(dep.clone());
     em.attempts = attempts;
+    em.capture_request(&body, false);
+    let capture = em.verdict.capture;
     let status = resp.status();
     let mut out = routed(status, &em.request_id, &dep, attempts, resp.headers());
     let sse = p.stream && status == StatusCode::OK;
     match (dep.flavor, sse) {
         (Flavor::Anthropic, true) => {
-            stream(out, resp, Box::new(translate::AnthToOaiStream::new(&p.model, &em.request_id)), em)
+            let t = translate::AnthToOaiStream::new(&p.model, &em.request_id).capturing(capture);
+            stream(out, resp, Box::new(t), em)
         }
-        (Flavor::OpenAI, true) => stream(out, resp, Box::new(translate::OaiPassthrough::new(inject)), em),
+        (Flavor::OpenAI, true) => {
+            stream(out, resp, Box::new(translate::OaiPassthrough::new(inject).capturing(capture)), em)
+        }
         (flavor, false) => {
             let ct = resp.headers().get(header::CONTENT_TYPE).cloned();
             let bytes = match collect(resp).await {
                 Ok(b) => b,
                 Err(r) => return r,
             };
+            if capture > 0 && status == StatusCode::OK {
+                em.set_output(match flavor {
+                    Flavor::Anthropic => translate::anth_json_text(&bytes),
+                    Flavor::OpenAI => translate::oai_json_text(&bytes),
+                });
+            }
             let (bytes, usage) = if status != StatusCode::OK {
                 (bytes, Default::default())
             } else if flavor == Flavor::Anthropic {
@@ -478,7 +524,13 @@ async fn proxy_openai(
     }
 }
 
-async fn proxy_anthropic(cfg: Arc<Config>, key: Arc<Key>, inbound: Inbound, req: Request<Incoming>) -> Response<Body> {
+async fn proxy_anthropic(
+    cfg: Arc<Config>,
+    key: Arc<Key>,
+    inbound: Inbound,
+    req: Request<Incoming>,
+    rq: Rq,
+) -> Response<Body> {
     let body = match read_body(req).await {
         Ok(b) => b,
         Err(_) => return anth_error(StatusCode::BAD_REQUEST, "invalid_request_error", "unreadable or oversized body"),
@@ -490,7 +542,7 @@ async fn proxy_anthropic(cfg: Arc<Config>, key: Arc<Key>, inbound: Inbound, req:
     if p.model.is_empty() {
         return anth_error(StatusCode::BAD_REQUEST, "invalid_request_error", "model is required");
     }
-    let mut em = emit(&cfg, &key, p.model.clone(), p.stream);
+    let mut em = emit(&cfg, &key, p.model.clone(), p.stream, rq);
     let refuse = |em: Emit, code: &'static str| {
         let why = if code == "model_not_allowed" { "is not available for this API key" } else { "does not exist" };
         em.send(404, code, Default::default(), 0);
@@ -541,6 +593,9 @@ async fn proxy_anthropic(cfg: Arc<Config>, key: Arc<Key>, inbound: Inbound, req:
     };
     em.deployment = Some(dep.clone());
     em.attempts = attempts;
+    // The request's own bytes, not a re-encoding.
+    em.capture_request(&body, true);
+    let capture = em.verdict.capture;
     let status = resp.status();
     let mut out = routed(status, &em.request_id, &dep, attempts, resp.headers());
     if status != StatusCode::OK {
@@ -555,9 +610,12 @@ async fn proxy_anthropic(cfg: Arc<Config>, key: Arc<Key>, inbound: Inbound, req:
         return r;
     }
     match (dep.flavor, p.stream) {
-        (Flavor::Anthropic, true) => stream(out, resp, Box::new(translate::AnthPassthrough::new()), em),
+        (Flavor::Anthropic, true) => {
+            stream(out, resp, Box::new(translate::AnthPassthrough::new().capturing(capture)), em)
+        }
         (Flavor::OpenAI, true) => {
-            stream(out, resp, Box::new(translate::OaiToAnthStream::new(&p.model, &em.request_id)), em)
+            let t = translate::OaiToAnthStream::new(&p.model, &em.request_id).capturing(capture);
+            stream(out, resp, Box::new(t), em)
         }
         (flavor, false) => {
             let ct = resp.headers().get(header::CONTENT_TYPE).cloned();
@@ -565,6 +623,12 @@ async fn proxy_anthropic(cfg: Arc<Config>, key: Arc<Key>, inbound: Inbound, req:
                 Ok(b) => b,
                 Err(r) => return r,
             };
+            if capture > 0 {
+                em.set_output(match flavor {
+                    Flavor::Anthropic => translate::anth_json_text(&bytes),
+                    Flavor::OpenAI => translate::oai_json_text(&bytes),
+                });
+            }
             let (bytes, usage) = if flavor == Flavor::Anthropic {
                 let u = translate::anth_json_usage(&bytes);
                 (bytes, u)
@@ -635,7 +699,7 @@ fn routed(status: StatusCode, req_id: &str, d: &Deployment, attempts: i64, upstr
     h.insert("x-llmr-attempts", HeaderValue::from(attempts));
     h.insert(
         "access-control-expose-headers",
-        HeaderValue::from_static("X-Request-Id, X-Llmr-Provider, X-Llmr-Upstream, X-Llmr-Attempts"),
+        HeaderValue::from_static("X-Request-Id, X-Llmr-Trace-Id, X-Llmr-Provider, X-Llmr-Upstream, X-Llmr-Attempts"),
     );
     // The upstream's advice on a 429 or 503, so the client knows when to come back.
     if (status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE)
