@@ -145,6 +145,9 @@ docker compose -f docker-compose.dev.yml --profile otel --profile langfuse up -d
   `rules`); destinations have their own `/api/telemetry/destinations`. `POST /api/observability/test`
   is gone; use `POST /api/telemetry/destinations/test`.
 - Gateways from 0.2 keep working with a 0.3 control plane, but only 0.3 gateways capture content.
+  Upgrade the control plane first: a 0.3 gateway can't join a 0.2 control plane. Gateways from 0.2
+  don't say when they shut down, so with the Helm chart's alerts on, `LLMRouterGatewayNotSyncing`
+  fires for each one replaced, for up to 30 minutes.
 
 ## Adding a destination kind
 
