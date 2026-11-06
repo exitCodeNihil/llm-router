@@ -388,15 +388,17 @@ impl<'de: 'a, 'a> Deserialize<'de> for Fields<'a> {
 }
 
 /// The request's input and system within `limit` bytes each (Go: capContent):
-/// a larger system prompt is dropped and the input keeps its newest messages
-/// that fit, copied out of the request so a queued event never holds a large
-/// body. Reports whether anything was left out.
+/// the input keeps its newest messages that fit, or the newest alone with its
+/// text cut when not even that fits, and a larger system prompt is cut. Copied
+/// out of the request, so a queued event never holds a large body.
+/// content_truncated says something was left out.
 fn capture_request(body: &[u8], with_system: bool, limit: usize) -> Content {
     let Ok(f) = serde_json::from_slice::<Fields>(body) else { return Content::default() };
     let mut c = Content::default();
     if let Some(system) = f.system.filter(|_| with_system) {
         if system.get().len() > limit {
             c.content_truncated = true;
+            c.system = cut_json(system.get(), limit);
         } else {
             c.system = Some(system.to_owned());
         }
@@ -423,10 +425,54 @@ fn capture_request(body: &[u8], with_system: bool, limit: usize) -> Content {
                 }
                 s.push(']');
                 c.input = RawValue::from_string(s).ok();
+            } else if let Some(newest) = msgs.last() {
+                // Not even the newest message fits: keep it, its text cut.
+                c.input = cut_json(newest.get(), limit.saturating_sub(2))
+                    .and_then(|m| RawValue::from_string(format!("[{}]", m.get())).ok());
             }
         }
     }
     c
+}
+
+/// A JSON value cut to fit in `limit` bytes by shortening its strings, the
+/// longest first, leaving "role" and "type" alone; None when even empty
+/// strings don't fit. Only an oversized part takes this path: it is re-encoded.
+fn cut_json(raw: &str, limit: usize) -> Option<Box<RawValue>> {
+    fn strings<'a>(v: &'a mut serde_json::Value, out: &mut Vec<&'a mut String>) {
+        match v {
+            serde_json::Value::String(s) => out.push(s),
+            serde_json::Value::Array(a) => a.iter_mut().for_each(|x| strings(x, out)),
+            serde_json::Value::Object(m) => {
+                for (k, x) in m.iter_mut() {
+                    if k != "role" && k != "type" {
+                        strings(x, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let mut excess = serde_json::to_string(&v).ok()?.len().saturating_sub(limit);
+    let mut all = Vec::new();
+    strings(&mut v, &mut all);
+    all.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    // Every byte of text takes at least a byte encoded, so cutting n bytes
+    // of text saves at least n.
+    for s in all {
+        if excess == 0 {
+            break;
+        }
+        let before = s.len();
+        cut_utf8(s, before.saturating_sub(excess));
+        excess = excess.saturating_sub(before - s.len());
+    }
+    let out = serde_json::to_string(&v).ok()?;
+    if out.len() > limit {
+        return None;
+    }
+    RawValue::from_string(out).ok()
 }
 
 /// `s` cut to at most `n` bytes, at a character boundary.
@@ -681,7 +727,7 @@ mod tests {
     }
 
     /// Go: capContent. Each part within the cap: the input keeps its newest
-    /// messages, a larger system prompt is dropped, the output is cut.
+    /// messages that fit, or the newest cut; a larger system prompt is cut.
     #[test]
     fn captures_requests_within_the_cap() {
         let body = r#"{"model":"m","system":"you are terse","messages":[{"role":"user","content":"first"}, {"role":"assistant","content":"second"},{"role":"user","content":"third"}]}"#;
@@ -695,8 +741,36 @@ mod tests {
         let cut = capture_request(body.as_bytes(), true, last.len() + 3);
         assert_eq!(cut.input.as_ref().unwrap().get(), format!("[{last}]"));
         assert!(cut.content_truncated);
+        // Not even the newest message fits: it stays, its text cut to fit.
+        let cut = capture_request(body.as_bytes(), true, 32);
+        assert_eq!(cut.input.as_ref().unwrap().get(), r#"[{"content":"th","role":"user"}]"#);
+        assert_eq!(cut.system.as_ref().unwrap().get(), r#""you are terse""#);
+        assert!(cut.content_truncated);
         let cut = capture_request(body.as_bytes(), true, 10);
-        assert!(cut.input.is_none() && cut.system.is_none() && cut.content_truncated);
+        assert_eq!(cut.system.as_ref().unwrap().get(), r#""you are ""#);
+        assert!(cut.input.is_none(), "a message whose structure alone is over the cap");
+        assert!(cut.content_truncated);
+
+        // Blocks: the longest text gives way first; role and type never do.
+        let big = "é".repeat(400);
+        let body = serde_json::json!({"system": [{"type": "text", "text": big}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "keep"}, {"type": "text", "text": big}]}]})
+        .to_string();
+        let cut = capture_request(body.as_bytes(), true, 200);
+        let (input, system) = (cut.input.unwrap(), cut.system.unwrap());
+        assert!(input.get().len() <= 200 && system.get().len() <= 200, "{} {}", input.get(), system.get());
+        let v: serde_json::Value = serde_json::from_str(input.get()).unwrap();
+        assert_eq!(v[0]["role"], "user");
+        assert_eq!(v[0]["content"][0]["text"], "keep");
+        let text = v[0]["content"][1]["text"].as_str().unwrap();
+        assert!(!text.is_empty() && big.starts_with(text));
+        let v: serde_json::Value = serde_json::from_str(system.get()).unwrap();
+        assert_eq!(v[0]["type"], "text");
+        assert!(cut.content_truncated);
+        // Escapes count: a cut text still fits once encoded.
+        let quotes = serde_json::json!({"messages": [{"role": "user", "content": "\"\n".repeat(300)}]}).to_string();
+        let input = capture_request(quotes.as_bytes(), false, 100).input.unwrap();
+        assert!(input.get().len() <= 100, "{}", input.get().len());
 
         let none = capture_request(br#"{"model":"m","messages":"not a list of messages at all"}"#, true, 10);
         assert!(none.input.is_none() && none.content_truncated);

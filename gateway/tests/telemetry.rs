@@ -230,10 +230,11 @@ async fn content_leak_table() {
     }
 }
 
-/// A caller whose trace isn't sampled gets nothing exported, the rule that
-/// matched still named; an invalid traceparent starts a new trace.
+/// A caller's traceparent places the request in its trace but decides nothing:
+/// an unsampled one can't opt out of export or capture. An invalid one starts
+/// a new trace.
 #[tokio::test]
-async fn traceparent_decides_too() {
+async fn traceparent_places_but_never_decides() {
     let _q = QUEUE.lock().await;
     let tel = json!({"mode": "by_rule", "rules": [
         {"id": "r-prod", "order": 1, "scope_type": "tag", "scope_value": "prod", "capture": "content", "sample": 100, "enabled": true}],
@@ -246,7 +247,8 @@ async fn traceparent_decides_too() {
     let (_, h, _) = call(format!("{gw}/v1/messages"), &body, Some(unsampled)).await;
     assert_eq!(h["x-llmr-trace-id"], "4bf92f3577b34da6a3ce929d0e0e4736");
     let e = &events(model)[0];
-    assert!(!e.export && !e.capture_content && e.content.is_none());
+    assert_eq!((e.trace_id, e.parent_span_id), (0x4bf92f3577b34da6a3ce929d0e0e4736, 0x00f067aa0ba902b7));
+    assert!(e.export && e.capture_content && e.content.is_some(), "the policy decides, not the caller");
     assert_eq!(e.rule_id.as_deref(), Some("r-prod"));
 
     let (_, h, _) = call(format!("{gw}/v1/messages"), &body, Some("00-nonsense")).await;

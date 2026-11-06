@@ -276,13 +276,11 @@ pub struct Verdict {
     pub capture: usize,
 }
 
-/// The policy's decision, taken away from by the caller's unsampled trace and
-/// the group's data rule, and how much content to capture.
-pub fn decide(policy: &Policy, rule: DataRule, key: &Key, request_id: &str, sampled: bool) -> Verdict {
+/// The policy's decision, taken away from by the group's data rule, and how
+/// much content to capture. A caller's traceparent doesn't take part: its
+/// sampled flag would let any key holder opt out of export.
+pub fn decide(policy: &Policy, rule: DataRule, key: &Key, request_id: &str) -> Verdict {
     let mut d = policy.evaluate(key, request_id);
-    if !sampled {
-        d = Decision { rule_id: d.rule_id, ..Decision::default() };
-    }
     match rule {
         DataRule::Inherit => {}
         DataRule::NoContent => d.capture_content = false,
@@ -304,8 +302,8 @@ pub struct Trace {
     pub id: u128,
     /// The caller's span; 0 for a new trace.
     pub parent: u64,
-    /// False only when the caller's traceparent says its trace isn't
-    /// recorded; nothing is exported for the request then.
+    /// The caller's sampled flag. Read, never acted on: what is exported is
+    /// the policy's decision alone.
     pub sampled: bool,
 }
 
@@ -554,18 +552,12 @@ mod tests {
                         if scope { r#"[{"teams":{"mode":"all","values":null},"max_bytes":4096}]"# } else { "[]" };
                     let p =
                         policy(&format!(r#"{{"mode":"everything","capture_content":{capture},"content":{content}}}"#));
-                    for sampled in [false, true] {
-                        let v = decide(&p, DataRule::parse(rule), &k, "r", sampled);
-                        let what = format!("capture={capture} {rule} scope={scope} sampled={sampled}");
-                        let want = capture && rule == "inherit" && scope && sampled;
-                        assert_eq!(v.capture, if want { 4096 } else { 0 }, "{what}");
-                        assert_eq!(v.decision.export, rule != "no_export" && sampled, "{what}");
-                        assert_eq!(
-                            v.decision.capture_content,
-                            capture && rule != "no_content" && rule != "no_export" && sampled,
-                            "{what}"
-                        );
-                    }
+                    let v = decide(&p, DataRule::parse(rule), &k, "r");
+                    let what = format!("capture={capture} {rule} scope={scope}");
+                    let want = capture && rule == "inherit" && scope;
+                    assert_eq!(v.capture, if want { 4096 } else { 0 }, "{what}");
+                    assert_eq!(v.decision.export, rule != "no_export", "{what}");
+                    assert_eq!(v.decision.capture_content, capture && rule == "inherit", "{what}");
                 }
             }
         }
@@ -588,9 +580,9 @@ mod tests {
         let p = policy(
             r#"{"capture_content":true,"content":[{"teams":{"mode":"selected","values":["A"]},"max_bytes":9}]}"#,
         );
-        assert_eq!(decide(&p, DataRule::Inherit, &key("k", "", "B", [&[], &[], &[]]), "r", true).capture, 0);
-        assert_eq!(decide(&p, DataRule::Inherit, &key("k", "", "A", [&[], &[], &[]]), "r", true).capture, 9);
-        assert_eq!(decide(&p, DataRule::Inherit, &key("k", "", "", [&[], &[], &[]]), "r", true).capture, 0);
+        assert_eq!(decide(&p, DataRule::Inherit, &key("k", "", "B", [&[], &[], &[]]), "r").capture, 0);
+        assert_eq!(decide(&p, DataRule::Inherit, &key("k", "", "A", [&[], &[], &[]]), "r").capture, 9);
+        assert_eq!(decide(&p, DataRule::Inherit, &key("k", "", "", [&[], &[], &[]]), "r").capture, 0);
     }
 
     #[test]

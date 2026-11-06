@@ -276,7 +276,7 @@ fn authenticate(cfg: &Config, h: &HeaderMap) -> Result<(Caller, Inbound), Respon
 
 fn emit(cfg: &Arc<Config>, key: &Arc<Key>, model: String, stream: bool, rq: Rq) -> Emit {
     let request_id = format!("req_{:016x}", fastrand::u64(..));
-    let verdict = telemetry::decide(&cfg.telemetry, cfg.data_rule, key, &request_id, rq.trace.sampled);
+    let verdict = telemetry::decide(&cfg.telemetry, cfg.data_rule, key, &request_id);
     Emit {
         cfg: cfg.clone(),
         key: key.clone(),
