@@ -175,3 +175,22 @@ func TestCloudTokenErrors(t *testing.T) {
 		t.Fatalf("the reason names the issuer's URL: %q", TokenErrorReason(err))
 	}
 }
+
+// TestCloudTokenEmailLowercase: emails are lowercased rune by rune
+// (strings.ToLower), as gateways do (gateway/src/cloud/jwt.rs lower_email),
+// so the email hashes in a gateway's config match what it computes.
+func TestCloudTokenEmailLowercase(t *testing.T) {
+	iss := newFakeIssuer(t)
+	s := testSnapshot(iss)
+	v := NewCloudValidator(nil)
+	for in, want := range map[string]string{
+		"İstanbul@x.com":  "istanbul@x.com",
+		"ΟΔΥΣΣΕΥΣ@x.com":  "οδυσσευσ@x.com", // no final ς
+		"Dev@Example.COM": "dev@example.com",
+	} {
+		vt, err := v.Verify(context.Background(), s, iss.mint(t, map[string]any{"preferred_username": in, "tid": "tenant-1"}))
+		if err != nil || vt.Email != want {
+			t.Errorf("%s: %+v %v, want %s", in, vt, err, want)
+		}
+	}
+}

@@ -309,7 +309,7 @@ impl Identities {
         let email_claim = if issuer.email_claim.is_empty() { "email" } else { issuer.email_claim.as_str() };
         let email = claims.get(email_claim).and_then(Value::as_str).filter(|e| !e.is_empty());
         let Some(email) = email else { return Err(format!("token has no {email_claim} claim")) };
-        Ok(Verified { issuer: idx, email: email.to_lowercase(), exp })
+        Ok(Verified { issuer: idx, email: lower_email(email), exp })
     }
 
     /// Check the signature with the issuer's keys. Only a token the current
@@ -588,6 +588,13 @@ impl PublicKey {
     }
 }
 
+/// Lowercase as Go's strings.ToLower does, which the control plane hashes
+/// emails with: each char on its own, to one char. str::to_lowercase differs
+/// for 'İ' (to "i\u{307}") and a final 'Σ' (to 'ς'), and the hash would miss.
+pub(crate) fn lower_email(s: &str) -> String {
+    s.chars().map(|c| c.to_lowercase().next().unwrap_or(c)).collect()
+}
+
 fn sha256(b: &[u8]) -> [u8; 32] {
     let d = ring::digest::digest(&ring::digest::SHA256, b);
     let mut out = [0u8; 32];
@@ -838,6 +845,29 @@ mod tests {
             .unwrap();
             Config::build(wire).unwrap()
         }
+    }
+
+    /// The same inputs and answers as the control plane's
+    /// TestCloudTokenEmailLowercase (internal/auth/cloudtoken_test.go).
+    #[tokio::test]
+    async fn lowercases_emails_as_the_control_plane_does() {
+        let cases = [
+            ("İstanbul@x.com", "istanbul@x.com"),
+            ("ΟΔΥΣΣΕΥΣ@x.com", "οδυσσευσ@x.com"),
+            ("Dev@Example.COM", "dev@example.com"),
+        ];
+        let idp = Idp::new().await;
+        let ids = Identities::default();
+        let cfg = idp.config(1, false);
+        for (email, want) in cases {
+            let v = ids.verify(&cfg, &idp.mint("RS256", "k1", json!({ "email": email }))).await.unwrap();
+            assert_eq!(v.email, want, "{email}");
+        }
+        // And the hash the config's users are found by.
+        assert_eq!(
+            hex(&sha256(cases[0].1.as_bytes())),
+            "7bf4275a83b36f3e36d285d92b1ce0eb742132d551f6a8b0e8b6bea16a5e3d64"
+        );
     }
 
     #[test]
