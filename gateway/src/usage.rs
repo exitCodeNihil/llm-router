@@ -165,8 +165,8 @@ fn hex_span<S: Serializer>(n: &u64, s: S) -> Result<S::Ok, S::Error> {
 /// long enough to fill it, new events are dropped and counted.
 const MAX_QUEUED: usize = 200_000;
 
-/// The most captured content the gateway holds: queued, and reserved by
-/// requests in flight. Past it a request is not captured, and an event put
+/// The most captured content the gateway holds: queued, in the batch being
+/// sent, and reserved by requests in flight. Past it a request is not captured, and an event put
 /// back after a failed sync loses its content; either keeps its usage, marked
 /// truncated, and is counted.
 const CONTENT_BUDGET: usize = 64 << 20;
@@ -176,6 +176,9 @@ const CONTENT_BUDGET: usize = 64 << 20;
 static RESERVED: AtomicUsize = AtomicUsize::new(0);
 /// The queue's content, readable without its lock.
 static QUEUED_CONTENT: AtomicUsize = AtomicUsize::new(0);
+/// Content in the batch being sent: taken from the queue, not yet
+/// acknowledged, dropped or put back.
+static SENDING_CONTENT: AtomicUsize = AtomicUsize::new(0);
 
 /// A request's share of the content budget, given back when dropped: once its
 /// event is queued, where the queue counts the content instead, or when the
@@ -186,9 +189,9 @@ pub struct Reservation(usize);
 impl Reservation {
     /// `n` bytes of the budget, if what is queued and reserved leaves them.
     fn take(n: usize) -> Option<Reservation> {
-        let queued = QUEUED_CONTENT.load(Ordering::Relaxed);
+        let held = QUEUED_CONTENT.load(Ordering::Relaxed) + SENDING_CONTENT.load(Ordering::Relaxed);
         let before = RESERVED.fetch_add(n, Ordering::Relaxed);
-        if before + n + queued > CONTENT_BUDGET {
+        if before + n + held > CONTENT_BUDGET {
             RESERVED.fetch_sub(n, Ordering::Relaxed);
             return None;
         }
@@ -215,6 +218,33 @@ impl Drop for Reservation {
 /// Content bytes requests in flight have reserved.
 pub fn reserved_content() -> usize {
     RESERVED.load(Ordering::Relaxed)
+}
+
+/// A batch's content, counted against the budget from when it leaves the
+/// queue until the batch is acknowledged or dropped (dropping this) or its
+/// events go back in the queue (drop this first, so they fit again).
+#[derive(Debug, Default)]
+pub struct Sending(usize);
+
+impl Sending {
+    pub fn of(events: &[Event]) -> Sending {
+        let n = events.iter().filter_map(|e| e.content.as_ref()).map(|c| c.bytes()).sum();
+        SENDING_CONTENT.fetch_add(n, Ordering::Relaxed);
+        Sending(n)
+    }
+}
+
+impl Drop for Sending {
+    fn drop(&mut self) {
+        if self.0 > 0 {
+            SENDING_CONTENT.fetch_sub(self.0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Content bytes in the batch being sent.
+pub fn sending_content() -> usize {
+    SENDING_CONTENT.load(Ordering::Relaxed)
 }
 
 #[derive(Default)]
@@ -333,8 +363,10 @@ pub fn requeue(events: Vec<Event>) {
     let mut q = queue().lock().unwrap();
     let room = MAX_QUEUED.saturating_sub(q.events.len());
     let dropped = events.len().saturating_sub(room);
-    // what requests in flight reserved stays theirs
-    let budget = CONTENT_BUDGET.saturating_sub(RESERVED.load(Ordering::Relaxed));
+    // what requests in flight reserved, and the batch being sent, keep theirs
+    let budget = CONTENT_BUDGET
+        .saturating_sub(RESERVED.load(Ordering::Relaxed))
+        .saturating_sub(SENDING_CONTENT.load(Ordering::Relaxed));
     for mut e in events.into_iter().take(room).rev() {
         q.admit_within(&mut e, budget);
         q.events.push_front(e);
@@ -1158,6 +1190,36 @@ pub(crate) mod tests {
             (c.input.as_ref().unwrap().get(), c.output.as_str()),
             (r#"[{"role":"user","content":"hello"}]"#, "answer")
         );
+    }
+
+    /// The batch being sent keeps its content counted until it is
+    /// acknowledged or dropped; put back in the queue, it keeps its content.
+    #[test]
+    fn the_batch_being_sent_counts_against_the_budget() {
+        let _q = hold_queue();
+        let big = format!("\"{}\"", "x".repeat(CONTENT_BUDGET / 2));
+        let events = vec![Event { model_name: "sending-test".into(), content: content(&big, None, ""), ..event("s") }];
+        let n = events[0].content.as_ref().unwrap().bytes();
+        let before = sending_content();
+        let sending = Sending::of(&events);
+        assert_eq!(sending_content(), before + n);
+
+        let free = CONTENT_BUDGET - queued_content() - sending_content() - reserved_content();
+        assert!(Reservation::take(free + 1).is_none(), "the batch's content is spoken for");
+        assert!(Reservation::take(free).is_some());
+
+        drop(sending);
+        assert_eq!(sending_content(), before);
+        assert!(Reservation::take(free + n).is_some(), "acknowledged, its room is free again");
+
+        // A failed sync puts the batch back: released first, it fits.
+        let sending = Sending::of(&events);
+        drop(sending);
+        requeue(events);
+        let (mine, rest): (Vec<Event>, Vec<Event>) =
+            take(usize::MAX, usize::MAX).into_iter().partition(|e| e.model_name == "sending-test");
+        requeue(rest);
+        assert!(!mine[0].content.as_ref().unwrap().content_truncated);
     }
 
     /// What is queued holds no more memory than the bytes the budget counts.

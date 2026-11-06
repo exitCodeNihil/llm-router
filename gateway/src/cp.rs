@@ -304,6 +304,7 @@ impl ControlPlane {
     async fn sync_once(&self, s: &mut Syncer) -> bool {
         if s.pending.is_none() {
             let events = usage::take(MAX_BATCH, s.max_bytes());
+            let sending = usage::Sending::of(&events);
             let (rates, scopes) = limits::freeze();
             s.batch += 1;
             let mem = crate::resources::memory();
@@ -318,7 +319,7 @@ impl ControlPlane {
                 cpu_pct: crate::resources::cpu_pct(),
                 leaving: self.leaving.load(Ordering::Relaxed),
             };
-            let frozen = Frozen { batch: s.batch, cursor: s.cursor.clone(), events, rates, stats };
+            let frozen = Frozen { batch: s.batch, cursor: s.cursor.clone(), events, sending, rates, stats };
             s.pending = Batch::build(frozen, scopes).await;
         }
         let Some(batch) = &s.pending else { return false };
@@ -348,7 +349,9 @@ impl ControlPlane {
                     s.limit_bytes = Some(s.max_bytes() / 2);
                     eprintln!("sync: {status}; sending batches of at most {} bytes", s.max_bytes());
                     limits::discard(&batch.scopes);
-                    usage::requeue(batch.frozen.events);
+                    let Frozen { events, sending, .. } = batch.frozen;
+                    drop(sending);
+                    usage::requeue(events);
                 } else if status == StatusCode::PAYLOAD_TOO_LARGE {
                     // Refused at the smallest batch: resending it as is would
                     // hold back every later event, and the limit counters.
@@ -450,6 +453,9 @@ struct Frozen {
     batch: i64,
     cursor: String,
     events: Vec<Event>,
+    /// The events' content, counted against the capture budget while the
+    /// batch lives.
+    sending: usage::Sending,
     rates: Vec<RateDelta>,
     stats: Stats,
 }
@@ -489,6 +495,8 @@ impl Batch {
     /// and counted. The batch number, cursor and rates stay.
     async fn smaller(mut self) -> Option<Batch> {
         let f = &mut self.frozen;
+        // Recounted below, once the batch has lost what it is about to lose.
+        f.sending = usage::Sending::default();
         let stripped = usage::strip_content(&mut f.events);
         if stripped > 0 {
             eprintln!("sync: 413 at the smallest batch size; sending {stripped} events without their content");
@@ -504,6 +512,7 @@ impl Batch {
             eprintln!("sync: 413 for a single event without content; dropping it");
             f.events.clear();
         }
+        f.sending = usage::Sending::of(&f.events);
         Batch::build(self.frozen, self.scopes).await
     }
 }
@@ -682,6 +691,7 @@ mod tests {
             }
         }
         assert!(s.pending.is_none() && usage::queued() == 0, "{:?}", seen.lock().unwrap());
+        assert_eq!(usage::sending_content(), 0, "nothing is counted once every batch is settled");
         let seen = seen.lock().unwrap();
         let accepted: Vec<_> = seen.iter().filter(|(_, _, code)| *code == 200).collect();
         assert!(accepted.windows(2).all(|w| w[0].0 < w[1].0), "each batch once, in order");
@@ -696,6 +706,55 @@ mod tests {
         // other tests count too
         assert!(usage::CONTENT_STRIPPED.load(Ordering::Relaxed) - stripped >= 3);
         assert_eq!(metrics::SYNC_REFUSED_EVENTS.load(Ordering::Relaxed) - refused, 1);
+    }
+
+    /// A batch's captured content counts against the budget while it waits to
+    /// be acknowledged, and stops counting once it is, once it is refused for
+    /// good, or once a 413 puts it back in the queue (where the queue counts
+    /// it, content intact).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
+    async fn the_batch_being_sent_holds_its_content_until_settled() {
+        let _globals = hold_globals();
+        // 503, then 200; 400; 413, then 200
+        let (url, _) = mock_cp(|n, _| match n {
+            1 => 503,
+            3 => 400,
+            4 => 413,
+            _ => 200,
+        })
+        .await;
+        drop(usage::take(usize::MAX, usize::MAX));
+        let send = |model: &str| {
+            let mut em = emit_capturing(model, 1 << 20);
+            em.capture_request(br#"{"messages":[{"role":"user","content":"question"}]}"#, false);
+            em.set_output(crate::translate::oai_json_text(
+                br#"{"choices":[{"message":{"content":"answer"}}]}"#,
+                1 << 20,
+            ));
+            em.send(200, "", Default::default(), 0);
+        };
+        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into());
+        let mut s = cp.syncer.lock().await;
+
+        send("pending");
+        let queued = usage::queued_content();
+        assert!(queued > 0);
+        assert!(!cp.sync_once(&mut s).await, "503");
+        assert_eq!((usage::queued_content(), usage::sending_content()), (0, queued), "counted while unacknowledged");
+        assert!(cp.sync_once(&mut s).await);
+        assert_eq!(usage::sending_content(), 0, "acknowledged");
+
+        send("refused");
+        assert!(!cp.sync_once(&mut s).await, "400");
+        assert_eq!(usage::sending_content(), 0, "dropped");
+
+        send("too-large");
+        let queued = usage::queued_content();
+        assert!(!cp.sync_once(&mut s).await, "413");
+        assert_eq!((usage::queued_content(), usage::sending_content()), (queued, 0), "back in the queue, content kept");
+        assert!(cp.sync_once(&mut s).await);
+        assert_eq!((usage::queued_content(), usage::sending_content()), (0, 0));
     }
 
     #[test]

@@ -104,6 +104,11 @@ pub fn render(ready: bool, usage_queued: usize, usage_capacity: usize, usage_dro
         crate::usage::queued_content() as i64,
     );
     gauge(
+        "llmr_usage_sending_content_bytes",
+        "Captured telemetry content in the usage batch being sent to the control plane",
+        crate::usage::sending_content() as i64,
+    );
+    gauge(
         "llmr_usage_inflight_content_bytes",
         "Telemetry content budget reserved by requests in flight that capture content",
         crate::usage::reserved_content() as i64,
