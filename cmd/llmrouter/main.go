@@ -123,6 +123,8 @@ func run() error {
 	go lf.Run(ctx)
 	live := metrics.NewLive()
 	nodeStore := metrics.NewNodeStore()
+	httpm := metrics.NewHTTP()
+	promReg := newMetrics(httpm, nodeStore, writer)
 	events := &metrics.Events{}
 	go watchConfigEpoch(ctx, holder, events)
 	gw.Usage = usage.MultiWriter{writer, lf, live}
@@ -132,7 +134,7 @@ func run() error {
 		slog.Warn("LLMR_ADMIN_TOKEN is not set; bootstrap admin login is disabled")
 	}
 	mg := &mgmt.Server{Store: st, AdminToken: cfg.AdminToken, EncryptionKey: cfg.EncryptionKey,
-		Snapshots: holder, Live: live, NodeStore: nodeStore, Events: events, Recorder: recorder, Exporter: lf,
+		Snapshots: holder, Live: live, NodeStore: nodeStore, HTTP: httpm, Events: events, Recorder: recorder, Exporter: lf,
 		Gateway: gw, Version: version, Started: time.Now(), IDEOrigin: cfg.IDEOrigin}
 	mg.Register(mux)
 	go mg.SyncWorkspaceModels(ctx)
@@ -160,6 +162,7 @@ func run() error {
 	mux.Handle("/", console.SPA())
 
 	gw.Register(mux)
+	serveMetrics(ctx, cfg.MetricsListen, mux, promReg)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
@@ -167,8 +170,9 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           gateway.Logging(mgmt.CSRFGuard(mux)),
+		Handler:           gateway.Logging(httpm.Middleware(mgmt.CSRFGuard(mux))),
 		ReadHeaderTimeout: 10 * time.Second,
+		ConnState:         httpm.ConnState,
 	}
 	go func() {
 		<-ctx.Done()

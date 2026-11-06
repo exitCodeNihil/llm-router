@@ -45,6 +45,7 @@ type Server struct {
 	rtAt      time.Time
 	Live      *metrics.Live
 	NodeStore *metrics.NodeStore
+	HTTP      *metrics.HTTP // the control plane's own listener
 	Events    *metrics.Events
 	Recorder  *telemetry.Recorder
 	// Exporter reports delivery health; nil when no exporter runs in-process.
@@ -176,6 +177,7 @@ func (m *Server) Register(mux *http.ServeMux) {
 
 	mux.Handle("GET /api/metrics/live", h(m.metricsLive))
 	mux.Handle("GET /api/nodes", h(m.listNodes))
+	mux.Handle("GET /api/nodes/history", h(m.nodesHistory))
 
 	mux.Handle("POST /api/observability/test", h(m.observabilityTest))
 	mux.Handle("GET /api/observability/exported", h(m.observabilityExported))

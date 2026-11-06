@@ -94,6 +94,10 @@ func NewPGWriter(pool *pgxpool.Pool) *PGWriter {
 
 const flushBatchSize = 1000
 
+// Queued is the events waiting to be written, of Capacity.
+func (w *PGWriter) Queued() int   { return len(w.ch) }
+func (w *PGWriter) Capacity() int { return cap(w.ch) }
+
 func (w *PGWriter) Write(e Event) {
 	// Content is never stored; dropping it here keeps up to 65k queued events
 	// from holding on to request and response bodies.

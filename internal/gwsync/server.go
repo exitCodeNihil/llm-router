@@ -273,13 +273,17 @@ type RateDelta struct {
 	Tokens   int64  `json:"tokens"`
 }
 
+// Stats is a gateway's state at a sync, for the Gateways page and /metrics.
 type Stats struct {
-	Version  string  `json:"version"`
-	UptimeS  int64   `json:"uptime_s"`
-	CPUPct   float64 `json:"cpu_pct"`
-	MemPct   float64 `json:"mem_pct"`
-	InFlight int64   `json:"in_flight"`
-	Workers  int     `json:"workers"`
+	Version         string  `json:"version"`
+	UptimeS         int64   `json:"uptime_s"`
+	CPUPct          float64 `json:"cpu_pct"`
+	InFlight        int64   `json:"in_flight"`
+	Workers         int     `json:"workers"`
+	OpenConnections int64   `json:"open_connections"`
+	MemBytes        int64   `json:"mem_bytes"`
+	MemLimitBytes   int64   `json:"mem_limit_bytes"` // absent: no limit
+	Leaving         bool    `json:"leaving"`         // shutting down
 }
 
 func (s *Server) sync(w http.ResponseWriter, r *http.Request, p peer) {
@@ -369,10 +373,7 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request, p peer) {
 			s.Limits.Ingest(d.Scope, d.Minute, d.Requests, d.Tokens)
 		}
 	}
-	if s.Nodes != nil {
-		s.Nodes.Set(instance, metrics.NodeMetric{Version: req.Stats.Version, UptimeS: req.Stats.UptimeS,
-			CPUPct: req.Stats.CPUPct, MemPct: req.Stats.MemPct})
-	}
+	s.observe(r, instance, g.Name, req.Stats)
 	writeJSON(w, http.StatusOK, s.Limits.Export(snap, req.Cursor))
 }
 

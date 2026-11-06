@@ -27,6 +27,9 @@ type Config struct {
 	// TrustedProxies lists the proxies (addresses or CIDR ranges) whose
 	// X-Forwarded-For header names the client, for sign-in rate limits.
 	TrustedProxies []netip.Prefix
+	// MetricsListen serves /metrics on its own listener instead of the main
+	// one ("off": not at all). Empty = on the main listener, like a gateway.
+	MetricsListen string
 }
 
 func Load(args []string) (*Config, error) {
@@ -37,6 +40,7 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&c.IDEListen, "ide-listen", os.Getenv("LLMR_IDE_LISTEN"), "listen address for the workspace IDE proxy")
 	fs.StringVar(&c.IDEOrigin, "ide-origin", os.Getenv("LLMR_IDE_ORIGIN"), "public origin of the IDE listener, e.g. http://localhost:8081")
 	fs.StringVar(&c.CookieDomain, "cookie-domain", os.Getenv("LLMR_COOKIE_DOMAIN"), "session cookie Domain attribute, e.g. .example.com (needed when the IDE origin is a different hostname)")
+	fs.StringVar(&c.MetricsListen, "metrics-listen", os.Getenv("LLMR_METRICS_LISTEN"), "serve /metrics on this address instead of the main listener (off: not at all)")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}

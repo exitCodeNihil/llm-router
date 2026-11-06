@@ -111,6 +111,7 @@ type Live struct {
 	providers map[string]*provStat
 	edges     map[edgeKey]*wcounter
 	nodes     map[string]*wcounter // gateway_id ("" = the control plane) -> rps
+	nodeLat   map[string]*latring  // gateway_id -> latency reservoir (node p50)
 	scopes    map[string]*wcounter // "key:id"|"user:id"|"team:id"|"tag:val" -> rule match rates
 	global    latring              // all-provider latency reservoir (node p50/p95)
 }
@@ -121,6 +122,7 @@ func NewLive() *Live {
 		providers: map[string]*provStat{},
 		edges:     map[edgeKey]*wcounter{},
 		nodes:     map[string]*wcounter{},
+		nodeLat:   map[string]*latring{},
 		scopes:    map[string]*wcounter{},
 	}
 }
@@ -153,6 +155,10 @@ func (l *Live) Write(e usage.Event) {
 		l.nodes[e.GatewayID] = &wcounter{}
 	}
 	l.nodes[e.GatewayID].add(sec, isErr)
+	if l.nodeLat[e.GatewayID] == nil {
+		l.nodeLat[e.GatewayID] = &latring{}
+	}
+	l.nodeLat[e.GatewayID].push(e.LatencyMS)
 
 	for st, val := range map[string]string{"key": e.APIKeyID, "user": e.UserID, "team": e.TeamID} {
 		if val == "" {
@@ -258,6 +264,16 @@ func (l *Live) NodeRPS(id string) float64 {
 	}
 	count, _ := c.totals(sec)
 	return float64(count) / windowSecs
+}
+
+// NodeP50 is one node's median latency over its recent requests.
+func (l *Live) NodeP50(id string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if r := l.nodeLat[id]; r != nil {
+		return percentile(r.buf, 50)
+	}
+	return 0
 }
 
 // TotalRPM sums request counts across providers over the window.
