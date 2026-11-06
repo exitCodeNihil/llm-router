@@ -34,13 +34,24 @@ type Record struct {
 // recordOverhead is roughly what a span without content weighs, encoded.
 const recordOverhead = 1 << 10
 
-// Size estimates the record's encoded size, for queue and batch limits.
+// Size estimates what the record holds, for queue and batch limits: the
+// content it pins counts in full, whatever the destination's cap. A record
+// without content holds none: Write gives it an item without.
 func (r *Record) Size() int {
 	n := recordOverhead
 	if r.Content {
-		n += min(len(r.E.Input)+len(r.E.Output)+len(r.E.System), r.MaxContent+recordOverhead)
+		n += len(r.E.Input) + len(r.E.Output) + len(r.E.System)
 	}
 	return n
+}
+
+// withoutContent is a copy of the item that holds no content, for
+// destinations that don't receive it.
+func (it *Item) withoutContent() *Item {
+	c := *it
+	c.E.Input, c.E.Output, c.E.System = nil, "", nil
+	c.E.CaptureContent, c.E.ContentTruncated = false, false
+	return &c
 }
 
 // TestRecord is the span a destination test sends: a test span on a new trace.

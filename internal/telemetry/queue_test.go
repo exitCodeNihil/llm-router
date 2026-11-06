@@ -55,6 +55,15 @@ func TestQueueDropsOldest(t *testing.T) {
 	}
 }
 
+// A content record counts the content it pins, not the destination's cap:
+// the item holds all of it until the record is delivered.
+func TestRecordSizeCountsPinnedContent(t *testing.T) {
+	r := &Record{Item: &Item{E: usage.Event{Output: string(make([]byte, 10*recordOverhead))}}, Content: true, MaxContent: 10}
+	if r.Size() != 11*recordOverhead {
+		t.Fatalf("size %d, want %d", r.Size(), 11*recordOverhead)
+	}
+}
+
 func TestQueueBatchLimits(t *testing.T) {
 	p := defaultPolicy
 	p.BatchSpans, p.BatchBytes = 3, 2*recordOverhead

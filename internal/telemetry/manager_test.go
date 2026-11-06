@@ -166,6 +166,8 @@ func TestContentPerDestination(t *testing.T) {
 	}
 	if r := receive(t, sinkFor(t, "without"))[0]; r.Content || ContentOf(r) != nil {
 		t.Fatal("metadata destination got content")
+	} else if r.E.Output != "" || r.Item == nil {
+		t.Fatal("a metadata destination's queue pins the content")
 	}
 }
 

@@ -199,8 +199,16 @@ func (m *Manager) Write(e usage.Event) {
 	e.CaptureContent = anyContent
 	it := &Item{E: e, Group: group}
 	m.resolve(it)
+	meta := it
+	if anyContent {
+		meta = it.withoutContent() // so a metadata-only queue doesn't pin the content
+	}
 	for _, t := range targets {
-		t.w.st.dropped(t.w.q.push(&Record{Item: it, Content: t.content, MaxContent: t.max}))
+		r := &Record{Item: meta}
+		if t.content {
+			r = &Record{Item: it, Content: true, MaxContent: t.max}
+		}
+		t.w.st.dropped(t.w.q.push(r))
 	}
 	if m.Recorder != nil {
 		m.Recorder.Add(e)
