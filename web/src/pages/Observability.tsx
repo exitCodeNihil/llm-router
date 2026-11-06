@@ -878,7 +878,7 @@ export default function Observability() {
             ) : (exported.data?.length ?? 0) === 0 ? (
               <Empty
                 title="Nothing exported yet"
-                description="Once traffic matches your capture policy, events appear here."
+                description="Events appear here once traffic the capture policy lets out is exported to a destination."
               />
             ) : (
               <Table
