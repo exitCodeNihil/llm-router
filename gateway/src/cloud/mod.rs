@@ -1,8 +1,10 @@
-//! Cloud credentials the gateway mints for itself: tokens from Entra ID and
-//! Google, and the refresh logic every short-lived token shares.
+//! Cloud credentials: tokens the gateway mints for itself from Entra ID and
+//! Google, the refresh logic every short-lived token shares, and callers'
+//! identity tokens.
 
 pub mod entra;
 pub mod gcp;
+pub mod jwt;
 pub mod token;
 
 use std::time::Duration;

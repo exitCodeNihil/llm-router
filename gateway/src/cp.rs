@@ -13,6 +13,7 @@ use http::{HeaderValue, Method, Request, StatusCode, header};
 use http_body_util::{BodyExt, Full, Limited};
 use serde::{Deserialize, Serialize};
 
+use crate::cloud::jwt::{BoxFuture, ProvisionError, Provisioned, Provisioner};
 use crate::config::{Config, SCHEMA, Wire};
 use crate::limits::{self, Counters, RateDelta};
 use crate::server::{HttpsClient, State, https_client};
@@ -184,6 +185,7 @@ impl ControlPlane {
 
     /// Join, then run the control-plane loops for as long as the process lives.
     pub async fn run(self: Arc<Self>, st: &'static State) {
+        crate::cloud::jwt::identities().set_provisioner(self.clone());
         self.rejoin(0).await;
         tokio::spawn(self.clone().renew_loop());
         tokio::spawn(self.clone().config_loop(st));
@@ -352,6 +354,51 @@ impl ControlPlane {
                 false
             }
         }
+    }
+}
+
+impl Provisioner for ControlPlane {
+    /// Ask the control plane to create the user behind an identity token
+    /// (POST /gw/v1/provision). It verifies the token itself.
+    fn provision<'a>(&'a self, token: &'a str) -> BoxFuture<'a, Result<Provisioned, ProvisionError>> {
+        Box::pin(async move {
+            let body: Bytes = serde_json::to_vec(&serde_json::json!({"token": token})).unwrap_or_default().into();
+            for _ in 0..2 {
+                let (session, generation) = self.session();
+                if session.is_empty() {
+                    self.rejoin(generation).await;
+                    continue;
+                }
+                let call = self
+                    .call(
+                        Method::POST,
+                        "/gw/v1/provision",
+                        &session,
+                        Some((body.clone(), false)),
+                        &[],
+                        Duration::from_secs(15),
+                    )
+                    .await;
+                return match call {
+                    Ok(Call::Ok(StatusCode::OK, _, bytes)) => serde_json::from_slice(&bytes)
+                        .map_err(|e| ProvisionError::Unavailable(format!("provision response: {e}"))),
+                    Ok(Call::Unauthorized) => {
+                        self.rejoin(generation).await;
+                        continue;
+                    }
+                    Ok(Call::Ok(status, _, bytes)) => {
+                        let why = String::from_utf8_lossy(&bytes[..bytes.len().min(300)]).trim().to_string();
+                        if status == StatusCode::FORBIDDEN || status == StatusCode::BAD_REQUEST {
+                            Err(ProvisionError::Refused(why))
+                        } else {
+                            Err(ProvisionError::Unavailable(format!("{status}: {why}")))
+                        }
+                    }
+                    Err(e) => Err(ProvisionError::Unavailable(e)),
+                };
+            }
+            Err(ProvisionError::Unavailable("no control-plane session".into()))
+        })
     }
 }
 
