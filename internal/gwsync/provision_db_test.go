@@ -442,3 +442,25 @@ func TestProvisionIssuerUnavailable(t *testing.T) {
 		t.Fatalf("wrong audience: %d %s", code, b)
 	}
 }
+
+// TestProvisionNeedsALiveSchema2Session: a 0.2.x session can't provision, nor
+// can the session of an instance that has been removed.
+func TestProvisionNeedsALiveSchema2Session(t *testing.T) {
+	e := newProvisionEnv(t)
+	tok := e.idp.sign(t, e.idp.key, map[string]any{"email": e.email("sess")})
+	old := e.s.newSession(peer{instance: e.instance, group: e.groupID, schema: 1}).Session
+	if code, body := e.post("/gw/v1/provision", old, map[string]string{"token": tok}); code != http.StatusBadRequest {
+		t.Fatalf("schema 1 session: %d %s", code, body)
+	}
+	if _, err := e.st.Pool.Exec(e.ctx, `DELETE FROM gateway_instances WHERE id=$1`, e.instance); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := e.post("/gw/v1/provision", e.session, map[string]string{"token": tok}); code != http.StatusUnauthorized {
+		t.Fatalf("removed instance: %d %s", code, body)
+	}
+	var n int
+	e.st.Pool.QueryRow(e.ctx, `SELECT count(*) FROM users WHERE email=$1`, e.email("sess")).Scan(&n)
+	if n != 0 {
+		t.Fatal("a refused session created a user")
+	}
+}

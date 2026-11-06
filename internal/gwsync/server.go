@@ -401,6 +401,11 @@ func (s *Server) provision(w http.ResponseWriter, r *http.Request, p peer) {
 		http.Error(w, "too many provisioning requests from this gateway", http.StatusTooManyRequests)
 		return
 	}
+	// Identity tokens came with schema 2: an older session never provisions.
+	if p.schema < 2 {
+		http.Error(w, "provisioning needs a schema 2 session: join again", http.StatusBadRequest)
+		return
+	}
 	snap := s.Snapshots.Get()
 	if snap == nil {
 		http.Error(w, "control plane starting", http.StatusServiceUnavailable)
@@ -409,6 +414,19 @@ func (s *Server) provision(w http.ResponseWriter, r *http.Request, p peer) {
 	g := snap.GatewayGroups[p.group]
 	if g == nil {
 		http.Error(w, "gateway group removed", http.StatusUnauthorized)
+		return
+	}
+	// Sessions are signed, not stored: a removed instance's session lasts
+	// until it expires, so check the instance as renew does.
+	var one int
+	if err := s.Store.Pool.QueryRow(r.Context(),
+		`SELECT 1 FROM gateway_instances WHERE id=$1 AND group_id=$2`, p.instance, p.group).Scan(&one); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Error("gateway provisioning failed", "instance", p.instance, "err", err)
+			http.Error(w, "provisioning failed", http.StatusServiceUnavailable)
+			return
+		}
+		http.Error(w, "instance removed: join again", http.StatusUnauthorized)
 		return
 	}
 	var req struct {
