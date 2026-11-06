@@ -3,10 +3,11 @@
 //! content scopes of the destinations that take the group's traffic with
 //! content. Also the caller's W3C traceparent (internal/gateway/traceparent.go).
 //!
-//! The control plane decides again, per destination, what each one receives;
-//! the gateway's verdict can only take away. It matters most for content: the
-//! gateway captures it only when the policy does and some destination would
-//! take it, so a request nobody wants content of costs nothing extra.
+//! The gateway's verdict decides only what content it captures: it captures
+//! content only when the policy does and some destination would take it, so a
+//! request nobody wants content of costs nothing extra. The verdict doesn't
+//! travel with the event: the control plane decides export, content and rule
+//! again for each event, then per destination what each one receives.
 
 use std::sync::Arc;
 

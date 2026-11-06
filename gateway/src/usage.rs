@@ -67,15 +67,10 @@ pub struct Event {
     /// The pricing cost_usd was computed with (usage.CostBasisCurrent).
     #[serde(skip_serializing_if = "is_zero_u8")]
     pub cost_basis: u8,
-    /// The gateway's telemetry verdict. The control plane decides again and
-    /// can only take away from it.
-    #[serde(skip_serializing_if = "is_false")]
-    pub export: bool,
-    #[serde(skip_serializing_if = "is_false")]
-    pub capture_content: bool,
-    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "arc_str")]
-    pub rule_id: Option<Arc<str>>,
-    /// Captured content: only when the verdict captures it.
+    /// Captured content: only when the gateway's verdict captures it. The
+    /// verdict itself doesn't travel: the control plane decides export,
+    /// content and rule again for every event it receives, and its decision
+    /// alone counts.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub content: Option<Box<Content>>,
 }
@@ -149,9 +144,6 @@ fn hex_trace<S: Serializer>(n: &u128, s: S) -> Result<S::Ok, S::Error> {
 }
 fn hex_span<S: Serializer>(n: &u64, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(std::str::from_utf8(&telemetry::hex64(*n)).unwrap_or_default())
-}
-fn arc_str<S: Serializer>(v: &Option<Arc<str>>, s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(v.as_deref().unwrap_or_default())
 }
 
 /// Events waiting for the next sync. When the control plane is unreachable for
@@ -255,7 +247,6 @@ impl Event {
     /// ones, but content, most of a large event, is never underestimated.
     pub fn encoded_size(&self) -> usize {
         self.content.as_ref().map_or(0, |c| c.encoded_size())
-            + self.rule_id.as_ref().map_or(0, |r| r.len() + 14)
             + self.reported.as_ref().map_or(0, |_| 100)
             + if self.parent_span_id != 0 { 38 } else { 0 }
             + 560
@@ -675,9 +666,6 @@ impl Emit {
             reported: (!u.geo.is_empty() || !u.speed.is_empty())
                 .then(|| Box::new(Reported { inference_geo: u.geo, speed: u.speed })),
             cost_basis: 0,
-            export: self.verdict.decision.export,
-            capture_content: self.verdict.decision.capture_content,
-            rule_id: self.verdict.decision.rule_id,
             content,
         };
         if let Some(d) = &self.deployment {
@@ -813,9 +801,6 @@ mod tests {
                 speed: Tag::new("standard"),
             })),
             cost_basis: 1,
-            export: true,
-            capture_content: true,
-            rule_id: Some("4b7c3a1e-0000-4000-8000-000000000005".into()),
             stream: true,
             ..event("")
         };
@@ -856,9 +841,6 @@ mod tests {
                     speed: Tag::new("standard"),
                 })),
                 cost_basis: 1,
-                export: true,
-                capture_content: true,
-                rule_id: Some("4b7c3a1e-0000-4000-8000-000000000005".into()),
                 content: content(&input, Some(&serde_json::to_string(&nasty).unwrap()), &nasty),
                 ..event("")
             },
@@ -875,8 +857,6 @@ mod tests {
             trace_id: 0x4bf92f3577b34da6a3ce929d0e0e4736,
             operation: Operation::Chat,
             reported: Some(Box::new(Reported { inference_geo: Tag::new("us"), ..Reported::default() })),
-            rule_id: Some("r1".into()),
-            export: true,
             content: content(r#"[{"role":"user","content":"hi"}]"#, None, "answer"),
             ..event("s")
         };
@@ -885,7 +865,7 @@ mod tests {
         assert!(v.get("parent_span_id").is_none() && v.get("speed").is_none() && v.get("system").is_none());
         assert_eq!(v["operation"], "chat");
         assert_eq!(v["inference_geo"], "us");
-        assert_eq!((v["export"].clone(), v["rule_id"].clone()), (true.into(), "r1".into()));
+        assert!(v.get("export").is_none() && v.get("rule_id").is_none(), "the control plane decides those");
         assert!(v.get("capture_content").is_none() && v.get("cost_basis").is_none());
         assert_eq!(v["input"][0]["content"], "hi");
         assert_eq!(v["output"], "answer");

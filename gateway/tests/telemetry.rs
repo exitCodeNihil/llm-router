@@ -174,7 +174,6 @@ async fn captures_content_within_the_cap() {
                 let e = &evs[0];
                 assert_eq!(e.trace_id, 0x4bf92f3577b34da6a3ce929d0e0e4736, "{what}");
                 assert_eq!(e.parent_span_id, 0x00f067aa0ba902b7, "{what}");
-                assert!(e.export && e.capture_content && e.rule_id.is_none(), "{what}");
                 assert_eq!((e.operation.as_str(), e.cost_basis), ("chat", 1), "{what}");
                 if flavor == "anthropic" {
                     assert_eq!(e.reported.as_ref().unwrap().inference_geo.as_str(), "us", "{what}");
@@ -221,7 +220,6 @@ async fn content_leak_table() {
                     let e = &evs[0];
                     let want = capture && rule == "inherit" && scope;
                     assert_eq!(e.content.is_some(), want, "{what}");
-                    assert_eq!(e.export, rule != "no_export", "{what}");
                     if want {
                         assert_eq!(e.content.as_ref().unwrap().output, TEXT, "{what}");
                     }
@@ -251,8 +249,7 @@ async fn traceparent_places_but_never_decides() {
     assert_eq!(h["x-llmr-trace-id"], "4bf92f3577b34da6a3ce929d0e0e4736");
     let e = &events(model)[0];
     assert_eq!((e.trace_id, e.parent_span_id), (0x4bf92f3577b34da6a3ce929d0e0e4736, 0x00f067aa0ba902b7));
-    assert!(e.export && e.capture_content && e.content.is_some(), "the policy decides, not the caller");
-    assert_eq!(e.rule_id.as_deref(), Some("r-prod"));
+    assert!(e.content.is_some(), "the policy decides, not the caller");
 
     let (_, h, _) = call(format!("{gw}/v1/messages"), &body, Some("00-nonsense")).await;
     let id = h["x-llmr-trace-id"].to_str().unwrap().to_string();
@@ -261,7 +258,7 @@ async fn traceparent_places_but_never_decides() {
     let e = &events(model)[0];
     assert_eq!(format!("{:032x}", e.trace_id), id);
     assert_eq!(e.parent_span_id, 0);
-    assert!(e.export && e.content.is_some(), "a tag rule with content, sampled at 100");
+    assert!(e.content.is_some(), "a tag rule with content, sampled at 100");
 
     // Every authenticated response names its trace, not only the proxied ones.
     let req = Request::get(format!("{gw}/v1/models")).header("x-llmr-key", KEY).body(Full::new(Bytes::new())).unwrap();
@@ -289,7 +286,7 @@ async fn capture_off_captures_nothing() {
             let (status, _, _) = call(format!("{gw}{path}"), &body, None).await;
             assert_eq!(status, 200);
             let e = &events(&model)[0];
-            assert!(e.export && !e.capture_content && e.content.is_none(), "{model} stream={stream}");
+            assert!(e.content.is_none(), "{model} stream={stream}");
         }
     }
 }
