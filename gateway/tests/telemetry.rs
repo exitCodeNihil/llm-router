@@ -20,9 +20,10 @@ use tokio::net::TcpListener;
 
 const KEY: &str = "llmr_telemetrykey";
 const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-/// What every stub answer says, 100 bytes.
+/// What every stub answer says, 100 bytes. No hex digits, so it can't turn
+/// up in a request or trace id by chance.
 const TEXT: &str =
-    "0123456789abcdefghij0123456789abcdefghij0123456789abcdefghij0123456789abcdefghij0123456789abcdefghij";
+    "pqrstuvwxyPQRSTUVWXYpqrstuvwxyPQRSTUVWXYpqrstuvwxyPQRSTUVWXYpqrstuvwxyPQRSTUVWXYpqrstuvwxyPQRSTUVWXY";
 
 /// The usage queue is the process's: one test at a time takes from it.
 static QUEUE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -142,7 +143,9 @@ fn events(model: &str) -> Vec<Event> {
     mine
 }
 
-const MESSAGES: &str = r#"[{"role":"user", "content":"hi"}]"#;
+/// The prompt's text is a marker no id can contain either.
+const PROMPT: &str = "zqxprompt";
+const MESSAGES: &str = r#"[{"role":"user", "content":"zqxprompt"}]"#;
 const SYSTEM: &str = r#""be brief""#;
 
 /// Input, system and output, each within the cap, on both surfaces, from both
@@ -185,7 +188,7 @@ async fn captures_content_within_the_cap() {
 
                 let v: Value = serde_json::to_value(e).unwrap();
                 assert_eq!(v["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736", "{what}");
-                assert_eq!(v["input"][0]["content"], "hi", "{what}");
+                assert_eq!(v["input"][0]["content"], PROMPT, "{what}");
                 assert_eq!(v["output"], &TEXT[..cap], "{what}");
                 assert_eq!(v["content_truncated"], true, "{what}");
             }
@@ -223,7 +226,7 @@ async fn content_leak_table() {
                         assert_eq!(e.content.as_ref().unwrap().output, TEXT, "{what}");
                     }
                     let raw = serde_json::to_string(e).unwrap();
-                    assert_eq!(raw.contains("hi") || raw.contains("0123"), want, "{what}: {raw}");
+                    assert_eq!(raw.contains(PROMPT) || raw.contains(&TEXT[..10]), want, "{what}: {raw}");
                 }
             }
         }
