@@ -345,6 +345,20 @@ pub fn requeue(events: Vec<Event>) {
     }
 }
 
+/// Take the captured content out of events, keeping their usage, marked
+/// truncated, and count them; how many had any.
+pub fn strip_content(events: &mut [Event]) -> usize {
+    let mut n = 0;
+    for c in events.iter_mut().filter_map(|e| e.content.as_mut()) {
+        if c.input.is_some() || c.system.is_some() || !c.output.is_empty() {
+            **c = Content { content_truncated: true, ..Content::default() };
+            n += 1;
+        }
+    }
+    CONTENT_STRIPPED.fetch_add(n as u64, Ordering::Relaxed);
+    n
+}
+
 pub fn queued() -> usize {
     queue().lock().unwrap().events.len()
 }
@@ -781,7 +795,7 @@ impl Emit {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::Wire;
 
@@ -791,7 +805,7 @@ mod tests {
 
     #[test]
     fn requeued_events_go_out_first_in_order() {
-        let _q = QUEUE.lock().unwrap();
+        let _q = hold_queue();
         push(event("c"));
         requeue(vec![event("a"), event("b")]);
         let ids: Vec<_> = take(usize::MAX, usize::MAX)
@@ -836,12 +850,18 @@ mod tests {
         assert!(v.get("output").is_none() && v.get("input").is_none());
     }
 
-    /// Tests that use the process-wide queue, one at a time.
+    /// Tests that use the process-wide queue or content budget, one at a time.
     static QUEUE: Mutex<()> = Mutex::new(());
+
+    /// Hold the process-wide queue; a test that failed holding it doesn't
+    /// fail the others.
+    pub(crate) fn hold_queue() -> std::sync::MutexGuard<'static, ()> {
+        QUEUE.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn the_queue_counts_its_content() {
-        let _q = QUEUE.lock().unwrap();
+        let _q = hold_queue();
         let before = queued_content();
         push(Event { model_name: "budget-test".into(), content: content("[1]", Some(r#""s""#), "out"), ..event("b") });
         // other tests share the queue: only ours is known to be there
@@ -951,7 +971,7 @@ mod tests {
         c.seal();
         c.output = "x".repeat(1000);
         assert_eq!(c.encoded_size(), measured, "kept, not counted again");
-        let _q = QUEUE.lock().unwrap();
+        let _q = hold_queue();
         push(Event { model_name: "sealed-test".into(), content: content("[1]", None, "a\nb"), ..event("s") });
         let (mine, rest): (Vec<Event>, Vec<Event>) =
             take(usize::MAX, usize::MAX).into_iter().partition(|e| e.model_name == "sealed-test");
@@ -1089,7 +1109,7 @@ mod tests {
     /// when the request ends without one.
     #[test]
     fn requests_in_flight_reserve_their_content() {
-        let _q = QUEUE.lock().unwrap();
+        let _q = hold_queue();
         let body = br#"{"system":"s","messages":[{"role":"user","content":"hello"}]}"#;
         let (before, queued) = (reserved_content(), queued_content());
         assert!(before + queued < CONTENT_BUDGET / 4, "{before} {queued}");

@@ -31,7 +31,8 @@ pub const VERSION: &str = match option_env!("LLMR_VERSION") {
 /// count captured content, escapes included, and one event holds under 10 MiB
 /// of it (three parts of at most 1 MiB, the output up to 6x once escaped), so
 /// even a batch of one fits. A proxy that refuses a batch as too large (413) halves the cap, down
-/// to MIN_BATCH_BYTES.
+/// to MIN_BATCH_BYTES; refused there, the batch goes without its content, then halved, and an
+/// event refused even alone, without content, is dropped.
 const MAX_BATCH: usize = 50_000;
 const MAX_BATCH_BYTES: usize = 16 << 20;
 const MIN_BATCH_BYTES: usize = 64 << 10;
@@ -305,7 +306,6 @@ impl ControlPlane {
             let events = usage::take(MAX_BATCH, s.max_bytes());
             let (rates, scopes) = limits::freeze();
             s.batch += 1;
-            let (batch, cursor) = (s.batch, s.cursor.clone());
             let mem = crate::resources::memory();
             let stats = Stats {
                 version: VERSION,
@@ -318,20 +318,8 @@ impl ControlPlane {
                 cpu_pct: crate::resources::cpu_pct(),
                 leaving: self.leaving.load(Ordering::Relaxed),
             };
-            // Encoding a large batch takes milliseconds: keep it off the request
-            // threads. JSON first, then one gzip pass; serde's many small writes
-            // straight into the encoder cost ~50x more.
-            let body = tokio::task::spawn_blocking(move || {
-                let req = SyncRequest { batch, cursor: &cursor, events: &events, rates: &rates, stats };
-                let json = serde_json::to_vec(&req).map_err(std::io::Error::other)?;
-                let mut gz =
-                    flate2::write::GzEncoder::new(Vec::with_capacity(json.len() / 8), flate2::Compression::fast());
-                gz.write_all(&json)?;
-                Ok::<_, std::io::Error>((gz.finish()?, events))
-            })
-            .await;
-            let Ok(Ok((body, events))) = body else { return false };
-            s.pending = Some(Batch { body: body.into(), scopes, events });
+            let frozen = Frozen { batch: s.batch, cursor: s.cursor.clone(), events, rates, stats };
+            s.pending = Batch::build(frozen, scopes).await;
         }
         let Some(batch) = &s.pending else { return false };
         let (session, generation) = self.session();
@@ -360,13 +348,19 @@ impl ControlPlane {
                     s.limit_bytes = Some(s.max_bytes() / 2);
                     eprintln!("sync: {status}; sending batches of at most {} bytes", s.max_bytes());
                     limits::discard(&batch.scopes);
-                    usage::requeue(batch.events);
+                    usage::requeue(batch.frozen.events);
+                } else if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    // Refused at the smallest batch: resending it as is would
+                    // hold back every later event, and the limit counters.
+                    let Some(batch) = s.pending.take() else { return false };
+                    s.pending = batch.smaller().await;
                 } else if refused(status) {
                     // Resending the same bytes would be refused again and hold
                     // back every later event: drop this batch and move on.
                     let Some(batch) = s.pending.take() else { return false };
-                    metrics::SYNC_REFUSED_EVENTS.fetch_add(batch.events.len() as u64, Ordering::Relaxed);
-                    eprintln!("sync: {status}: {why}; dropping a batch of {} events", batch.events.len());
+                    let n = batch.frozen.events.len();
+                    metrics::SYNC_REFUSED_EVENTS.fetch_add(n as u64, Ordering::Relaxed);
+                    eprintln!("sync: {status}: {why}; dropping a batch of {n} events");
                     limits::discard(&batch.scopes);
                 } else {
                     eprintln!("sync: {status}: {why}");
@@ -442,12 +436,76 @@ impl Syncer {
     }
 }
 
-/// A frozen upload, resent as is until acknowledged. Its events are kept to
-/// be queued again if the batch turns out to be too large to send.
+/// A frozen upload, resent as is until acknowledged. What it was built from is
+/// kept, to queue its events again or build it smaller if it turns out to be
+/// too large to send.
 struct Batch {
     body: Bytes,
     scopes: Vec<Arc<limits::Scope>>,
+    frozen: Frozen,
+}
+
+/// A batch's contents: the same number, cursor and rates however it is built.
+struct Frozen {
+    batch: i64,
+    cursor: String,
     events: Vec<Event>,
+    rates: Vec<RateDelta>,
+    stats: Stats,
+}
+
+impl Batch {
+    /// Encode a batch. Encoding a large one takes milliseconds: keep it off
+    /// the request threads. JSON first, then one gzip pass; serde's many small
+    /// writes straight into the encoder cost ~50x more.
+    async fn build(frozen: Frozen, scopes: Vec<Arc<limits::Scope>>) -> Option<Batch> {
+        let body = tokio::task::spawn_blocking(move || {
+            let f = &frozen;
+            let req =
+                SyncRequest { batch: f.batch, cursor: &f.cursor, events: &f.events, rates: &f.rates, stats: &f.stats };
+            let gz = (|| {
+                let json = serde_json::to_vec(&req).map_err(std::io::Error::other)?;
+                let mut gz =
+                    flate2::write::GzEncoder::new(Vec::with_capacity(json.len() / 8), flate2::Compression::fast());
+                gz.write_all(&json)?;
+                gz.finish()
+            })();
+            (gz, frozen)
+        })
+        .await;
+        match body {
+            Ok((Ok(body), frozen)) => Some(Batch { body: body.into(), scopes, frozen }),
+            _ => {
+                eprintln!("sync: could not encode a batch");
+                limits::discard(&scopes);
+                None
+            }
+        }
+    }
+
+    /// The batch smaller, after a 413 at the smallest batch size: without its
+    /// events' content; already without, its first half, the rest put back
+    /// in the queue; down to one event, without that event, which is dropped
+    /// and counted. The batch number, cursor and rates stay.
+    async fn smaller(mut self) -> Option<Batch> {
+        let f = &mut self.frozen;
+        let stripped = usage::strip_content(&mut f.events);
+        if stripped > 0 {
+            eprintln!("sync: 413 at the smallest batch size; sending {stripped} events without their content");
+        } else if f.events.len() > 1 {
+            eprintln!(
+                "sync: 413 at the smallest batch size; sending {} of its {} events",
+                f.events.len() / 2,
+                f.events.len()
+            );
+            usage::requeue(f.events.split_off(f.events.len() / 2));
+        } else {
+            metrics::SYNC_REFUSED_EVENTS.fetch_add(f.events.len() as u64, Ordering::Relaxed);
+            eprintln!("sync: 413 for a single event without content; dropping it");
+            f.events.clear();
+        }
+        Batch::build(self.frozen, self.scopes).await
+    }
 }
 
 /// Whether the control plane refused a batch for good: it answers 400 when it
@@ -464,7 +522,7 @@ struct SyncRequest<'a> {
     cursor: &'a str,
     events: &'a [Event],
     rates: &'a [RateDelta],
-    stats: Stats,
+    stats: &'a Stats,
 }
 
 #[derive(Serialize)]
@@ -508,37 +566,43 @@ fn is_local(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usage::tests::{emit_capturing, hold_queue};
     use std::sync::Mutex;
 
-    /// A control plane that records each sync's batch number and fails the
-    /// second sync.
-    async fn recording_cp() -> (String, Arc<Mutex<Vec<i64>>>) {
+    /// What a mock control plane saw of a sync: its batch number, its JSON,
+    /// and the status it answered.
+    type Seen = Arc<Mutex<Vec<(i64, serde_json::Value, u16)>>>;
+
+    /// A control plane answering each sync with `status(n, json size)`, n
+    /// counting syncs from 1.
+    async fn mock_cp(status: impl Fn(usize, usize) -> u16 + Send + Sync + 'static) -> (String, Seen) {
         use hyper::service::service_fn;
         use hyper_util::rt::{TokioExecutor, TokioIo};
         use std::io::Read;
-        let seen = Arc::new(Mutex::new(Vec::new()));
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let seen: Seen = Default::default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        let s = seen.clone();
+        let (s, status) = (seen.clone(), Arc::new(status));
         tokio::spawn(async move {
             while let Ok((conn, _)) = listener.accept().await {
-                let s = s.clone();
+                let (s, status) = (s.clone(), status.clone());
                 tokio::spawn(async move {
                     let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
-                        let s = s.clone();
+                        let (s, status) = (s.clone(), status.clone());
                         async move {
                             let gz = req.into_body().collect().await.unwrap().to_bytes();
                             let mut json = Vec::new();
                             flate2::read::GzDecoder::new(&gz[..]).read_to_end(&mut json).unwrap();
                             let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
-                            let n = {
+                            let code = {
                                 let mut seen = s.lock().unwrap();
-                                seen.push(v["batch"].as_i64().unwrap());
-                                seen.len()
+                                let code = status(seen.len() + 1, json.len());
+                                seen.push((v["batch"].as_i64().unwrap(), v, code));
+                                code
                             };
-                            let status = if n == 2 { 503 } else { 200 };
                             Ok::<_, std::convert::Infallible>(
-                                http::Response::builder().status(status).body(Full::new(Bytes::from("{}"))).unwrap(),
+                                http::Response::builder().status(code).body(Full::new(Bytes::from("{}"))).unwrap(),
                             )
                         }
                     });
@@ -554,16 +618,65 @@ mod tests {
     // The control plane skips a batch number it has already stored and still
     // answers 200: a shutdown flush that counted from 1 again lost its events.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the usage queue is the process's: one test at a time
     async fn the_shutdown_flush_continues_the_batch_sequence() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let (url, seen) = recording_cp().await;
+        let _q = hold_queue();
+        let (url, seen) = mock_cp(|n, _| if n == 2 { 503 } else { 200 }).await;
         let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into());
         assert!(cp.sync_once(&mut *cp.syncer.lock().await).await);
         assert!(!cp.sync_once(&mut *cp.syncer.lock().await).await, "the mock fails the second sync");
         cp.flush(Instant::now() + Duration::from_secs(5)).await;
-        let seen = seen.lock().unwrap().clone();
+        let seen: Vec<i64> = seen.lock().unwrap().iter().map(|(b, _, _)| *b).collect();
         assert_eq!(&seen[..3], &[1, 2, 2], "the unacknowledged batch is resent as is: {seen:?}");
         assert!(seen.windows(2).all(|w| w[0] <= w[1]), "never counts from 1 again: {seen:?}");
+    }
+
+    /// A proxy that refuses batches over a size even at the smallest batch
+    /// size: the batch goes without its content, then halved, and an event
+    /// too large alone is dropped, so the rest, and the limit counters, flow.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // the usage queue is the process's: one test at a time
+    async fn a_413_at_the_smallest_batch_never_blocks_the_sync() {
+        let _q = hold_queue();
+        let (url, seen) = mock_cp(|_, size| if size > 3000 { 413 } else { 200 }).await;
+        drop(usage::take(usize::MAX, usize::MAX));
+        let send = |model: &str, cap: usize, output: &str| {
+            let mut em = emit_capturing(model, cap);
+            em.capture_request(br#"{"messages":[{"role":"user","content":"q"}]}"#, false);
+            let json = serde_json::json!({"choices": [{"message": {"content": output}}]}).to_string();
+            em.set_output(crate::translate::oai_json_text(json.as_bytes(), cap));
+            em.send(200, "", Default::default(), 0);
+        };
+        send("small-1", 1 << 20, "answer");
+        send("big", 1 << 20, &"x".repeat(10_000));
+        send(&"too-large-".repeat(500), 0, "");
+        send("small-2", 1 << 20, "answer");
+        let (stripped, refused) =
+            (usage::CONTENT_STRIPPED.load(Ordering::Relaxed), metrics::SYNC_REFUSED_EVENTS.load(Ordering::Relaxed));
+
+        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into());
+        let mut s = cp.syncer.lock().await;
+        s.limit_bytes = Some(MIN_BATCH_BYTES);
+        for _ in 0..20 {
+            if cp.sync_once(&mut s).await && usage::queued() == 0 {
+                break;
+            }
+        }
+        assert!(s.pending.is_none() && usage::queued() == 0, "{:?}", seen.lock().unwrap());
+        let seen = seen.lock().unwrap();
+        let accepted: Vec<_> = seen.iter().filter(|(_, _, code)| *code == 200).collect();
+        assert!(accepted.windows(2).all(|w| w[0].0 < w[1].0), "each batch once, in order");
+        let events: Vec<&serde_json::Value> =
+            accepted.iter().flat_map(|(_, v, _)| v["events"].as_array().unwrap()).collect();
+        let models: Vec<&str> = events.iter().map(|e| e["model_name"].as_str().unwrap()).collect();
+        assert_eq!(models, ["small-1", "big", "small-2"], "the one too large alone is dropped");
+        for e in events {
+            assert!(e["content_truncated"] == true && e.get("input").is_none() && e.get("output").is_none(), "{e}");
+        }
+        assert!(seen.iter().any(|(_, v, code)| *code == 413 && v["events"].as_array().unwrap().len() == 1));
+        // other tests count too
+        assert!(usage::CONTENT_STRIPPED.load(Ordering::Relaxed) - stripped >= 3);
+        assert_eq!(metrics::SYNC_REFUSED_EVENTS.load(Ordering::Relaxed) - refused, 1);
     }
 
     #[test]
