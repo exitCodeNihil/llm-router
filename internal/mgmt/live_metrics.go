@@ -2,10 +2,8 @@ package mgmt
 
 import (
 	"net/http"
-	"sort"
 	"time"
 
-	"github.com/exitcodenihil/llm-router/internal/gwsync"
 	"github.com/exitcodenihil/llm-router/internal/metrics"
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
 )
@@ -138,7 +136,7 @@ func (m *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	// Gateway instances sync every 2 s, so a few missed syncs already mean trouble.
 	rows, _ := listRows(r.Context(), m.Store.Pool,
-		`SELECT i.id, i.name, g.name AS group_name, g.region, i.last_seen_at
+		`SELECT i.id, i.name, i.group_id, g.name AS group_name, g.region, i.last_seen_at
 		FROM gateway_instances i JOIN gateway_groups g ON g.id = i.group_id
 		WHERE i.last_seen_at > now() - interval '10 minutes' ORDER BY g.name, i.joined_at`)
 	for _, row := range rows {
@@ -159,7 +157,11 @@ func (m *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 			status = "warn"
 		}
 		gw := nodeRow(nm)
-		gw["unserved_providers"] = unservedProviders(m.Snapshots, nm.Schema)
+		groupID, _ := row["group_id"].(string)
+		gw["unserved_providers"] = []string{}
+		if m.GatewaySync != nil {
+			gw["unserved_providers"] = m.GatewaySync.UnservedProviders(groupID, nm.Schema)
+		}
 		p50 := 0
 		if m.Live != nil {
 			p50 = m.Live.NodeP50(id)
@@ -182,28 +184,6 @@ func (m *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"nodes": nodes, "cluster_events": events})
-}
-
-// unservedProviders names the providers with models that a gateway on this
-// config schema leaves out (Vertex and Entra on gateways older than 0.3), so
-// the Gateways page can say why those models fail there. Empty when the
-// schema is current or not yet known.
-func unservedProviders(h *snapshot.Holder, schema int) []string {
-	names := []string{}
-	if schema < 1 || h == nil || h.Get() == nil {
-		return names
-	}
-	seen := map[string]bool{}
-	for _, ds := range h.Get().DeploymentsByModel {
-		for _, d := range ds {
-			if p := d.Provider; p != nil && !seen[p.ID] && !gwsync.Servable(p, schema) {
-				seen[p.ID] = true
-				names = append(names, p.Name)
-			}
-		}
-	}
-	sort.Strings(names)
-	return names
 }
 
 // nodeRow is the ops part of a node's row on the Gateways page.

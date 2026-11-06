@@ -222,6 +222,18 @@ func (s *Server) config(w http.ResponseWriter, r *http.Request, p peer) {
 
 // encoded returns the group's config for this snapshot, building it once per
 // version.
+// UnservedProviders names the providers with models gateway group `group`
+// serves that a gateway on config schema `schema` is not sent (Vertex and
+// Entra before 0.3), from the config such a gateway gets. Empty for a current
+// or unknown schema.
+func (s *Server) UnservedProviders(group string, schema int) []string {
+	snap := s.Snapshots.Get()
+	if schema < 1 || schema >= schemaVersion || snap == nil || snap.GatewayGroups[group] == nil {
+		return []string{}
+	}
+	return slices.Clone(s.encoded(snap, group, schema).built.unserved)
+}
+
 func (s *Server) encoded(snap *snapshot.Snapshot, group string, schema int) *encoded {
 	s.mu.Lock()
 	defer s.mu.Unlock()

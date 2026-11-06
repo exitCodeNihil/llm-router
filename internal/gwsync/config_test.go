@@ -138,6 +138,14 @@ func TestConfigCloudProvidersNeedSchema2(t *testing.T) {
 	if len(old.cfg.Deployments) != 3 || len(old.cfg.Providers) != 3 {
 		t.Errorf("schema 1 keeps the providers it can serve: %+v", old.cfg.Providers)
 	}
+	if got := strings.Join(old.unserved, ","); got != "adc,foundry,vertex" {
+		t.Errorf("schema 1 leaves out %q", got)
+	}
+	// A group whose teams can't reach those models was never going to get them.
+	teamA := &snapshot.GatewayGroup{ID: "ga", Name: "team-a", AllowedTeams: map[string]bool{"A": true}}
+	if got := buildConfig(s, teamA, 1).unserved; len(got) != 0 {
+		t.Errorf("team A's schema 1 gateway leaves out %v", got)
+	}
 
 	cur := buildConfig(s, g, schemaVersion)
 	got := map[string]Provider{}
@@ -152,6 +160,9 @@ func TestConfigCloudProvidersNeedSchema2(t *testing.T) {
 	}
 	if len(cur.cfg.Deployments) != 6 {
 		t.Errorf("schema 2 serves every deployment: %+v", cur.cfg.Deployments)
+	}
+	if len(cur.unserved) != 0 {
+		t.Errorf("schema 2 leaves out %v", cur.unserved)
 	}
 }
 

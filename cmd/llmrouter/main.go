@@ -171,8 +171,10 @@ func run() error {
 		TrustedProxies: cfg.TrustedProxies}
 	consoleAuth.Register(mux)
 	mg.TokenGuard = consoleAuth
-	(&gwsync.Server{Store: st, Snapshots: holder, Limits: lim, Export: usage.MultiWriter{exporter, live}, Nodes: nodeStore,
-		Key: auth.DeriveKey("llmr-gw-session", cfg.EncryptionKey)}).Register(mux)
+	gwSync := &gwsync.Server{Store: st, Snapshots: holder, Limits: lim, Export: usage.MultiWriter{exporter, live}, Nodes: nodeStore,
+		Key: auth.DeriveKey("llmr-gw-session", cfg.EncryptionKey)}
+	gwSync.Register(mux)
+	mg.GatewaySync = gwSync
 	mux.Handle("/", console.SPA())
 
 	gw.Register(mux)

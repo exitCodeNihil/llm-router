@@ -50,9 +50,13 @@ type Server struct {
 	}
 	Live      *metrics.Live
 	NodeStore *metrics.NodeStore
-	HTTP      *metrics.HTTP // the control plane's own listener
-	Events    *metrics.Events
-	Recorder  *telemetry.Recorder
+	// GatewaySync names the providers an older gateway is not sent.
+	GatewaySync interface {
+		UnservedProviders(group string, schema int) []string
+	}
+	HTTP     *metrics.HTTP // the control plane's own listener
+	Events   *metrics.Events
+	Recorder *telemetry.Recorder
 	// Telemetry reports destination health and trace links; nil when no
 	// exporter runs in-process.
 	Telemetry *telemetry.Manager
