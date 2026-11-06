@@ -424,9 +424,16 @@ func (s *Server) provision(w http.ResponseWriter, r *http.Request, p peer) {
 		}
 	})
 	vt, err := s.Tokens.Verify(r.Context(), snap, req.Token)
+	if auth.IssuerUnavailable(err) {
+		// Not a refusal: the gateway tries again in a few seconds.
+		slog.Error("identity token issuer unavailable", "instance", p.instance, "err", err)
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "identity token issuer unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	if err != nil {
 		slog.Warn("gateway sent an identity token that does not verify", "instance", p.instance, "err", err)
-		http.Error(w, "invalid identity token: "+err.Error(), http.StatusForbidden)
+		http.Error(w, "invalid identity token: "+auth.TokenErrorReason(err), http.StatusForbidden)
 		return
 	}
 	if u := snap.UsersByEmail[vt.Email]; u != nil {

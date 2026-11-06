@@ -69,5 +69,7 @@ curl https://router.example.com/v1/chat/completions -H "Authorization: Bearer $T
 the control plane for people they know. A gateway group limited to some teams serves their members,
 and creates new users only when **Map to team** is one of its teams. A new person's first request
 goes to the control plane once, which checks the token itself before it creates the user, so a
-gateway can't create users on its own. To map tokens to users, gateways get every user they serve
-and a hash of each email address, not the address.
+gateway can't create users on its own. The control plane must therefore reach the issuer too (its
+`/.well-known/openid-configuration` and `jwks_uri`): while it can't, new people's first requests
+fail, the gateway asks again a few seconds later, and nobody is refused for it. To map tokens to
+users, gateways get every user they serve and a hash of each email address, not the address.

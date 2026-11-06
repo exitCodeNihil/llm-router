@@ -91,7 +91,13 @@ func (g *Server) authenticate(next http.Handler) http.Handler {
 			var err error
 			id, err = g.CloudAuth(r.Context(), snap, token)
 			if err != nil {
-				writeAuthError(w, "invalid identity token: "+err.Error())
+				// The detail can name the issuer's URLs or a database error.
+				if auth.IssuerUnavailable(err) {
+					slog.Warn("identity token not verified", "err", err)
+				} else {
+					slog.Debug("identity token refused", "err", err)
+				}
+				writeAuthError(w, "invalid identity token: "+auth.TokenErrorReason(err))
 				return
 			}
 		}

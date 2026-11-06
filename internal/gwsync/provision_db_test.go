@@ -12,7 +12,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +33,8 @@ import (
 type testIssuer struct {
 	srv *httptest.Server
 	key *rsa.PrivateKey
+	// keysDown makes the JWKS endpoint fail.
+	keysDown atomic.Bool
 }
 
 func newTestIssuer(t *testing.T) *testIssuer {
@@ -48,6 +52,10 @@ func newTestIssuer(t *testing.T) *testIssuer {
 			"id_token_signing_alg_values_supported": []string{"RS256"}})
 	})
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
+		if ti.keysDown.Load() {
+			http.Error(w, "down", http.StatusBadGateway)
+			return
+		}
 		json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{
 			{Key: &key.PublicKey, KeyID: "k1", Algorithm: "RS256", Use: "sig"}}})
 	})
@@ -397,5 +405,40 @@ func TestProvisionExistingNonMember(t *testing.T) {
 	teams, _ = pgx.CollectRows(rows, pgx.RowTo[string])
 	if !slices.Equal(teams, []string{e.teamB}) {
 		t.Fatalf("provisioning changed an existing account's teams: %v", teams)
+	}
+}
+
+// TestProvisionIssuerUnavailable: the control plane failing to reach the
+// issuer is a 503 the gateway retries soon, not a refusal it keeps, and the
+// answer names no URL.
+func TestProvisionIssuerUnavailable(t *testing.T) {
+	e := newProvisionEnv(t)
+	e.idp.keysDown.Store(true)
+	tok := e.idp.sign(t, e.idp.key, map[string]any{"email": e.email("down")})
+	req, _ := http.NewRequest("POST", e.srv.URL+"/gw/v1/provision",
+		strings.NewReader(`{"token":"`+tok+`"}`))
+	req.Header.Set("Authorization", "Bearer "+e.session)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body bytes.Buffer
+	body.ReadFrom(res.Body)
+	res.Body.Close()
+	if res.StatusCode != http.StatusServiceUnavailable || res.Header.Get("Retry-After") == "" {
+		t.Fatalf("issuer keys down: %d (Retry-After %q) %s", res.StatusCode, res.Header.Get("Retry-After"), body.String())
+	}
+	if strings.Contains(body.String(), e.idp.srv.URL) {
+		t.Fatalf("the answer names the issuer's URL: %s", body.String())
+	}
+	e.idp.keysDown.Store(false)
+	if code, body := e.post("/gw/v1/provision", e.session, map[string]string{"token": tok}); code != 200 {
+		t.Fatalf("issuer back: %d %s", code, body)
+	}
+	// A refusal says why in a word, without the detail.
+	bad := e.idp.sign(t, e.idp.key, map[string]any{"email": e.email("down"), "aud": "other"})
+	code, b := e.post("/gw/v1/provision", e.session, map[string]string{"token": bad})
+	if code != http.StatusForbidden || strings.TrimSpace(string(b)) != "invalid identity token: wrong audience" {
+		t.Fatalf("wrong audience: %d %s", code, b)
 	}
 }

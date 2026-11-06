@@ -30,7 +30,7 @@ type CloudValidator struct {
 	Pool *pgxpool.Pool
 
 	mu        sync.Mutex
-	providers map[string]*oidc.Provider // issuer URL -> discovered provider
+	providers map[string]*issuerKeys // by issuer URL
 	cache     map[[32]byte]cachedID
 }
 
@@ -42,7 +42,7 @@ type cachedID struct {
 func NewCloudValidator(pool *pgxpool.Pool) *CloudValidator {
 	return &CloudValidator{
 		Pool:      pool,
-		providers: map[string]*oidc.Provider{},
+		providers: map[string]*issuerKeys{},
 		cache:     map[[32]byte]cachedID{},
 	}
 }
@@ -54,16 +54,53 @@ type Verified struct {
 	Expiry time.Time
 }
 
+// TokenError is why an identity token was refused. Reason is short and safe
+// to show the caller ("expired", "wrong audience"); Err has the detail, for
+// the log. Unavailable marks a failure on our side: the issuer's discovery
+// document or keys could not be fetched, so the token may well be good.
+type TokenError struct {
+	Reason      string
+	Unavailable bool
+	Err         error
+}
+
+func (e *TokenError) Error() string {
+	if e.Err == nil {
+		return e.Reason
+	}
+	return e.Reason + ": " + e.Err.Error()
+}
+
+func (e *TokenError) Unwrap() error { return e.Err }
+
+// TokenErrorReason is the part of an identity-token error a caller may see.
+func TokenErrorReason(err error) string {
+	if te, ok := errors.AsType[*TokenError](err); ok {
+		return te.Reason
+	}
+	return "invalid token"
+}
+
+// IssuerUnavailable reports whether err is the issuer's discovery or keys
+// failing to load, rather than the token being refused.
+func IssuerUnavailable(err error) bool {
+	te, ok := errors.AsType[*TokenError](err)
+	return ok && te.Unavailable
+}
+
+func refused(reason string, err error) *TokenError { return &TokenError{Reason: reason, Err: err} }
+
 // Verify checks a token against the configured issuer it names: the signature
 // against the issuer's published keys, expiry, audience, the issuer's match
-// claims and its email claim. It looks no user up and creates none.
+// claims and its email claim. It looks no user up and creates none. Its errors
+// are *TokenError.
 func (v *CloudValidator) Verify(ctx context.Context, s *snapshot.Snapshot, token string) (*Verified, error) {
 	if len(s.Issuers) == 0 {
-		return nil, fmt.Errorf("no token issuers configured")
+		return nil, refused("no token issuers configured", nil)
 	}
 	iss, err := unverifiedIssuer(token)
 	if err != nil {
-		return nil, err
+		return nil, refused("malformed token", err)
 	}
 	var issuer *snapshot.Issuer
 	for _, cand := range s.Issuers {
@@ -73,35 +110,87 @@ func (v *CloudValidator) Verify(ctx context.Context, s *snapshot.Snapshot, token
 		}
 	}
 	if issuer == nil {
-		return nil, fmt.Errorf("issuer %s is not configured", iss)
+		return nil, refused("unknown issuer", fmt.Errorf("issuer %s is not configured", iss))
 	}
 
-	provider, err := v.provider(ctx, issuer.IssuerURL)
+	ik, err := v.issuerKeys(ctx, issuer.IssuerURL)
 	if err != nil {
-		return nil, fmt.Errorf("issuer discovery failed: %w", err)
+		return nil, &TokenError{Reason: "issuer unavailable", Unavailable: true,
+			Err: fmt.Errorf("issuer discovery failed: %w", err)}
 	}
-	idToken, err := provider.Verifier(&oidc.Config{ClientID: issuer.Audience}).Verify(ctx, token)
+	keys := &watchedKeys{inner: ik.keys}
+	verifier := oidc.NewVerifier(issuer.IssuerURL, keys, &oidc.Config{ClientID: issuer.Audience, SupportedSigningAlgs: ik.algs})
+	idToken, err := verifier.Verify(ctx, token)
 	if err != nil {
-		return nil, err
+		if keys.fetchErr != nil {
+			return nil, &TokenError{Reason: "issuer unavailable", Unavailable: true,
+				Err: fmt.Errorf("issuer keys: %w", keys.fetchErr)}
+		}
+		return nil, refused(verifyReason(err), err)
 	}
 	var claims map[string]any
 	if err := idToken.Claims(&claims); err != nil {
-		return nil, err
+		return nil, refused("malformed token", err)
 	}
 	for claim, want := range issuer.Match {
 		if got, _ := claims[claim].(string); got != want {
-			return nil, fmt.Errorf("claim %s mismatch", claim)
+			return nil, refused("claim mismatch", fmt.Errorf("claim %s mismatch", claim))
 		}
 	}
 	emailClaim := issuer.EmailClaim
 	email, _ := claims[emailClaim].(string)
 	if email == "" {
-		return nil, fmt.Errorf("token has no %s claim", emailClaim)
+		return nil, refused("no email claim", fmt.Errorf("token has no %s claim", emailClaim))
 	}
 	return &Verified{Issuer: issuer, Email: strings.ToLower(email), Expiry: idToken.Expiry}, nil
 }
 
-// Validate implements gateway.CloudTokenValidator.
+// verifyReason names what go-oidc's verifier refused, for the caller.
+func verifyReason(err error) string {
+	if _, ok := errors.AsType[*oidc.TokenExpiredError](err); ok {
+		return "expired"
+	}
+	msg := err.Error()
+	for _, r := range []struct{ has, reason string }{
+		{"expected audience", "wrong audience"},
+		{"before the nbf", "not valid yet"},
+		{"issued by a different provider", "unknown issuer"},
+		{"unsupported algorithm", "unsupported signing algorithm"},
+		{"failed to verify signature", "bad signature"},
+		{"malformed", "malformed token"},
+	} {
+		if strings.Contains(msg, r.has) {
+			return r.reason
+		}
+	}
+	return "invalid token"
+}
+
+// issuerKeys is what verifying an issuer's tokens needs: its key set, from
+// the jwks_uri it publishes, and the algorithms it signs with.
+type issuerKeys struct {
+	keys *oidc.RemoteKeySet
+	algs []string
+}
+
+// watchedKeys records whether fetching the issuer's keys failed during one
+// verification: go-oidc reports that as a signature failure.
+type watchedKeys struct {
+	inner    oidc.KeySet
+	fetchErr error
+}
+
+func (w *watchedKeys) VerifySignature(ctx context.Context, jwt string) ([]byte, error) {
+	payload, err := w.inner.VerifySignature(ctx, jwt)
+	// RemoteKeySet wraps only a failed fetch ("fetching keys %w"); a token no
+	// key verifies, or a malformed one, is a plain error.
+	if err != nil && errors.Unwrap(err) != nil {
+		w.fetchErr = err
+	}
+	return payload, err
+}
+
+// Validate implements gateway.CloudTokenValidator. Its errors are *TokenError.
 func (v *CloudValidator) Validate(ctx context.Context, s *snapshot.Snapshot, token string) (*Identity, error) {
 	tokenHash := sha256.Sum256([]byte(token))
 	v.mu.Lock()
@@ -119,11 +208,14 @@ func (v *CloudValidator) Validate(ctx context.Context, s *snapshot.Snapshot, tok
 	user := s.UsersByEmail[email]
 	if user == nil {
 		if !issuer.AutoCreateUser || v.Pool == nil {
-			return nil, fmt.Errorf("no gateway user for %s", email)
+			return nil, refused("no gateway user for "+email, nil)
 		}
 		created, err := v.ProvisionUser(ctx, email, issuer.MapToTeam)
+		if errors.Is(err, ErrUserDisabled) {
+			return nil, refused(email+" is disabled", err)
+		}
 		if err != nil {
-			return nil, err
+			return nil, &TokenError{Reason: "could not create a user for " + email, Unavailable: true, Err: err}
 		}
 		user = created
 	}
@@ -145,18 +237,44 @@ func (v *CloudValidator) Validate(ctx context.Context, s *snapshot.Snapshot, tok
 	return id, nil
 }
 
-func (v *CloudValidator) provider(ctx context.Context, issuerURL string) (*oidc.Provider, error) {
+// issuerKeys discovers an issuer once. Discovery runs outside the lock, so a
+// slow issuer doesn't hold up cached tokens or other issuers.
+func (v *CloudValidator) issuerKeys(ctx context.Context, issuerURL string) (*issuerKeys, error) {
 	v.mu.Lock()
-	defer v.mu.Unlock()
-	if p, ok := v.providers[issuerURL]; ok {
-		return p, nil
+	ik := v.providers[issuerURL]
+	v.mu.Unlock()
+	if ik != nil {
+		return ik, nil
 	}
 	p, err := oidc.NewProvider(ctx, issuerURL)
 	if err != nil {
 		return nil, err
 	}
-	v.providers[issuerURL] = p
-	return p, nil
+	var d struct {
+		JWKSURL string   `json:"jwks_uri"`
+		Algs    []string `json:"id_token_signing_alg_values_supported"`
+	}
+	if err := p.Claims(&d); err != nil {
+		return nil, err
+	}
+	// What the issuer says it signs with, of what go-oidc verifies; RS256 when
+	// it doesn't say (NewVerifier's default).
+	var algs []string
+	for _, a := range d.Algs {
+		switch a {
+		case oidc.RS256, oidc.RS384, oidc.RS512, oidc.ES256, oidc.ES384, oidc.ES512,
+			oidc.PS256, oidc.PS384, oidc.PS512, oidc.EdDSA:
+			algs = append(algs, a)
+		}
+	}
+	ik = &issuerKeys{keys: oidc.NewRemoteKeySet(context.Background(), d.JWKSURL), algs: algs}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if cur := v.providers[issuerURL]; cur != nil {
+		return cur, nil
+	}
+	v.providers[issuerURL] = ik
+	return ik, nil
 }
 
 // ErrUserDisabled is returned for a disabled account: an identity token never
