@@ -150,18 +150,63 @@ try {
   const rows = await page.locator("tbody tr").count();
   check("drill-down shows matching rows", rows > 0, `${rows} rows`);
 
-  // ── Langfuse deep-link ──────────────────────────────────────────
-  const tel = await (await api.get(`${API}/api/settings/telemetry`, { headers: HEAD })).json();
-  if (tel.trace_base_url) {
-    check("telemetry exposes a trace URL prefix", /\/project\/.+\/traces\/$/.test(tel.trace_base_url), tel.trace_base_url);
-    const links = await page.getByRole("link", { name: "open" }).count();
-    check("request rows deep-link into Langfuse", links > 0, `${links} links`);
-    const href = await page.getByRole("link", { name: "open" }).first().getAttribute("href");
-    check("the link targets the request's own trace id", !!href && href.startsWith(tel.trace_base_url) && href.includes("req_"), href ?? "");
-    const res = await api.get(href);
-    check("that trace URL resolves", res.status() === 200, `status ${res.status()}`);
+  // ── Trace links ─────────────────────────────────────────────────
+  // Each enabled destination with a link template ({trace_id} in trace_url)
+  // links every row that has a trace id; Langfuse also links older rows by
+  // their request id, which its old exporter used as the trace id.
+  const destsRes = await api.get(`${API}/api/telemetry/destinations`, { headers: HEAD });
+  check("destinations list loads", destsRes.ok(), `status ${destsRes.status()}`);
+  const dests = destsRes.ok() ? await destsRes.json() : [];
+  const linked = dests.filter((d) => d.enabled && d.trace_url);
+  const openLinks = page.locator("tbody").getByRole("link", { name: "open", exact: true });
+  const openMenus = page.locator("tbody").getByRole("button", { name: "open", exact: true });
+  if (linked.length === 0) {
+    check("no trace column without a linked destination", (await page.getByRole("columnheader", { name: "Trace" }).count()) === 0);
+    check("no trace link without a linked destination", (await openLinks.count()) + (await openMenus.count()) === 0);
   } else {
-    check("no trace link when telemetry is not configured", (await page.getByRole("link", { name: "open" }).count()) === 0);
+    for (const d of linked) {
+      check(`${d.name}'s trace link is a template`, d.trace_url.includes("{trace_id}"), d.trace_url);
+    }
+    // The same rows the page shows: its own query string, as the console sends it.
+    const qs = new URL(page.url()).searchParams;
+    qs.set("limit", "50");
+    const reqRows = await (await api.get(`${API}/api/usage/requests?${qs}`, { headers: HEAD })).json();
+    const idsFor = (d) =>
+      reqRows.map((r) => r.trace_id ?? (d.kind === "langfuse" ? r.request_id : null)).filter(Boolean);
+    const expected = new Set(
+      linked.flatMap((d) => idsFor(d).map((id) => d.trace_url.replaceAll("{trace_id}", encodeURIComponent(id)))),
+    );
+    check("the trace column is shown", (await page.getByRole("columnheader", { name: "Trace" }).count()) > 0);
+    if (linked.length === 1) {
+      const linkable = idsFor(linked[0]).length;
+      const hrefs = await openLinks.evaluateAll((as) => as.map((a) => a.getAttribute("href")));
+      check(
+        "every row with a trace id links to it, and only those",
+        hrefs.length === linkable,
+        `${hrefs.length} links for ${linkable} of ${reqRows.length} rows with a trace id`,
+      );
+      const stray = hrefs.filter((h) => !expected.has(h));
+      check("each link fills the template with the row's own trace id", stray.length === 0, stray.slice(0, 2).join(" | "));
+      if (hrefs[0]) {
+        const res = await api.get(hrefs[0], { maxRedirects: 5 }).catch((e) => ({ status: () => e.message }));
+        check("that trace URL resolves", Number(res.status()) < 400, `status ${res.status()}`);
+      }
+    } else {
+      const menus = await openMenus.count();
+      const traced = reqRows.filter((r) => r.trace_id).length;
+      check("rows with a trace id offer a link per destination", menus === traced, `${menus} menus for ${traced} traced rows`);
+      if (menus > 0) {
+        await openMenus.first().click();
+        await page.waitForTimeout(300);
+        const items = await page.getByRole("menuitem").allTextContents();
+        check(
+          "the menu names each linked destination",
+          linked.every((d) => items.some((t) => t.includes(d.name))),
+          items.join(", "),
+        );
+        await page.keyboard.press("Escape");
+      }
+    }
   }
 
   check("no page errors", errors.length === 0, errors.slice(0, 2).join(" | "));

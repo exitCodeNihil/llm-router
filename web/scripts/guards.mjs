@@ -136,24 +136,25 @@ try {
   }
 
   // ── capture policy stays a draft ───────────────────────────────
-  const tel = await (await api.get(`${API}/api/settings/telemetry`, { headers: HEAD })).json();
+  // The policy is the body itself: {mode, capture_content, rules}; "" means everything.
+  const modeOf = async () => {
+    const res = await api.get(`${API}/api/settings/telemetry`, { headers: HEAD });
+    const body = await res.json();
+    if (!res.ok() || !("mode" in body)) throw new Error(`unexpected telemetry policy: ${JSON.stringify(body)}`);
+    return body.mode || "everything";
+  };
   await page.goto(`${BASE}/observability`, { waitUntil: "networkidle" });
   await page.waitForTimeout(700);
   const rg = page.locator('[role="radiogroup"]').first();
-  const savedMode = tel.telemetry?.mode || "everything";
+  const savedMode = await modeOf();
   await rg.getByRole("radio", { name: savedMode === "off" ? "Everything" : "Off" }).click();
   await page.waitForTimeout(500);
-  const still = await (await api.get(`${API}/api/settings/telemetry`, { headers: HEAD })).json();
-  check(
-    "changing capture mode does not save on click",
-    (still.telemetry?.mode || "everything") === savedMode,
-    `server says ${still.telemetry?.mode}`,
-  );
+  const still = await modeOf();
+  check("changing capture mode does not save on click", still === savedMode, `server says ${still}`);
   check("an explicit Apply is offered instead", await page.getByRole("button", { name: "Apply policy" }).isVisible());
   await page.getByRole("button", { name: "Discard" }).click();
   await page.waitForTimeout(400);
-  const restored = await (await api.get(`${API}/api/settings/telemetry`, { headers: HEAD })).json();
-  check("capture policy still stored as before", (restored.telemetry?.mode || "everything") === savedMode);
+  check("capture policy still stored as before", (await modeOf()) === savedMode);
 } finally {
   if (probeKeyId) {
     await api.delete(`${API}/api/keys/${probeKeyId}`, { headers: HEAD });
