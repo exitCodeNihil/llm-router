@@ -66,11 +66,28 @@ func TestDestinationsAPIAgainstPostgres(t *testing.T) {
 		t.Fatalf("kinds: %d %s", code, body)
 	}
 
+	// Scope values name teams and gateway groups that exist.
+	teamX, otherTeam, g1 := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	st.Pool.Exec(ctx, `INSERT INTO teams (id, name) VALUES ($1, $2), ($3, $4)`, teamX, "x-"+teamX, otherTeam, "o-"+otherTeam)
+	st.Pool.Exec(ctx, `INSERT INTO gateway_groups (id, name, join_token_hash) VALUES ($1, $2, $3)`, g1, "g-"+g1, []byte(g1))
+	missing := uuid.NewString()
+	for _, c := range []struct{ scopes, want string }{
+		{`"team_scope":{"mode":"selected","values":["` + missing + `"]}`, "unknown team " + missing},
+		{`"team_scope":{"mode":"except","values":["team-x"]}`, "unknown team team-x"},
+		{`"group_scope":{"mode":"selected","values":["_control_plane","` + missing + `"]}`, "unknown gateway group " + missing},
+		{`"group_scope":{"mode":"selected","values":["` + teamX + `"]}`, "unknown gateway group " + teamX},
+	} {
+		code, body := call("POST", "/api/telemetry/destinations", `{"name":"s","kind":"otlp","endpoint":"http://x",`+c.scopes+`}`)
+		if code != 400 || !strings.Contains(body, c.want) {
+			t.Errorf("%s: %d %s", c.scopes, code, body)
+		}
+	}
+
 	// Create: secrets and header values go in, and never come out.
 	code, body = call("POST", "/api/telemetry/destinations", `{"name":"Tempo","kind":"otlp","endpoint":"http://tempo:4318",
 		"config":{"trace_link":"http://grafana/explore?trace={trace_id}"},
 		"headers":[{"name":"Authorization","value":"Bearer t0ken"},{"name":"X-Scope-OrgID","value":"acme"}],
-		"team_scope":{"mode":"except","values":["team-x","team-x"]},"group_scope":{"mode":"selected","values":["_control_plane","g1"]}}`)
+		"team_scope":{"mode":"except","values":["`+teamX+`","`+teamX+`"]},"group_scope":{"mode":"selected","values":["_control_plane","`+g1+`"]}}`)
 	if code != 201 {
 		t.Fatalf("create: %d %s", code, body)
 	}
@@ -85,8 +102,8 @@ func TestDestinationsAPIAgainstPostgres(t *testing.T) {
 	v := list[0]
 	if v.ID != created.ID || v.Kind != "otlp" || !v.Enabled || v.ContentMode != "metadata_only" || v.MaxContentBytes != 65536 ||
 		strings.Join(v.Headers, ",") != "Authorization,X-Scope-OrgID" || len(v.SecretNames) != 0 ||
-		v.TeamScope.Mode != "except" || strings.Join(v.TeamScope.Values, ",") != "team-x" ||
-		strings.Join(v.GroupScope.Values, ",") != "_control_plane,g1" || v.Health.Status != "no_data" ||
+		v.TeamScope.Mode != "except" || strings.Join(v.TeamScope.Values, ",") != teamX ||
+		strings.Join(v.GroupScope.Values, ",") != "_control_plane,"+g1 || v.Health.Status != "no_data" ||
 		v.Config["trace_link"] != "http://grafana/explore?trace={trace_id}" {
 		t.Fatalf("view %+v", v)
 	}
@@ -219,7 +236,7 @@ func TestDestinationsAPIAgainstPostgres(t *testing.T) {
 	st.Pool.Exec(ctx, `INSERT INTO gateway_groups (id, name, join_token_hash) VALUES ($1, $2, $3)`, groupID, "g-"+groupID.String(), groupID[:])
 	// Back on the original key, so the secret is entered once more.
 	if code, body := call("PUT", "/api/telemetry/destinations/"+lfID, `{"name":"LF","kind":"langfuse","endpoint":"https://cloud.langfuse.com",
-		"config":{"public_key":"pk"},"secrets":{"secret_key":"sk-new"},"team_scope":{"mode":"selected","values":["`+teamID.String()+`","other"]},
+		"config":{"public_key":"pk"},"secrets":{"secret_key":"sk-new"},"team_scope":{"mode":"selected","values":["`+teamID.String()+`","`+otherTeam+`"]},
 		"group_scope":{"mode":"except","values":["`+groupID.String()+`"]}}`); code != 204 {
 		t.Fatalf("put scopes: %d %s", code, body)
 	}
@@ -229,7 +246,7 @@ func TestDestinationsAPIAgainstPostgres(t *testing.T) {
 	if code, body := call("DELETE", "/api/gateway-groups/"+groupID.String(), ""); code != 204 {
 		t.Fatalf("delete group: %d %s", code, body)
 	}
-	if d := stored(lfID); strings.Join(d.Teams.Values, ",") != "other" || len(d.Groups.Values) != 0 {
+	if d := stored(lfID); strings.Join(d.Teams.Values, ",") != otherTeam || len(d.Groups.Values) != 0 {
 		t.Fatalf("scopes after deletes: %+v %+v", d.Teams, d.Groups)
 	}
 

@@ -206,6 +206,9 @@ func (m *Server) createDestination(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d, err := req.destination(nil)
+	if err == nil {
+		err = m.checkScopes(r.Context(), d)
+	}
 	if err != nil {
 		httpError(w, http.StatusBadRequest, err.Error())
 		return
@@ -251,6 +254,9 @@ func (m *Server) putDestination(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d, err := req.destination(stored)
+	if err == nil {
+		err = m.checkScopes(r.Context(), d)
+	}
 	if err != nil {
 		httpError(w, http.StatusBadRequest, err.Error())
 		return
@@ -278,6 +284,52 @@ func (m *Server) putDestination(w http.ResponseWriter, r *http.Request) {
 	}
 	m.bump(r.Context())
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// checkScopes refuses scope values that name no team or gateway group.
+func (m *Server) checkScopes(ctx context.Context, d *snapshot.Destination) error {
+	for _, c := range []struct {
+		what, table string
+		values      []string
+	}{{"team", "teams", d.Teams.Values}, {"gateway group", "gateway_groups", d.Groups.Values}} {
+		var ids []uuid.UUID
+		for _, v := range c.values {
+			if v == snapshot.ControlPlaneGroup && c.table == "gateway_groups" {
+				continue
+			}
+			id, err := uuid.Parse(v)
+			if err != nil || id.String() != v {
+				return fmt.Errorf("unknown %s %s", c.what, v)
+			}
+			ids = append(ids, id)
+		}
+		if len(ids) == 0 {
+			continue
+		}
+		rows, err := m.Store.Pool.Query(ctx, `SELECT id FROM `+c.table+` WHERE id = ANY($1)`, ids)
+		if err != nil {
+			return err
+		}
+		found := map[uuid.UUID]bool{}
+		for rows.Next() {
+			var id uuid.UUID
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return err
+			}
+			found[id] = true
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, id := range ids {
+			if !found[id] {
+				return fmt.Errorf("unknown %s %s", c.what, id)
+			}
+		}
+	}
+	return nil
 }
 
 func destinationWriteError(w http.ResponseWriter, err error) {
