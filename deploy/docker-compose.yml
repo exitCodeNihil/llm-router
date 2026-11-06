@@ -39,20 +39,20 @@ services:
         condition: service_healthy
 
   # ── Optional: Langfuse, for request traces ───────────────────────────────────
-  # Self-hosted Langfuse v3: web, worker, Postgres, ClickHouse, Redis, MinIO (about 2 GB RAM).
+  # Self-hosted Langfuse v4: web, worker, Postgres, ClickHouse, Redis, MinIO (about 2 GB RAM).
   # To turn it on, uncomment the services below and the four langfuse volumes at the bottom
   # of this file, then:
   #   cd deploy
   #   for v in NEXTAUTH_SECRET SALT ENCRYPTION_KEY PASSWORD SECRET_KEY; do
   #     echo "LANGFUSE_$v=$(openssl rand -hex 32)"; done >> .env
   #   docker compose up -d
-  # In the console, Observability: host http://langfuse-web:3000, public key pk-lf-llm-router,
+  # In the console, Observability → Add destination → Langfuse: host http://langfuse-web:3000,
+  # UI URL http://localhost:3001, public key pk-lf-llm-router,
   # secret key = LANGFUSE_SECRET_KEY from deploy/.env. The Langfuse UI is http://localhost:3001,
   # login admin@example.com / LANGFUSE_PASSWORD. More in docs/deploy.md.
-  # Keep the Langfuse images on :3. v4 rejects the ingestion API the gateway exports with.
   ## ---- uncomment from here ----
   # langfuse-worker:
-  #   image: docker.io/langfuse/langfuse-worker:3
+  #   image: docker.io/langfuse/langfuse-worker:4
   #   depends_on: &langfuse-deps
   #     langfuse-db: {condition: service_healthy}
   #     langfuse-clickhouse: {condition: service_healthy}
@@ -80,7 +80,7 @@ services:
   #     TELEMETRY_ENABLED: "false"
   #
   # langfuse-web:
-  #   image: docker.io/langfuse/langfuse:3
+  #   image: docker.io/langfuse/langfuse:4
   #   depends_on: *langfuse-deps
   #   ports:
   #     # Loopback only. Drop "127.0.0.1:" to reach it from other machines, and set LANGFUSE_URL.
@@ -115,7 +115,7 @@ services:
   #     retries: 15
   #
   # langfuse-clickhouse:
-  #   image: docker.io/clickhouse/clickhouse-server:25.12
+  #   image: docker.io/clickhouse/clickhouse-server:26.3.62.3
   #   user: "101:101"
   #   environment:
   #     CLICKHOUSE_DB: default
