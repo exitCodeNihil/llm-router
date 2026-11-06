@@ -691,7 +691,7 @@ s11() { # the Rust gateway's memory over a long run: 80%, then 120% of its 1-vCP
 		done
 	done
 	log "s11: idle for 5 min, to see what memory the gateway gives back"
-	sleep 300
+	sleep "$([[ -n ${QUICK:-} ]] && echo 5 || echo 300)"
 	kill "$bg" 2>/dev/null || true
 	sample_stop
 	down
