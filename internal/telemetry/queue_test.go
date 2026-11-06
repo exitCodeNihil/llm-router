@@ -139,9 +139,10 @@ func TestDeliverGivesUp(t *testing.T) {
 		t.Fatalf("health %+v", h)
 	}
 
-	// And past MaxAge, however few attempts.
+	// And past MaxAge, however few attempts. Backoff is jittered down to half,
+	// so a wait of MaxAge/2 to MaxAge leaves room for one retry, never two.
 	p := fastPolicy()
-	p.MaxAge, p.BackoffMin, p.BackoffMax = 30*time.Millisecond, 20*time.Millisecond, 20*time.Millisecond
+	p.MaxAge, p.BackoffMin, p.BackoffMax = 30*time.Millisecond, 30*time.Millisecond, 30*time.Millisecond
 	s = &fakeSink{got: make(chan []*Record, 10), errs: []error{retry, retry, retry, retry, retry}}
 	w = testWorker(p, s)
 	w.deliver(context.Background(), []*Record{rec("a")})
