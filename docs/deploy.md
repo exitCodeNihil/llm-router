@@ -158,10 +158,11 @@ Placeholder secrets such as `change-me` are refused. Generate them with `openssl
 - **Monitoring**: both the control plane and the gateways serve Prometheus metrics, the chart
   can add PodMonitors, alert rules and a gateway autoscaler, and there is a Grafana dashboard.
   Gateways scale horizontally; the control plane doesn't. See [Monitoring](monitoring.md).
-- **Langfuse**: **Observability** exports request traces. Rules choose which traffic is exported
-  and whether prompts leave the gateway (off by default). With no rules, nothing is exported.
-  Wrong credentials are rejected per batch, so check the delivery health on that page. Need a
-  Langfuse to point it at? [Compose can run one](#langfuse-in-compose).
+- **Traces**: **Observability** exports a trace of each request to OTLP backends and Langfuse. A
+  capture policy chooses which traffic is exported and whether prompts leave (off by default), and
+  each destination takes its teams, gateway groups and content mode. See
+  [Observability](observability.md). Need a Langfuse to point it at?
+  [Compose can run one](#langfuse-in-compose).
 - **Response headers**: every `/v1` response from an upstream carries `X-Request-Id`,
   `X-Llmr-Provider`, `X-Llmr-Upstream` and `X-Llmr-Attempts`. A successful one also carries the
   answering upstream's `anthropic-ratelimit-*` and `x-ratelimit-*` headers. On a shared provider
@@ -181,13 +182,11 @@ for v in NEXTAUTH_SECRET SALT ENCRYPTION_KEY PASSWORD SECRET_KEY; do
 docker compose up -d
 ```
 
-In the console, **Observability**: host `http://langfuse-web:3000`, public key `pk-lf-llm-router`,
-secret key `LANGFUSE_SECRET_KEY` from `deploy/.env`. Langfuse itself is at http://localhost:3001
-(loopback only), login `admin@example.com` and `LANGFUSE_PASSWORD`. Sign-up is off.
+In the console, **Observability**, **Add destination**, **Langfuse**: host `http://langfuse-web:3000`,
+UI URL `http://localhost:3001`, public key `pk-lf-llm-router`, secret key `LANGFUSE_SECRET_KEY` from
+`deploy/.env`. Langfuse itself is at http://localhost:3001 (loopback only), login
+`admin@example.com` and `LANGFUSE_PASSWORD`. Sign-up is off.
 
-- That host is the Compose-internal name, so the **Trace** links on the Requests page don't open
-  from your browser. Open `http://localhost:3001/project/llm-router/traces/<request id>` instead.
-- Keep the images on `:3`. Langfuse 4 rejects the ingestion API the gateway exports with.
 
 ## Production checklist
 
