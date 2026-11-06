@@ -309,11 +309,11 @@ pub fn apply(batch: &[Arc<Scope>], c: &Counters) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // The scope registry and dirty list are process-wide: one test at a time.
-    static SERIAL: Mutex<()> = Mutex::new(());
+    pub(crate) static SERIAL: Mutex<()> = Mutex::new(());
 
     fn key(name: &str, budget: Option<f64>, rpm: Option<i64>) -> Key {
         Key {

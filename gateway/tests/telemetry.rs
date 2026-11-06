@@ -146,10 +146,14 @@ fn events(model: &str) -> Vec<Event> {
 /// The prompt's text is a marker no id can contain either.
 const PROMPT: &str = "zqxprompt";
 const MESSAGES: &str = r#"[{"role":"user", "content":"zqxprompt"}]"#;
-const SYSTEM: &str = r#""be brief""#;
+/// A conversation over the cap of 64 whose newest message, MESSAGES's, fits.
+const HISTORY: &str = r#"[{"role":"user", "content":"an older question"}, {"role":"assistant", "content":"an older answer"}, {"role":"user", "content":"zqxprompt"}]"#;
+/// A system prompt over the cap of 64.
+const SYSTEM: &str = r#""be brief, be kind, and never repeat the caller's question back to them""#;
 
-/// Input, system and output, each within the cap, on both surfaces, from both
-/// kinds of upstream, streamed or not; and the caller's trace throughout.
+/// Input, system and output, each over the cap and cut to it, on both
+/// surfaces, from both kinds of upstream, streamed or not; and the caller's
+/// trace throughout.
 #[tokio::test]
 async fn captures_content_within_the_cap() {
     let _q = QUEUE.lock().await;
@@ -162,7 +166,7 @@ async fn captures_content_within_the_cap() {
                 let gw = gateway(&model, flavor, "inherit", capturing(cap)).await;
                 let system = if path == "/v1/messages" { format!(r#""system": {SYSTEM},"#) } else { String::new() };
                 let body = format!(
-                    r#"{{"model": "{model}", {system} "max_tokens": 5, "stream": {stream}, "messages": {MESSAGES}}}"#
+                    r#"{{"model": "{model}", {system} "max_tokens": 5, "stream": {stream}, "messages": {HISTORY}}}"#
                 );
                 let (status, h, raw) = call(format!("{gw}{path}"), &body, Some(TRACEPARENT)).await;
                 assert_eq!(status, 200, "{what}: {}", String::from_utf8_lossy(&raw));
@@ -179,9 +183,13 @@ async fn captures_content_within_the_cap() {
                     assert_eq!(e.reported.as_ref().unwrap().inference_geo.as_str(), "us", "{what}");
                 }
                 let c = e.content.as_ref().unwrap_or_else(|| panic!("{what}: no content"));
-                // the request's own bytes, spaces and all
+                // the newest message that fits, the request's own bytes, spaces and all
+                assert!(HISTORY.len() > cap && MESSAGES.len() <= cap);
                 assert_eq!(c.input.as_ref().unwrap().get(), MESSAGES, "{what}");
-                assert_eq!(c.system.as_ref().map(|s| s.get()), (path == "/v1/messages").then_some(SYSTEM), "{what}");
+                // the system prompt's text cut to fit
+                assert!(SYSTEM.len() > cap);
+                let cut = format!("{}\"", &SYSTEM[..cap - 1]);
+                assert_eq!(c.system.as_ref().map(|s| s.get()), (path == "/v1/messages").then_some(&*cut), "{what}");
                 assert_eq!(c.output, &TEXT[..cap], "{what}");
                 assert!(c.content_truncated, "{what}");
 

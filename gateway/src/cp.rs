@@ -566,8 +566,15 @@ fn is_local(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::usage::tests::{emit_capturing, hold_queue};
+    use crate::usage::tests::emit_capturing;
     use std::sync::Mutex;
+
+    /// Hold the process-wide usage queue and limit counters: a sync takes
+    /// from both, and other tests use them.
+    fn hold_globals() -> [std::sync::MutexGuard<'static, ()>; 2] {
+        let q = crate::usage::tests::hold_queue();
+        [q, crate::limits::tests::SERIAL.lock().unwrap_or_else(|e| e.into_inner())]
+    }
 
     /// What a mock control plane saw of a sync: its batch number, its JSON,
     /// and the status it answered.
@@ -617,15 +624,27 @@ mod tests {
 
     // The control plane skips a batch number it has already stored and still
     // answers 200: a shutdown flush that counted from 1 again lost its events.
+    // The real sync loop runs, then the flush takes over from it.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // the usage queue is the process's: one test at a time
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
     async fn the_shutdown_flush_continues_the_batch_sequence() {
-        let _q = hold_queue();
+        let _globals = hold_globals();
         let (url, seen) = mock_cp(|n, _| if n == 2 { 503 } else { 200 }).await;
-        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into());
-        assert!(cp.sync_once(&mut *cp.syncer.lock().await).await);
-        assert!(!cp.sync_once(&mut *cp.syncer.lock().await).await, "the mock fails the second sync");
+        let cp = Arc::new(ControlPlane::new(&url, "llmrg_test".into(), "test".into()));
+        cp.sync_interval_ms.store(50, Ordering::Relaxed);
+        let st: &'static State = Box::leak(Box::new(State {
+            config: Default::default(),
+            ready: Default::default(),
+            draining: Default::default(),
+            max_in_flight: 1,
+        }));
+        let sync_loop = tokio::spawn(cp.clone().sync_loop(st));
+        // until the loop has synced, failed the second, and is waiting to resend it
+        while seen.lock().unwrap().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         cp.flush(Instant::now() + Duration::from_secs(5)).await;
+        sync_loop.abort();
         let seen: Vec<i64> = seen.lock().unwrap().iter().map(|(b, _, _)| *b).collect();
         assert_eq!(&seen[..3], &[1, 2, 2], "the unacknowledged batch is resent as is: {seen:?}");
         assert!(seen.windows(2).all(|w| w[0] <= w[1]), "never counts from 1 again: {seen:?}");
@@ -635,9 +654,9 @@ mod tests {
     /// size: the batch goes without its content, then halved, and an event
     /// too large alone is dropped, so the rest, and the limit counters, flow.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // the usage queue is the process's: one test at a time
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
     async fn a_413_at_the_smallest_batch_never_blocks_the_sync() {
-        let _q = hold_queue();
+        let _globals = hold_globals();
         let (url, seen) = mock_cp(|_, size| if size > 3000 { 413 } else { 200 }).await;
         drop(usage::take(usize::MAX, usize::MAX));
         let send = |model: &str, cap: usize, output: &str| {

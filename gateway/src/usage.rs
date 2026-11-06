@@ -877,12 +877,13 @@ pub(crate) mod tests {
     }
 
     /// Batches stay under the control plane's 32 MiB limit only if events
-    /// are no larger than their estimate, content included: ordinary ones
-    /// not at all, and ones with every number at its longest by under 2x,
-    /// the batch cap's margin.
+    /// are no larger than their estimate. Content, most of a large event, is
+    /// never underestimated, escapes included, and overestimated by no more
+    /// than a few bytes; the rest of an ordinary event not at all, and of one
+    /// with every number at its longest by under 2x, the batch cap's margin.
     #[test]
     fn size_estimates_cover_content() {
-        let ordinary = Event {
+        let ids = |e: Event| Event {
             request_id: "req_0123456789abcdef".into(),
             api_key_id: "4b7c3a1e-0000-4000-8000-000000000000".into(),
             user_id: "4b7c3a1e-0000-4000-8000-000000000001".into(),
@@ -890,18 +891,6 @@ pub(crate) mod tests {
             deployment_id: "4b7c3a1e-0000-4000-8000-000000000003".into(),
             provider_id: "4b7c3a1e-0000-4000-8000-000000000004".into(),
             model_name: "claude-sonnet-4-5-20250929".into(),
-            ts_ms: 1_793_975_436_295,
-            prompt_tokens: 1_234_567,
-            completion_tokens: 123_456,
-            cached_tokens: 1_000_000,
-            cache_write_5m: 200_000,
-            cache_write_1h: 30_000,
-            cost_usd: 0.123456789012345,
-            notional_cost_usd: 1.23456789012345,
-            unpriced: true,
-            latency_ms: 123_456,
-            attempts: 3,
-            ttft_ms: 12_345,
             error_code: "upstream_rate_limited",
             trace_id: [0xff; 16],
             parent_span_id: u64::MAX,
@@ -912,52 +901,68 @@ pub(crate) mod tests {
             })),
             cost_basis: 1,
             stream: true,
-            ..event("")
+            unpriced: true,
+            ..e
         };
-        let actual = serde_json::to_vec(&ordinary).unwrap().len();
-        assert!(ordinary.encoded_size() >= actual, "estimate {} < actual {actual}", ordinary.encoded_size());
-        let actual = serde_json::to_vec(&event("plain")).unwrap().len();
-        assert!(event("plain").encoded_size() >= actual);
-
-        let nasty = "\"\\\u{1}\n<é>".repeat(5000);
-        let input =
-            serde_json::to_string(&vec![serde_json::json!({"role": "user", "content": nasty.clone()}); 3]).unwrap();
-        for e in [
-            event("plain"),
-            Event {
-                request_id: "req_0123456789abcdef".into(),
-                api_key_id: "4b7c3a1e-0000-4000-8000-000000000000".into(),
-                user_id: "4b7c3a1e-0000-4000-8000-000000000001".into(),
-                team_id: "4b7c3a1e-0000-4000-8000-000000000002".into(),
-                deployment_id: "4b7c3a1e-0000-4000-8000-000000000003".into(),
-                provider_id: "4b7c3a1e-0000-4000-8000-000000000004".into(),
-                model_name: "claude-sonnet-4-5-20250929".into(),
+        let ordinary = || {
+            ids(Event {
+                ts_ms: 1_793_975_436_295,
+                prompt_tokens: 1_234_567,
+                completion_tokens: 123_456,
+                cached_tokens: 1_000_000,
+                cache_write_5m: 200_000,
+                cache_write_1h: 30_000,
+                cost_usd: 0.123456789012345,
+                notional_cost_usd: 1.23456789012345,
+                latency_ms: 123_456,
+                attempts: 3,
+                ttft_ms: 12_345,
+                status_code: 200,
+                ..Event::default()
+            })
+        };
+        let longest = || {
+            ids(Event {
+                ts_ms: i64::MIN,
                 prompt_tokens: i64::MAX,
                 completion_tokens: i64::MIN,
-                cached_tokens: i64::MAX,
-                cache_write_5m: i64::MAX,
-                cache_write_1h: i64::MAX,
-                cost_usd: f64::MAX,
-                notional_cost_usd: f64::MIN_POSITIVE,
-                latency_ms: i64::MAX,
-                attempts: i64::MAX,
-                ttft_ms: i64::MAX,
-                error_code: "upstream_rate_limited",
-                trace_id: [0xff; 16],
-                parent_span_id: u64::MAX,
-                operation: Operation::TextCompletion,
-                reported: Some(Box::new(Reported {
-                    inference_geo: Tag::new(&"g".repeat(40)),
-                    speed: Tag::new("standard"),
-                })),
-                cost_basis: 1,
-                content: content(&input, Some(&serde_json::to_string(&nasty).unwrap()), &nasty),
-                ..event("")
-            },
+                cached_tokens: i64::MIN,
+                cache_write_5m: i64::MIN,
+                cache_write_1h: i64::MIN,
+                cost_usd: -f64::MAX,
+                notional_cost_usd: -f64::MIN_POSITIVE,
+                latency_ms: i64::MIN,
+                attempts: i64::MIN,
+                ttft_ms: i64::MIN,
+                status_code: u16::MAX,
+                ..Event::default()
+            })
+        };
+        let size = |e: &Event| serde_json::to_vec(e).unwrap().len();
+
+        // without content
+        for (e, margin) in [(event("plain"), 1), (ordinary(), 1), (longest(), 2)] {
+            assert!(margin * e.encoded_size() >= size(&e), "estimate {} vs {}", e.encoded_size(), size(&e));
+        }
+
+        // content, every part at its hardest to encode
+        let nasty = "\"\\\u{1}\n\u{7f}<é>\u{2028}😀".repeat(2000);
+        let input =
+            serde_json::to_string(&vec![serde_json::json!({"role": "user", "content": nasty.clone()}); 3]).unwrap();
+        let system = serde_json::to_string(&nasty).unwrap();
+        for (input, system, output) in [
+            (&*input, Some(&*system), &*nasty),
+            ("[]", None, ""),
+            ("[]", None, "\u{0}\u{1f}"),
+            (&*input, None, "plain"),
         ] {
-            let actual = serde_json::to_vec(&e).unwrap().len();
-            let content = e.content.as_ref().map_or(0, |c| c.encoded_size());
-            assert!(2 * e.encoded_size() - content >= actual, "estimate {} vs actual {actual}", e.encoded_size());
+            for base in [event("plain"), ordinary(), longest()] {
+                let without = size(&base);
+                let e = Event { content: content(input, system, output), ..base };
+                let (estimate, added) = (e.content.as_ref().unwrap().encoded_size(), size(&e) - without);
+                assert!(estimate >= added, "content estimate {estimate} < {added}");
+                assert!(estimate <= added + 64, "content estimate {estimate} far over {added}");
+            }
         }
     }
 
