@@ -176,7 +176,21 @@ func TestDestinationsAPIAgainstPostgres(t *testing.T) {
 	if code != 200 || !res.OK || !strings.HasPrefix(res.TraceURL, "http://ui/") || len(res.TraceURL) != len("http://ui/")+32 {
 		t.Fatalf("test draft: %d %s", code, body)
 	}
-	call("PUT", "/api/telemetry/destinations/"+list[0].ID, `{"name":"Tempo","kind":"otlp","endpoint":"`+srv.URL+`"}`)
+	// A new host doesn't get the stored header: it must be entered again,
+	// for a test as for a save.
+	auth = "unset"
+	code, body = call("POST", "/api/telemetry/destinations/test", `{"id":"`+list[0].ID+`","name":"Tempo","kind":"otlp","endpoint":"`+srv.URL+`"}`)
+	if json.Unmarshal([]byte(body), &res); res.OK || !strings.Contains(res.Detail, "the endpoint changed") || auth != "unset" {
+		t.Fatalf("test on a new host with the stored header: %d %s", code, body)
+	}
+	if code, body = call("PUT", "/api/telemetry/destinations/"+list[0].ID, `{"name":"Tempo","kind":"otlp","endpoint":"`+srv.URL+`"}`); code != 400 ||
+		!strings.Contains(body, "the endpoint changed: enter the secret key and header values again") {
+		t.Fatalf("put on a new host with the stored header: %d %s", code, body)
+	}
+	if code, body = call("PUT", "/api/telemetry/destinations/"+list[0].ID, `{"name":"Tempo","kind":"otlp","endpoint":"`+srv.URL+`",
+		"headers":[{"name":"Authorization","value":"Bearer t0ken"}]}`); code != 204 {
+		t.Fatalf("put on a new host: %d %s", code, body)
+	}
 	code, body = call("POST", "/api/telemetry/destinations/test", `{"id":"`+list[0].ID+`"}`)
 	if json.Unmarshal([]byte(body), &res); !res.OK || auth != "Bearer t0ken" {
 		t.Fatalf("test saved: %d %s (auth %q)", code, body, auth)

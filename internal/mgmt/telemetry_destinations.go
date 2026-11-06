@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -91,10 +92,23 @@ func (req *destinationRequest) destination(stored *snapshot.Destination) (*snaps
 			old = stored.Secrets
 		}
 	}
+	// Stored values are bound to where they were sent: a new host gets them
+	// only when they are entered again.
+	moved := stored != nil && !sameHosts(stored, d)
+	keep := func(key string) (string, error) {
+		v := old[key]
+		if v != "" && moved {
+			return "", errors.New("the endpoint changed: enter the secret key and header values again")
+		}
+		return v, nil
+	}
 	for _, name := range k.SecretFields() {
 		v := req.Secrets[name]
-		if v == "" && old != nil {
-			v = old[name]
+		if v == "" {
+			var err error
+			if v, err = keep(name); err != nil {
+				return nil, err
+			}
 		}
 		if v != "" {
 			d.Secrets[name] = v
@@ -106,8 +120,12 @@ func (req *destinationRequest) destination(stored *snapshot.Destination) (*snaps
 		}
 	}
 	if req.Headers == nil {
-		for key, v := range old {
+		for key := range old {
 			if strings.HasPrefix(key, snapshot.HeaderSecretPrefix) {
+				v, err := keep(key)
+				if err != nil {
+					return nil, err
+				}
 				d.Secrets[key] = v
 			}
 		}
@@ -116,8 +134,11 @@ func (req *destinationRequest) destination(stored *snapshot.Destination) (*snaps
 			name := strings.TrimSpace(h.Name)
 			key := snapshot.HeaderSecretPrefix + name
 			v := h.Value
-			if v == "" && old != nil {
-				v = old[key]
+			if v == "" {
+				var err error
+				if v, err = keep(key); err != nil {
+					return nil, err
+				}
 			}
 			if v == "" {
 				return nil, fmt.Errorf("header %s needs a value", name)
@@ -466,6 +487,26 @@ func (m *Server) destinations(ctx context.Context, id string) ([]destinationView
 		}
 	}
 	return out, nil
+}
+
+// sameHosts reports whether d sends where stored did: the same scheme and
+// host for the endpoint and for the traces URL (the endpoint when unset).
+func sameHosts(stored, d *snapshot.Destination) bool {
+	traces := func(x *snapshot.Destination) string {
+		if x.TracesURL != "" {
+			return x.TracesURL
+		}
+		return x.Endpoint
+	}
+	return origin(stored.Endpoint) == origin(d.Endpoint) && origin(traces(stored)) == origin(traces(d))
+}
+
+func origin(s string) string {
+	u, err := url.Parse(s)
+	if err != nil {
+		return s
+	}
+	return strings.ToLower(u.Scheme + "://" + u.Host)
 }
 
 // statusOf is a destination's status from its row alone.
