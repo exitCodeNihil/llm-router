@@ -19,6 +19,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -111,6 +112,51 @@ pub fn identities() -> &'static Identities {
     IDS.get_or_init(Identities::default)
 }
 
+/// Why a token was refused. The caller is told `reason` (Display): a few
+/// words, never an issuer's URLs or what a fetch failed with; the log gets
+/// `detail` too.
+#[derive(Debug)]
+pub struct Rejection {
+    pub reason: String,
+    detail: String,
+}
+
+impl Rejection {
+    fn new(reason: &str, detail: impl Into<String>) -> Rejection {
+        Rejection { reason: reason.to_string(), detail: detail.into() }
+    }
+
+    /// A reason with nothing more to say: shown and logged as it is.
+    fn plain(reason: String) -> Rejection {
+        Rejection { reason, detail: String::new() }
+    }
+
+    /// Logs a refusal with its detail, a line a second at most: anyone can
+    /// send tokens.
+    fn log(&self) {
+        static NEXT_MS: AtomicI64 = AtomicI64::new(0);
+        static QUIET: AtomicU64 = AtomicU64::new(0);
+        let now = now_ms();
+        let next = NEXT_MS.load(Ordering::Relaxed);
+        if now < next || NEXT_MS.compare_exchange(next, now + 1000, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            QUIET.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let quiet = match QUIET.swap(0, Ordering::Relaxed) {
+            0 => String::new(),
+            n => format!(" ({n} more since the last one)"),
+        };
+        let sep = if self.detail.is_empty() { "" } else { ": " };
+        eprintln!("identity token refused: {}{sep}{}{quiet}", self.reason, self.detail);
+    }
+}
+
+impl std::fmt::Display for Rejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
 /// What a verified token says about its caller.
 #[derive(Debug)]
 pub struct Verified {
@@ -135,7 +181,7 @@ impl Identities {
     /// Resolve an identity token to the caller (CloudValidator.Validate): a
     /// key-less identity carrying the user, and the team the issuer maps
     /// callers to.
-    pub async fn authenticate(&self, cfg: &Config, token: &str) -> Result<Arc<Key>, String> {
+    pub async fn authenticate(&self, cfg: &Config, token: &str) -> Result<Arc<Key>, Rejection> {
         let hash = sha256(token.as_bytes());
         let now = now_ms();
         if let Some(c) = lock(&self.tokens).get(&hash)
@@ -144,7 +190,7 @@ impl Identities {
         {
             return Ok(c.key.clone());
         }
-        let v = self.verify(cfg, token).await?;
+        let v = self.verify(cfg, token).await.inspect_err(Rejection::log)?;
         let issuer = &cfg.issuers[v.issuer];
         let email_hash = sha256(v.email.as_bytes());
         let user = match cfg.emails.get(&email_hash) {
@@ -152,7 +198,7 @@ impl Identities {
                 lock(&self.outcomes).remove(&email_hash);
                 u.clone()
             }
-            None => self.provisioned(cfg, issuer, &v.email, email_hash, token).await?,
+            None => self.provisioned(cfg, issuer, &v.email, email_hash, token).await.map_err(Rejection::plain)?,
         };
         let team = Some(issuer.map_to_team.as_str()).filter(|t| !t.is_empty()).and_then(|t| cfg.teams.get(t)).cloned();
         let key = Arc::new(Key {
@@ -256,13 +302,13 @@ impl Identities {
 
     /// Verify a token against the configured issuer it names: signature,
     /// exp, nbf, aud, the issuer's match claims and its email claim.
-    pub async fn verify(&self, cfg: &Config, token: &str) -> Result<Verified, String> {
+    pub async fn verify(&self, cfg: &Config, token: &str) -> Result<Verified, Rejection> {
         if cfg.issuers.is_empty() {
-            return Err("no token issuers configured".into());
+            return Err(Rejection::plain("no token issuers configured".into()));
         }
         let mut parts = token.split('.');
         let (Some(h), Some(p), Some(s), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
-            return Err("not a JWT".into());
+            return Err(Rejection::new("malformed token", "not a JWT"));
         };
         #[derive(Deserialize)]
         struct Header {
@@ -270,13 +316,15 @@ impl Identities {
             alg: String,
             kid: Option<String>,
         }
-        let header: Header = b64url(h).and_then(|b| serde_json::from_slice(&b).ok()).ok_or("undecodable JWT header")?;
+        let malformed = |what: &str| Rejection::new("malformed token", format!("undecodable JWT {what}"));
+        let header: Header =
+            b64url(h).and_then(|b| serde_json::from_slice(&b).ok()).ok_or_else(|| malformed("header"))?;
         let claims: serde_json::Map<String, Value> =
-            b64url(p).and_then(|b| serde_json::from_slice(&b).ok()).ok_or("undecodable JWT payload")?;
-        let sig = b64url(s).ok_or("undecodable JWT signature")?;
+            b64url(p).and_then(|b| serde_json::from_slice(&b).ok()).ok_or_else(|| malformed("payload"))?;
+        let sig = b64url(s).ok_or_else(|| malformed("signature"))?;
         let iss = claims.get("iss").and_then(Value::as_str).unwrap_or_default();
         let Some(idx) = cfg.issuers.iter().position(|i| i.url == iss) else {
-            return Err(format!("issuer {iss} is not configured"));
+            return Err(Rejection::new("unknown issuer", format!("issuer {iss:?} is not configured")));
         };
         let issuer = &cfg.issuers[idx];
 
@@ -284,14 +332,14 @@ impl Identities {
         self.check_signature(&issuer.url, &header.alg, header.kid.as_deref(), signed, &sig).await?;
 
         let now = now_ms() as f64 / 1000.0;
-        let exp = claims.get("exp").and_then(Value::as_f64).ok_or("token has no exp claim")?;
+        let exp = claims.get("exp").and_then(Value::as_f64).ok_or_else(|| Rejection::plain("no exp claim".into()))?;
         if exp < now {
-            return Err("token is expired".into());
+            return Err(Rejection::plain("expired".into()));
         }
         if let Some(nbf) = claims.get("nbf").and_then(Value::as_f64)
             && now + NBF_LEEWAY_S < nbf
         {
-            return Err("token is not valid yet".into());
+            return Err(Rejection::plain("not valid yet".into()));
         }
         let aud_ok = match claims.get("aud") {
             Some(Value::String(a)) => *a == issuer.audience,
@@ -299,16 +347,18 @@ impl Identities {
             _ => false,
         };
         if !aud_ok {
-            return Err(format!("expected audience {:?}", issuer.audience));
+            return Err(Rejection::new("wrong audience", format!("expected audience {:?}", issuer.audience)));
         }
         for (claim, want) in &issuer.match_claims {
             if claims.get(claim).and_then(Value::as_str) != Some(want.as_str()) {
-                return Err(format!("claim {claim} mismatch"));
+                return Err(Rejection::new("claim mismatch", format!("claim {claim} mismatch")));
             }
         }
         let email_claim = if issuer.email_claim.is_empty() { "email" } else { issuer.email_claim.as_str() };
         let email = claims.get(email_claim).and_then(Value::as_str).filter(|e| !e.is_empty());
-        let Some(email) = email else { return Err(format!("token has no {email_claim} claim")) };
+        let Some(email) = email else {
+            return Err(Rejection::new("no email claim", format!("token has no {email_claim} claim")));
+        };
         Ok(Verified { issuer: idx, email: lower_email(email), exp })
     }
 
@@ -322,23 +372,26 @@ impl Identities {
         kid: Option<&str>,
         signed: &[u8],
         sig: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<(), Rejection> {
+        let unsupported = || Rejection::new("unsupported signing algorithm", format!("algorithm {alg:?}"));
         let kty = match alg {
             "RS256" => "RSA",
             "ES256" => "EC",
-            _ => return Err(format!("unsupported signing algorithm {alg:?}")),
+            _ => return Err(unsupported()),
         };
         let slot = lock(&self.keys).entry(issuer.to_string()).or_default().clone();
         let mut ks = slot.current.load_full();
         if ks.fetched.is_none() || (kid.is_some() && !ks.has(kid, kty)) {
             // Nothing to check it with; for a known key id, a key the issuer
             // rotated in since we last looked.
-            ks = refresh(self.client(), issuer, &slot, &ks).await?;
+            ks = refresh(self.client(), issuer, &slot, &ks)
+                .await
+                .map_err(|e| Rejection::new("issuer unavailable", e))?;
         } else if ks.fetched.is_some_and(|t| t.elapsed() > KEYS_TTL) {
             refresh_in_background(self.client().clone(), issuer.to_string(), slot.clone());
         }
         if !ks.algs.iter().any(|a| a == alg) {
-            return Err(format!("issuer does not sign with {alg}"));
+            return Err(unsupported());
         }
         let mut found = false;
         for k in ks.keys.iter().filter(|k| k.matches(kid, kty, alg)) {
@@ -347,7 +400,11 @@ impl Identities {
                 return Ok(());
             }
         }
-        Err(if found { "bad signature".into() } else { "no issuer key for this token".into() })
+        Err(if found {
+            Rejection::plain("bad signature".into())
+        } else {
+            Rejection::new("unknown signing key", format!("no key {kid:?} for {alg}"))
+        })
     }
 }
 
@@ -697,11 +754,11 @@ mod tests {
         fn refused(self) -> String;
     }
 
-    impl<T> Refused for Result<T, String> {
+    impl<T> Refused for Result<T, Rejection> {
         fn refused(self) -> String {
             match self {
                 Ok(_) => panic!("accepted"),
-                Err(e) => e,
+                Err(e) => e.to_string(),
             }
         }
     }
@@ -960,22 +1017,23 @@ mod tests {
         };
         let cases = [
             ("expired", idp.mint("RS256", "k1", json!({"exp": now - 10})), "expired"),
-            ("no exp", idp.mint("RS256", "k1", json!({"exp": null})), "exp"),
+            ("no exp", idp.mint("RS256", "k1", json!({"exp": null})), "no exp claim"),
             ("not yet valid", idp.mint("RS256", "k1", json!({"nbf": now + 600})), "not valid yet"),
-            ("wrong audience", idp.mint("RS256", "k1", json!({"aud": "other"})), "audience"),
-            ("wrong issuer", idp.mint("RS256", "k1", json!({"iss": "https://evil.example.com"})), "not configured"),
-            ("wrong tenant", idp.mint("RS256", "k1", json!({"tid": "evil"})), "claim tid mismatch"),
+            ("wrong audience", idp.mint("RS256", "k1", json!({"aud": "other"})), "wrong audience"),
+            ("wrong issuer", idp.mint("RS256", "k1", json!({"iss": "https://evil.example.com"})), "unknown issuer"),
+            ("wrong tenant", idp.mint("RS256", "k1", json!({"tid": "evil"})), "claim mismatch"),
             ("no email", idp.mint("RS256", "k1", json!({"email": null})), "no email claim"),
             ("tampered", tampered, "bad signature"),
             ("signature of another key", es_as_rs, "bad signature"),
             (
                 "alg none",
                 format!("{}.{}.", b64(br#"{"alg":"none"}"#), signed.split('.').nth(1).unwrap()),
-                "unsupported",
+                "unsupported signing algorithm",
             ),
-            ("HS256", idp.mint("HS256", "k1", json!({})), "unsupported"),
-            ("garbage", "not.a.jwt".to_string(), "undecodable"),
-            ("two parts", "a.b".to_string(), "not a JWT"),
+            ("HS256", idp.mint("HS256", "k1", json!({})), "unsupported signing algorithm"),
+            ("unknown key", idp.mint("RS256", "k7", json!({})), "unknown signing key"),
+            ("garbage", "not.a.jwt".to_string(), "malformed token"),
+            ("two parts", "a.b".to_string(), "malformed token"),
             ("unknown user", idp.mint("RS256", "k1", json!({"email": "stranger@example.com"})), "no gateway user"),
         ];
         for (name, token, want) in cases {
@@ -983,7 +1041,9 @@ mod tests {
                 Ok(_) => panic!("{name}: accepted"),
                 Err(e) => e,
             };
-            assert!(err.contains(want), "{name}: {err}");
+            // Exactly the reason: nothing about the issuer or what we expected.
+            let shown = err.to_string();
+            assert!(shown == want || name == "unknown user" && shown.contains(want), "{name}: {shown} ({err:?})");
         }
         let empty = Config::build(
             serde_json::from_value(json!({"schema": 2, "version": 1, "group": {"id": "g", "name": "g"}})).unwrap(),
@@ -1012,7 +1072,7 @@ mod tests {
         // A kid nobody publishes doesn't make every request fetch again.
         for _ in 0..3 {
             let err = ids.verify(&cfg, &idp.mint("RS256", "k9", json!({}))).await.refused();
-            assert!(err.contains("no issuer key"), "{err}");
+            assert!(err.contains("unknown signing key"), "{err}");
         }
         assert_eq!(idp.fetches(), 2, "at most one refetch a minute");
         ids.verify(&cfg, &idp.mint("RS256", "k1", json!({}))).await.unwrap();
@@ -1037,6 +1097,25 @@ mod tests {
         me.set(url.clone()).unwrap();
         let err = fetch_keys(&client, &url).await.err().unwrap();
         assert!(err.contains("jwks_uri") && err.contains("must use https"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_issuer_is_named_by_no_url() {
+        let idp = Idp::new().await;
+        let ids = Identities::default();
+        // An issuer at a port nobody serves.
+        let gone = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", gone.local_addr().unwrap());
+        drop(gone);
+        let wire: Wire = serde_json::from_value(json!({
+            "schema": 2, "version": 1, "group": {"id": "g", "name": "g"},
+            "issuers": [{"url": url, "audience": "llmr", "email_claim": "email"}],
+        }))
+        .unwrap();
+        let cfg = Config::build(wire).unwrap();
+        let err = ids.authenticate(&cfg, &idp.mint("RS256", "k1", json!({"iss": url}))).await.err().unwrap();
+        assert_eq!(err.to_string(), "issuer unavailable");
+        assert!(err.detail.contains(&url), "the log says which: {err:?}");
     }
 
     /// The current keys, as if fetched `age` ago.
@@ -1068,7 +1147,7 @@ mod tests {
         let t = Instant::now();
         ids.verify(&cfg, &idp.mint("ES256", "ec1", json!({}))).await.unwrap();
         assert!(t.elapsed() < Duration::from_millis(500), "waited {:?} for a fetch it didn't need", t.elapsed());
-        assert!(unknown.await.unwrap().refused().contains("no issuer key"));
+        assert!(unknown.await.unwrap().refused().contains("unknown signing key"));
 
         // Keys past their hour go on being used while new ones are fetched.
         age_keys(&ids, &idp.url, KEYS_TTL + Duration::from_secs(1));
@@ -1135,7 +1214,7 @@ mod tests {
         ids: &Arc<Identities>,
         cfg: &Arc<Config>,
         tokens: Vec<String>,
-    ) -> Vec<Result<Arc<Key>, String>> {
+    ) -> Vec<Result<Arc<Key>, Rejection>> {
         let tasks: Vec<_> = tokens
             .into_iter()
             .map(|t| {
