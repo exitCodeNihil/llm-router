@@ -668,6 +668,35 @@ s8() { # soak and spike at 2 vCPU: same absolute load for all, 70% non-stream, 3
 	down
 }
 
+s11() { # the Rust gateway's memory over a long run: 80%, then 120% of its 1-vCPU maximum, then idle
+	local m r phase seg bg
+	[[ " $* " == *" rgw "* ]] || return 0
+	m=$(max rgw 1)
+	fresh rgw
+	sample_start s11-rgw
+	# The gateway's own view every 10 s: what it has queued and holds memory for.
+	(while :; do
+		printf '%s ' "$(date +%s)"
+		curl -fsS "http://127.0.0.1:$(port rgw)/metrics" 2>/dev/null |
+			awk '/^llmr_(usage_queued|usage_queue_capacity|usage_dropped_total|in_flight|sync_failures_total|sync_refused_events_total) / { printf "%s=%s ", $1, $2 }'
+		echo
+		sleep 10
+	done) > "$OUT/s11-metrics-rgw.txt" 2>/dev/null &
+	bg=$!
+	for phase in 80 120; do
+		r=$((m * phase / 100))
+		log "s11: $r rps ($phase% of $m) for $SOAK_MIN min"
+		for ((seg = 1; seg <= SOAK_MIN / 5; seg++)); do
+			lg "s11-$phase-rgw-$seg" rgw openai oai fast -rate "$r" -duration 300s -warmup 0s -timeout 10s
+		done
+	done
+	log "s11: idle for 5 min, to see what memory the gateway gives back"
+	sleep 300
+	kill "$bg" 2>/dev/null || true
+	sample_stop
+	down
+}
+
 s10() { # limits across two instances of the Rust gateway: one 600 rpm key, 10 rps through each for a minute
 	local bg
 	[[ " $* " == *" rgw "* ]] || return 0
@@ -743,7 +772,7 @@ shift || true
 case $cmd in
 build | all | cal | headline | k6check | down) "$cmd" ;;
 build-lrust) build_lrust ;;
-s1 | s2 | s2c | s2x | s3 | s6 | s7 | s8 | s9 | s10) "$cmd" "${@:-${ALL[@]}}" ;;
+s1 | s2 | s2c | s2x | s3 | s6 | s7 | s8 | s9 | s10 | s11) "$cmd" "${@:-${ALL[@]}}" ;;
 real) "$PWD/real.sh" ;;
 report) go run ./loadgen report "$OUT" ;;
 docs)
