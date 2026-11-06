@@ -134,41 +134,75 @@ func TestSyncAgainstPostgres(t *testing.T) {
 	var oldTS, futureTS time.Time
 	st.Pool.QueryRow(ctx, `SELECT ts FROM usage_events WHERE request_id=$1`, old.RequestID).Scan(&oldTS)
 	st.Pool.QueryRow(ctx, `SELECT ts FROM usage_events WHERE request_id=$1`, future.RequestID).Scan(&futureTS)
-	if !oldTS.Equal(lo) {
-		t.Fatalf("old event stored at %v, want the start of the window %v", oldTS, lo)
+	if want := lo.Add(24 * time.Hour); !oldTS.Equal(want) {
+		t.Fatalf("old event stored at %v, want the window's second day %v", oldTS, want)
 	}
 	if futureTS.After(time.Now().Add(time.Minute)) {
 		t.Fatalf("future event stored at %v, want about now", futureTS)
 	}
 
-	// A row Postgres still refuses (here, a year with no partition) is skipped
-	// and adds no spend; the rest of the batch is stored.
+	// A row Postgres refuses (here, a cost too large for its column, which
+	// Sanitize would have caught) is skipped and adds no spend; the rest of
+	// the batch is stored.
+	spend := func() (usd float64) {
+		st.Pool.QueryRow(ctx, `SELECT coalesce(sum(usd),0) FROM spend_counters WHERE scope_type='key' AND scope_id=$1`, keyID).Scan(&usd)
+		return usd
+	}
+	before := spend()
+	batchOf := func(n int) []usage.Event {
+		out := make([]usage.Event, n)
+		for i := range out {
+			out[i] = ev(keyID, teamA).Event
+			out[i].TS = time.Now()
+		}
+		return out
+	}
+	events := batchOf(9)
+	events[3].NotionalCostUSD, events[7].NotionalCostUSD = 1e12, 1e12
 	tx, err := st.Pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	good, refused := ev(keyID, teamA).Event, ev(keyID, teamA).Event
-	good.TS, refused.TS = time.Now(), time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
-	kept, err := usage.InsertEvents(ctx, tx, []usage.Event{refused, good})
+	kept, err := usage.InsertEvents(ctx, tx, events)
 	if err != nil {
-		t.Fatalf("a refused row failed the batch: %v", err)
+		t.Fatalf("refused rows failed the batch: %v", err)
 	}
-	if len(kept) != 1 || kept[0].RequestID != good.RequestID {
-		t.Fatalf("kept %d events, want only the good one", len(kept))
+	if len(kept) != 7 {
+		t.Fatalf("kept %d events, want 7", len(kept))
 	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	var stored int
-	st.Pool.QueryRow(ctx, `SELECT count(*) FROM usage_events WHERE request_id IN ($1,$2)`, good.RequestID, refused.RequestID).Scan(&stored)
-	if stored != 1 {
-		t.Fatalf("stored %d of the good and refused rows, want 1", stored)
+	if got := spend() - before; got < 7*0.25-1e-9 || got > 7*0.25+1e-9 {
+		t.Fatalf("spend grew by %v, want 7 x 0.25: refused rows must not count", got)
+	}
+
+	// A missing partition is not the row's fault: the batch fails, so the
+	// gateway retries once partitions exist, instead of losing the rows.
+	tx, err = st.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stray := batchOf(2)
+	stray[1].TS = time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	if _, err := usage.InsertEvents(ctx, tx, stray); err == nil {
+		t.Fatal("a missing partition was skipped instead of failing the batch")
+	}
+	tx.Rollback(ctx)
+
+	// A count too large for its int4 column is clamped by the sync handler,
+	// not refused or retried forever.
+	huge := ev(keyID, teamA)
+	huge.PromptTokens = 3_000_000_000
+	res, body = post("/gw/v1/sync", joined.Session, SyncRequest{Batch: 3, Events: []SyncEvent{huge}})
+	if res.StatusCode != 200 {
+		t.Fatalf("an event with 3e9 prompt tokens: %d %s", res.StatusCode, body)
 	}
 
 	if _, err := st.Pool.Exec(ctx, `DELETE FROM gateway_instances WHERE id=$1`, joined.InstanceID); err != nil {
 		t.Fatal(err)
 	}
-	batch.Batch = 3
+	batch.Batch = 4
 	if res, _ := post("/gw/v1/sync", joined.Session, batch); res.StatusCode != 401 {
 		t.Fatalf("a removed instance got %d, want 401 so it joins again", res.StatusCode)
 	}

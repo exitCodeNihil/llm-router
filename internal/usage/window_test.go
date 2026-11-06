@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -26,8 +27,8 @@ func TestClampTS(t *testing.T) {
 		{"slightly ahead", now.Add(time.Minute), now.Add(time.Minute), false},
 		{"a day ahead", now.Add(24 * time.Hour), now, true},
 		{"start of last month", lo, lo, false},
-		{"before the window", lo.Add(-time.Second), lo, true},
-		{"years ago", time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC), lo, true},
+		{"before the window", lo.Add(-time.Second), lo.Add(24 * time.Hour), true},
+		{"years ago", time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC), lo.Add(24 * time.Hour), true},
 	} {
 		got, moved := ClampTS(c.in, now)
 		if !got.Equal(c.want) || moved != c.moved {
@@ -51,8 +52,22 @@ func TestSanitize(t *testing.T) {
 	if len(e.ErrorCode) > 64 || !strings.HasPrefix(e.ErrorCode, "é") || strings.ContainsRune(e.ErrorCode, '�') {
 		t.Fatalf("error code cut badly: %q", e.ErrorCode)
 	}
+	big := Event{RequestID: "r\x00id", ModelName: "m", PromptTokens: 3_000_000_000, NotionalCostUSD: 1e9,
+		DeploymentID: "urn:uuid:1b4e28ba-2fa1-11d2-883f-0016d3cca427"}
+	Sanitize(&big)
+	if big.PromptTokens != math.MaxInt32 || big.NotionalCostUSD != 0 || big.RequestID != "rid" || big.DeploymentID != "" {
+		t.Fatalf("got %+v", big)
+	}
 	ok := Event{RequestID: "req_1", ModelName: "m", StatusCode: 200}
 	if n := Sanitize(&ok); n != 0 {
 		t.Fatalf("a valid event changed %d fields", n)
+	}
+}
+
+func TestPGWriterDropsContent(t *testing.T) {
+	w := NewPGWriter(nil)
+	w.Write(Event{RequestID: "r", Input: []byte(`[{"role":"user"}]`), Output: "hi"})
+	if e := <-w.ch; e.Input != nil || e.Output != "" {
+		t.Fatalf("queued content: %+v", e)
 	}
 }

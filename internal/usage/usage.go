@@ -206,39 +206,48 @@ func ScopeKeys(e Event) []string {
 
 // InsertEvents writes events and their spend_counters in tx: one multi-row
 // batch plus one aggregated upsert per (scope, day). It returns the events it
-// stored. When Postgres refuses the batch over a row's data (error classes 22
-// and 23, a missing partition among them), it stores the rows one at a time
-// and skips the ones it refuses, so one bad row cannot sink the rest; those
-// skipped rows add no spend. Any other error is returned as is.
+// stored. When Postgres refuses a row's data (error classes 22 and 23), the
+// batch is split in halves until the refused rows are found and skipped, so
+// one bad row cannot sink the rest; skipped rows add no spend. Any other
+// error, a missing partition included, is returned so the caller can retry.
 func InsertEvents(ctx context.Context, tx pgx.Tx, events []Event) ([]Event, error) {
-	err := savepoint(ctx, tx, func(sp pgx.Tx) error {
-		b := &pgx.Batch{}
-		for _, e := range events {
-			queueRow(b, e)
-		}
-		return sp.SendBatch(ctx, b).Close()
-	})
-	if err == nil {
-		return events, writeCounters(ctx, tx, events)
-	}
-	if !refusedRow(err) {
-		return nil, err
-	}
 	kept := make([]Event, 0, len(events))
-	for _, e := range events {
+	var refused []Event
+	var insert func([]Event) error
+	insert = func(part []Event) error {
 		err := savepoint(ctx, tx, func(sp pgx.Tx) error {
 			b := &pgx.Batch{}
-			queueRow(b, e)
+			for _, e := range part {
+				queueRow(b, e)
+			}
 			return sp.SendBatch(ctx, b).Close()
 		})
-		if err == nil {
-			kept = append(kept, e)
-			continue
+		switch {
+		case err == nil:
+			kept = append(kept, part...)
+			return nil
+		case !refusedRow(err):
+			return err
+		case len(part) == 1:
+			refused = append(refused, part[0])
+			if len(refused) == 1 {
+				slog.Warn("usage row refused", "request_id", part[0].RequestID, "ts", part[0].TS, "err", err)
+			}
+			return nil
 		}
-		if !refusedRow(err) {
+		half := len(part) / 2
+		if err := insert(part[:half]); err != nil {
+			return err
+		}
+		return insert(part[half:])
+	}
+	if len(events) > 0 {
+		if err := insert(events); err != nil {
 			return nil, err
 		}
-		slog.Warn("usage row refused", "request_id", e.RequestID, "ts", e.TS, "err", err)
+	}
+	if len(refused) > 1 {
+		slog.Warn("usage rows refused", "refused", len(refused), "of", len(events))
 	}
 	return kept, writeCounters(ctx, tx, kept)
 }
@@ -258,11 +267,13 @@ func savepoint(ctx context.Context, tx pgx.Tx, fn func(pgx.Tx) error) error {
 }
 
 // refusedRow reports whether Postgres refused a row's data (classes 22, data
-// exception, and 23, integrity constraint violation, which includes "no
-// partition of relation found"), as opposed to a failure retrying could fix.
+// exception, and 23, integrity constraint violation), as opposed to a failure
+// retrying could fix. A missing partition (23514) is not the row's fault:
+// timestamps are clamped into the partition window, so it means partitions
+// failed to be created, and the caller should retry rather than lose the row.
 func refusedRow(err error) bool {
 	var pg *pgconn.PgError
-	if !errors.As(err, &pg) || len(pg.Code) < 2 {
+	if !errors.As(err, &pg) || len(pg.Code) < 2 || pg.Code == "23514" {
 		return false
 	}
 	return pg.Code[:2] == "22" || pg.Code[:2] == "23"

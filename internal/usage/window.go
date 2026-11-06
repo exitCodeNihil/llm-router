@@ -1,6 +1,8 @@
 package usage
 
 import (
+	"math"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -23,38 +25,46 @@ const maxFuture = 2 * time.Minute
 
 // ClampTS moves a timestamp the control plane cannot store, or should not
 // trust, into the partition window: a zero or future time becomes now, and
-// one older than the window becomes its start, so the spend still counts. The
-// bool reports whether it changed anything.
+// one older than the window becomes its second day, so the spend still
+// counts. The bool reports whether it changed anything.
 func ClampTS(ts, now time.Time) (time.Time, bool) {
 	now = now.UTC()
 	if ts.IsZero() || ts.After(now.Add(maxFuture)) {
 		return now, true
 	}
+	// A day into the window, not its first instant: partition bounds are
+	// dates in the database's time zone, which may not be UTC.
 	if lo, _ := Window(now); ts.Before(lo) {
-		return lo, true
+		return lo.Add(24 * time.Hour), true
 	}
 	return ts.UTC(), false
 }
 
 // Sanitize makes an event reported by a gateway storable: ids that are not
-// uuids are dropped, text is cut to the lengths the console shows and counts
-// that cannot be negative are zeroed. It reports how many fields it changed.
+// uuids are dropped, text loses NUL bytes and invalid UTF-8 and is cut to the
+// lengths the console shows, and counts and costs are brought into the
+// columns' ranges. It reports how many fields it changed.
 func Sanitize(e *Event) int {
 	fixed := 0
 	for _, id := range []*string{&e.APIKeyID, &e.UserID, &e.TeamID, &e.DeploymentID, &e.ProviderID} {
-		if *id != "" {
-			if _, err := uuid.Parse(*id); err != nil {
-				*id = ""
-				fixed++
-			}
+		if *id != "" && !isUUID(*id) {
+			*id = ""
+			fixed++
 		}
 	}
 	for _, f := range []struct {
 		s *string
 		n int
 	}{{&e.RequestID, 64}, {&e.ModelName, 256}, {&e.ErrorCode, 64}} {
-		if len(*f.s) > f.n {
-			*f.s = cut(*f.s, f.n)
+		v := *f.s
+		if strings.ContainsRune(v, 0) || !utf8.ValidString(v) {
+			v = strings.ToValidUTF8(strings.ReplaceAll(v, "\x00", ""), "")
+		}
+		if len(v) > f.n {
+			v = cut(v, f.n)
+		}
+		if v != *f.s {
+			*f.s = v
 			fixed++
 		}
 	}
@@ -66,10 +76,15 @@ func Sanitize(e *Event) int {
 		e.ModelName = "unknown"
 		fixed++
 	}
+	// The columns are int4: a larger count fails before it reaches Postgres.
 	for _, n := range []*int{&e.PromptTokens, &e.CompletionTokens, &e.CachedTokens, &e.CacheWrite5m,
 		&e.CacheWrite1h, &e.LatencyMS, &e.Attempts, &e.TTFTMs} {
-		if *n < 0 {
+		switch {
+		case *n < 0:
 			*n = 0
+			fixed++
+		case *n > math.MaxInt32:
+			*n = math.MaxInt32
 			fixed++
 		}
 	}
@@ -77,11 +92,26 @@ func Sanitize(e *Event) int {
 		e.StatusCode = 0
 		fixed++
 	}
-	if e.CostUSD < 0 {
-		e.CostUSD = 0
-		fixed++
+	// notional_cost_usd is numeric(18,10): at most 1e8. Nothing real costs
+	// that much in one request.
+	for _, f := range []*float64{&e.CostUSD, &e.NotionalCostUSD} {
+		if *f < 0 || *f >= maxUSD || math.IsNaN(*f) {
+			*f = 0
+			fixed++
+		}
 	}
 	return fixed
+}
+
+const maxUSD = 1e7
+
+// isUUID accepts only the canonical 36-character form Postgres stores.
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	_, err := uuid.Parse(s)
+	return err == nil
 }
 
 // cut shortens s to at most n bytes without splitting a UTF-8 sequence.
