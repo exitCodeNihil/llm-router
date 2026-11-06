@@ -317,7 +317,7 @@ func (w *worker) health() Health {
 	d := w.dest.Load()
 	n, b := w.q.depth()
 	w.st.mu.Lock()
-	h := Health{ID: d.ID, Name: d.Name, Kind: d.Kind, Queued: n, QueuedBytes: b, Delivered: w.st.delivered,
+	h := Health{ID: d.ID, Name: d.Name, Kind: d.Kind, Queued: n + int(w.sending.Load()), QueuedBytes: b, Delivered: w.st.delivered,
 		Dropped:   Dropped{Overflow: w.st.overflow, Rejected: w.st.rejected, Expired: w.st.expired},
 		LastError: w.st.lastErr}
 	ok, errAt := w.st.lastOK, w.st.lastErrAt

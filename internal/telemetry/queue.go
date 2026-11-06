@@ -129,7 +129,8 @@ type worker struct {
 
 	stop    context.CancelFunc
 	done    chan struct{}
-	flushOn atomic.Bool // deliver what is queued when stopped (shutdown)
+	flushOn atomic.Bool  // deliver what is queued when stopped (shutdown)
+	sending atomic.Int64 // records in the batch being delivered or retried
 }
 
 type sinkSlot struct {
@@ -161,7 +162,11 @@ func (w *worker) run(ctx context.Context) {
 			if len(batch) == 0 {
 				break
 			}
+			// Still waiting to be delivered, so health counts it as queued
+			// while it is retried.
+			w.sending.Store(int64(len(batch)))
 			w.deliver(ctx, batch)
+			w.sending.Store(0)
 		}
 	}
 }

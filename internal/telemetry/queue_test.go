@@ -307,3 +307,25 @@ func TestDeliverIsolatesAPoisonSpan(t *testing.T) {
 		}
 	}
 }
+
+// A batch waiting to be retried still counts as queued: an unreachable
+// destination must not read as having nothing waiting.
+func TestHealthCountsABatchBeingRetried(t *testing.T) {
+	retry := &ExportError{Retryable: true, Status: 503}
+	s := &fakeSink{got: make(chan []*Record, 10), errs: []error{retry, retry, retry, retry, retry, retry}}
+	p := fastPolicy()
+	p.BackoffMin, p.BackoffMax = time.Minute, time.Minute
+	w := testWorker(p, s)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); <-w.done }()
+	go w.run(ctx)
+	w.q.push(rec("1"))
+	w.q.push(rec("2"))
+	deadline := time.Now().Add(2 * time.Second)
+	for h := w.health(); (h.Queued != 2 || h.Status != "failing") && time.Now().Before(deadline); h = w.health() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if h := w.health(); h.Queued != 2 || h.Status != "failing" {
+		t.Fatalf("queued %d status %s, want 2 failing", h.Queued, h.Status)
+	}
+}
