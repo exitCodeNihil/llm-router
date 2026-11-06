@@ -687,7 +687,10 @@ s11() { # the Rust gateway's memory over a long run: 80%, then 120% of its 1-vCP
 		r=$((m * phase / 100))
 		log "s11: $r rps ($phase% of $m) for $SOAK_MIN min"
 		for ((seg = 1; seg <= SOAK_MIN / 5; seg++)); do
-			lg "s11-$phase-rgw-$seg" rgw openai oai fast -rate "$r" -duration 300s -warmup 0s -timeout 10s
+			# Past saturation requests pile up; the load generator holds ~70 KiB for each,
+			# so bound them or it, not the gateway, runs out of memory.
+			lg "s11-$phase-rgw-$seg" rgw openai oai fast -rate "$r" -duration 300s -warmup 0s -timeout 10s \
+				-max-in-flight 20000
 		done
 	done
 	log "s11: idle for 5 min, to see what memory the gateway gives back"
