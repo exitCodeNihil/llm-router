@@ -105,8 +105,23 @@ usage it held (up to 200,000 events) when it's back.
 A new join token stops further gateways joining with the old one; running ones carry on. Deleting a
 group stops its gateways getting config at once, and they stop serving within 15 minutes.
 
-The Rust gateway doesn't yet serve Google Vertex AI or Azure Entra providers, sign-in with identity
-tokens, or prompt capture for telemetry. The control plane's own `/v1` serves all of them.
+The Rust gateway doesn't yet serve sign-in with identity tokens or prompt capture for telemetry. The
+control plane's own `/v1` serves both.
+
+Google Vertex AI and Azure Entra ID providers need gateways from 0.3.0; older gateways don't receive
+them. A Vertex provider's service account key goes to the gateways that serve it. With application
+default credentials or Entra ID, each gateway uses its own identity, the same way the control plane
+does:
+
+- **Entra ID:** a client secret (`AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`), then
+  workload identity (`AZURE_FEDERATED_TOKEN_FILE`), then App Service or Container Apps managed
+  identity, then the VM or AKS managed identity. `AZURE_CLIENT_ID` alone picks a user-assigned
+  managed identity. `AZURE_AUTHORITY_HOST` selects a sovereign cloud.
+- **Google:** `GOOGLE_APPLICATION_CREDENTIALS` (a service account key or an `authorized_user` file),
+  then gcloud's application default credentials file, then the metadata server.
+
+Certificate credentials for Entra ID and Google `external_account` files aren't supported on gateways.
+A gateway logs why it refuses them, and requests to those providers fail with that reason.
 
 | Variable | Meaning |
 |---|---|
