@@ -134,7 +134,7 @@ A gateway logs why it refuses them, and requests to those providers fail with th
 | `LLMR_LISTEN` | Listen address, default `0.0.0.0:8080` |
 | `LLMR_WORKERS` | Worker threads; default: the container's CPU allowance |
 | `LLMR_MAX_IN_FLIGHT` | Above this many requests in flight, answer 503 with `Retry-After` (default 10000) |
-| `LLMR_SHUTDOWN_TIMEOUT` | Seconds to finish requests on SIGTERM before exiting (default 30) |
+| `LLMR_SHUTDOWN_TIMEOUT` | Seconds to finish requests on SIGTERM before exiting (default 30). Idle keep-alive connections close at once and the rest after their current request, so clients reconnect to another gateway |
 | `LLMR_GATEWAY_NAME` | Name on the Gateways page (default: the hostname) |
 
 `/healthz` answers 200 once the gateway has its config and has synced, and 503 while it starts or

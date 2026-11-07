@@ -20,7 +20,7 @@ http-body = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "http2", "native-tokio", "tls12"] }
-hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "client-legacy", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "server-graceful", "client-legacy", "http1", "http2"] }
 memchr = "2"
 mimalloc = { version = "0.1", default-features = false }
 ring = "0.17"

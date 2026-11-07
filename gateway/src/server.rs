@@ -17,10 +17,13 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
+use hyper::service::service_fn;
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto;
+use hyper_util::server::graceful::GracefulShutdown;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
@@ -46,6 +49,51 @@ pub struct State {
 impl State {
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed) && !self.draining.load(Ordering::Relaxed)
+    }
+}
+
+/// Serves `listener` until `shutdown` resolves, then drains: reports not
+/// ready, stops accepting, and asks every connection to close once its
+/// current request is done. An idle keep-alive connection closes at once, so
+/// a client holding one opens a new connection, which reaches another
+/// gateway, instead of sending this one requests until the drain runs out and
+/// they are cut off. Returns once every connection is closed and no request
+/// is in flight, or after `drain`.
+pub async fn run(
+    listener: tokio::net::TcpListener,
+    st: &'static State,
+    shutdown: impl Future<Output = ()>,
+    drain: Duration,
+) {
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder.http1().timer(TokioTimer::new()).header_read_timeout(Duration::from_secs(10));
+    builder.http2().timer(TokioTimer::new());
+    let builder = Arc::new(builder);
+    let graceful = GracefulShutdown::new();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let Ok((stream, _)) = accepted else { continue };
+                let _ = stream.set_nodelay(true);
+                let builder = builder.clone();
+                let watcher = graceful.watcher();
+                let conn = metrics::Connection::open();
+                tokio::spawn(async move {
+                    let _conn = conn;
+                    let svc = service_fn(move |req| handle(st, req));
+                    let _ = watcher.watch(builder.serve_connection(TokioIo::new(stream), svc)).await;
+                });
+            }
+            _ = &mut shutdown => break,
+        }
+    }
+    st.draining.store(true, Ordering::Relaxed);
+    drop(listener);
+    let deadline = Instant::now() + drain;
+    let _ = tokio::time::timeout_at(deadline.into(), graceful.shutdown()).await;
+    while metrics::IN_FLIGHT.load(Ordering::Relaxed) > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

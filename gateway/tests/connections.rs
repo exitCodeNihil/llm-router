@@ -5,10 +5,7 @@
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
-use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
-use llmr_gateway::metrics::{self, CONNECTIONS, OPEN_CONNECTIONS};
+use llmr_gateway::metrics::{CONNECTIONS, OPEN_CONNECTIONS};
 use llmr_gateway::server::{self, State};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -33,17 +30,7 @@ async fn open_connections_go_up_and_back_down() {
     }));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    // The accept loop of main.rs.
-    tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let conn = metrics::Connection::open();
-            tokio::spawn(async move {
-                let _conn = conn;
-                let svc = service_fn(move |req| server::handle(st, req));
-                let _ = auto::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(stream), svc).await;
-            });
-        }
-    });
+    tokio::spawn(server::run(listener, st, std::future::pending(), Duration::from_secs(1)));
 
     let mut clients = Vec::new();
     for _ in 0..3 {
