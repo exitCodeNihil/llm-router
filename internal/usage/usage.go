@@ -4,11 +4,14 @@
 package usage
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -349,8 +352,15 @@ func writeCounters(ctx context.Context, tx pgx.Tx, events []Event) error {
 	if len(agg) == 0 {
 		return nil
 	}
+	// Upsert in one fixed order: concurrent syncs that share counters (a
+	// user's, a team's) would otherwise lock them in opposite orders and
+	// deadlock.
+	keys := slices.SortedFunc(maps.Keys(agg), func(a, b counter) int {
+		return cmp.Or(strings.Compare(a.scopeType, b.scopeType), strings.Compare(a.scopeID, b.scopeID), a.day.Compare(b.day))
+	})
 	b := &pgx.Batch{}
-	for k, c := range agg {
+	for _, k := range keys {
+		c := agg[k]
 		b.Queue(`INSERT INTO spend_counters (scope_type, scope_id, period_start, usd, tokens)
 			VALUES ($1,$2,$3,$4,$5)
 			ON CONFLICT (scope_type, scope_id, period_start)
