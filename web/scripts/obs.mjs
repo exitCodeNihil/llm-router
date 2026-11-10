@@ -15,9 +15,10 @@
 // upstream this script serves itself.
 import http from "node:http";
 import { chromium } from "playwright";
+import { fixtures } from "./fixtures.mjs";
 
-const BASE = process.env.BASE ?? "http://localhost:5173";
-const API = process.env.API ?? "http://localhost:8080";
+const BASE = process.argv[2] ?? process.env.BASE ?? "http://localhost:5173";
+const API = process.argv[3] ?? process.env.API ?? "http://localhost:8080";
 const TOKEN = process.env.LLMR_ADMIN_TOKEN ?? "dev-admin-token";
 const OTLP = process.env.OTLP ?? "http://localhost:4318";
 const TEMPO = process.env.TEMPO ?? "http://localhost:3200";
@@ -73,6 +74,7 @@ await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
 const created = { providers: [], deployments: [], keys: [] };
 const original = await api("/api/settings/telemetry");
 
+const cleanup = await fixtures(API, TOKEN);
 const browser = await chromium.launch();
 const ctx = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
 // The console reads its admin token from localStorage; without it every page
@@ -389,6 +391,7 @@ try {
     (await page.getByRole("radiogroup", { name: "Capture mode" }).getByRole("radio", { name: "By rule" }).getAttribute("aria-checked")) === "true",
   );
 } finally {
+  await cleanup();
   for (const d of (await destinations()) ?? []) {
     if (d.name.startsWith(TAG)) await api(`/api/telemetry/destinations/${d.id}`, { method: "DELETE" });
   }

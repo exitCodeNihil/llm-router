@@ -5,9 +5,10 @@
 // and then *cancelled*, and the API is checked to prove nothing changed. Only a
 // throwaway probe key is actually toggled, and it is deleted afterwards.
 import { chromium } from "playwright";
+import { fixtures } from "./fixtures.mjs";
 
-const BASE = process.env.BASE ?? "http://localhost:5173";
-const API = process.env.API ?? "http://localhost:8080";
+const BASE = process.argv[2] ?? process.env.BASE ?? "http://localhost:5173";
+const API = process.argv[3] ?? process.env.API ?? "http://localhost:8080";
 const TOKEN = process.env.LLMR_ADMIN_TOKEN ?? "dev-admin-token";
 const HEAD = { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" };
 
@@ -23,6 +24,7 @@ const check = (name, cond, detail = "") => {
   }
 };
 
+const cleanup = await fixtures(API, TOKEN);
 const browser = await chromium.launch();
 const ctx = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
 await ctx.addInitScript((t) => {
@@ -156,6 +158,7 @@ try {
   await page.waitForTimeout(400);
   check("capture policy still stored as before", (await modeOf()) === savedMode);
 } finally {
+  await cleanup();
   if (probeKeyId) {
     await api.delete(`${API}/api/keys/${probeKeyId}`, { headers: HEAD });
     const left = await (await api.get(`${API}/api/keys`, { headers: HEAD })).json();

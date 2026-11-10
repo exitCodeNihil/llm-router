@@ -4,9 +4,12 @@
  * Verifies the accessibility behaviour the hand-rolled console was missing.
  */
 import { chromium } from "playwright";
+import { fixtures } from "./fixtures.mjs";
 
 const BASE = process.argv[2] ?? "http://localhost:5173";
+const API = process.argv[3] ?? "http://localhost:8080";
 const TOKEN = process.env.LLMR_TOKEN ?? "dev-admin-token";
+const cleanup = await fixtures(API, TOKEN);
 const results = [];
 const check = (name, pass, detail = "") => {
   results.push({ name, pass, detail });
@@ -188,6 +191,7 @@ if (chipCount > 2) {
 check("no console/page errors during interactions", errors.length === 0, errors.slice(0, 3).join(" | "));
 
 await browser.close();
+await cleanup();
 
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${results.length - failed.length}/${results.length} interaction checks passed`);

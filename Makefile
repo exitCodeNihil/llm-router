@@ -139,7 +139,7 @@ audit: $(NODE_DEPS) ## Console audit: every route x 3 viewports (AUDIT_MODE=both
 
 verify: $(NODE_DEPS) ## Browser suite: audit + interactions + e2e + CRUD + observability + guards
 	@AUDIT_MODE=both node $(WEB)/scripts/audit.mjs http://localhost:$(WEB_PORT)
-	@node $(WEB)/scripts/interact.mjs http://localhost:$(WEB_PORT)
+	@node $(WEB)/scripts/interact.mjs http://localhost:$(WEB_PORT) http://localhost:$(PORT)
 	@node $(WEB)/scripts/e2e.mjs      http://localhost:$(WEB_PORT) http://localhost:$(PORT)
 	@node $(WEB)/scripts/crud.mjs     http://localhost:$(WEB_PORT) http://localhost:$(PORT)
 	@node $(WEB)/scripts/obs.mjs      http://localhost:$(WEB_PORT) http://localhost:$(PORT)

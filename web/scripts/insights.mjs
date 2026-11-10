@@ -9,6 +9,7 @@
  * own API key, deployment context value and chats, and removes them all.
  */
 import { chromium } from "playwright";
+import { fixtures } from "./fixtures.mjs";
 
 const BASE = process.argv[2] ?? "http://localhost:5173";
 const API = process.argv[3] ?? "http://localhost:8080";
@@ -33,6 +34,7 @@ const admin = async (path, init = {}) => {
 
 // ── Fixtures: a model-restricted key and a known context window ──
 const stubAlias = "claude-test";
+const cleanup = await fixtures(API, TOKEN, stubAlias);
 const deployments = await admin("/api/deployments");
 const stub = deployments.find((d) => d.model_name === stubAlias && d.enabled);
 const other = deployments.find((d) => d.model_name !== stubAlias && d.enabled);
@@ -212,6 +214,7 @@ check("probe key removed", keysLeft.length === 0);
 check("pre-existing chats intact", (await listChats()).length === preExisting.size);
 
 await browser.close();
+await cleanup();
 const failed = results.filter((r) => !r).length;
 console.log(`\n${results.length - failed}/${results.length} operator-readout checks passed`);
 process.exit(failed ? 1 : 0);

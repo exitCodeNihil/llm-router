@@ -4,6 +4,7 @@
  * Also exercises the streaming playground.
  */
 import { chromium } from "playwright";
+import { fixtures } from "./fixtures.mjs";
 
 const BASE = process.argv[2] ?? "http://localhost:5173";
 const API = process.argv[3] ?? "http://localhost:8080";
@@ -12,6 +13,7 @@ const API = process.argv[3] ?? "http://localhost:8080";
 const STUB_ALIAS = process.env.LLMR_STUB_ALIAS ?? "claude-test";
 const TOKEN = process.env.LLMR_TOKEN ?? "dev-admin-token";
 const NAME = `pilot-e2e-${Date.now()}`;
+const cleanup = await fixtures(API, TOKEN, STUB_ALIAS);
 
 const results = [];
 const check = (name, pass, detail = "") => {
@@ -164,6 +166,7 @@ check(
 check("no page errors during e2e", errors.length === 0, errors.slice(0, 2).join(" | "));
 
 await browser.close();
+await cleanup();
 const failed = results.filter((r) => !r).length;
 console.log(`\n${results.length - failed}/${results.length} e2e checks passed`);
 process.exit(failed ? 1 : 0);
