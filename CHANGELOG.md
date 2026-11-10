@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/exitCodeNihil/llm-router/compare/v0.3.0...v0.3.1) (2026-11-10)
+
+
+### Bug Fixes
+
+* dependency advisories and console glitches ([#21](https://github.com/exitCodeNihil/llm-router/issues/21)) ([4cb81da](https://github.com/exitCodeNihil/llm-router/commit/4cb81da49a8d2ee3061ce958b4b5ee09ce4fee73))
+
 ## [0.3.0](https://github.com/exitCodeNihil/llm-router/compare/v0.2.2...v0.3.0) (2026-11-10)
 
 
