@@ -92,16 +92,24 @@ export async function fixtures(API, TOKEN, alias = "claude-test") {
   // The control plane picks up a new model within a moment.
   if (undo.length) await new Promise((r) => setTimeout(r, 1500));
 
-  // The Dashboard's flow and health cards only draw with traffic.
+  // The Dashboard's flow and health cards only draw with traffic, and the flow
+  // needs two keys for one to be unrelated to the other. Deleted keys fold
+  // into one node, so these stay until cleanup.
   if ((await admin("/api/usage/requests?limit=1")).length === 0) {
-    const k = await admin("/api/keys", "POST", { name: `${NAME}-traffic`, user_id: users[0].id });
-    for (let i = 0; i < 3; i++)
-      await fetch(`${API}/v1/messages`, {
-        method: "POST",
-        headers: { "x-api-key": k.key, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
-        body: JSON.stringify({ model: alias, max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
-      });
-    await admin(`/api/keys/${k.id}`, "DELETE");
+    for (const n of [1, 2]) {
+      const k = await admin("/api/keys", "POST", { name: `${NAME}-traffic-${n}`, user_id: users[0].id });
+      undo.push(() => admin(`/api/keys/${k.id}`, "DELETE"));
+      // A new key works once the control plane has reloaded its config.
+      for (let sent = 0, tries = 0; sent < 2 && tries < 20; tries++) {
+        const res = await fetch(`${API}/v1/messages`, {
+          method: "POST",
+          headers: { "x-api-key": k.key, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
+          body: JSON.stringify({ model: alias, max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
+        });
+        if (res.ok) sent++;
+        else await new Promise((r) => setTimeout(r, 500));
+      }
+    }
     await new Promise((r) => setTimeout(r, 2500)); // usage is written in batches
   }
 
