@@ -401,7 +401,7 @@ func tryDeployments(ctx context.Context, deployments []*snapshot.Deployment, ups
 			}
 			upstreamHealth.fail(d.ID, 0, time.Now())
 			slog.Warn("upstream failed", "provider", d.Provider.Name, "deployment", d.UpstreamName,
-				"timed_out", actx.Err() != nil, "err", err)
+				"timed_out", timedOut, "err", err)
 			continue
 		}
 		res.Body = cancelOnClose{res.Body, cancel}
