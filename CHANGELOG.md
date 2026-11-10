@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0](https://github.com/exitCodeNihil/llm-router/compare/v0.2.2...v0.3.0) (2026-11-10)
+
+
+### ⚠ BREAKING CHANGES
+
+* OTLP and Langfuse v4 destinations, gateway parity, monitoring ([#17](https://github.com/exitCodeNihil/llm-router/issues/17))
+
+### Features
+
+* OTLP and Langfuse v4 destinations, gateway parity, monitoring ([#17](https://github.com/exitCodeNihil/llm-router/issues/17)) ([de7f090](https://github.com/exitCodeNihil/llm-router/commit/de7f0904b5f54a08d2a94d432a8272b463ba7226))
+
 ## [0.2.2](https://github.com/exitCodeNihil/llm-router/compare/v0.2.1...v0.2.2) (2026-11-06)
 
 
