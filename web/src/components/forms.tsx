@@ -133,24 +133,27 @@ export function TagsInput({
   return (
     <VStack gap={2}>
       <HStack gap={2} vAlign="end">
-        <TextInput
-          label={label}
-          description={description}
-          placeholder="Add a tag and press Enter"
-          value={draft}
-          onChange={setDraft}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" || e.key === ",") {
-              e.preventDefault();
-              add();
-            }
-            // Backspace on an empty field removes the last tag — standard
-            // chip-input behaviour users expect.
-            if (e.key === "Backspace" && !draft && value.length) {
-              onChange(value.slice(0, -1));
-            }
-          }}
-        />
+        {/* Wide enough that the placeholder, which says how to add one, isn't cut off. */}
+        <div style={{ flex: "1 1 240px", minWidth: 240, maxWidth: 360 }}>
+          <TextInput
+            label={label}
+            description={description}
+            placeholder="Add a tag and press Enter"
+            value={draft}
+            onChange={setDraft}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === ",") {
+                e.preventDefault();
+                add();
+              }
+              // Backspace on an empty field removes the last tag — standard
+              // chip-input behaviour users expect.
+              if (e.key === "Backspace" && !draft && value.length) {
+                onChange(value.slice(0, -1));
+              }
+            }}
+          />
+        </div>
         <Button
           label="Add"
           variant="secondary"

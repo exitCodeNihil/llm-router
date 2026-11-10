@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import type { ReactNode } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Card } from "@astryxdesign/core/Card";
 import { Token } from "@astryxdesign/core/Token";
@@ -29,9 +30,10 @@ import {
   useDestinations,
   useUsageByModel,
 } from "../lib/hooks";
-import { compact, int, money } from "../lib/format";
+import { compact, dateTime, int, money } from "../lib/format";
 import { Empty, ErrorState, Loading, Page } from "../components/Page";
 import { TagsInput } from "../components/forms";
+import { FormDialog } from "../components/dialogs";
 
 type StatusOpt = "all" | "ok" | "err";
 
@@ -50,6 +52,69 @@ function traceLinks(dests: TelemetryDestination[], r: RequestRow) {
   return out;
 }
 
+/** Everything recorded for one request, for the ids and numbers the table
+ * has no room for. */
+function RequestDetail({
+  row: r,
+  links,
+  onClose,
+}: {
+  row: RequestRow | null;
+  links: { name: string; url: string }[];
+  onClose: () => void;
+}) {
+  if (!r) return null;
+  const free = r.cost_usd === 0 && !!r.notional_cost_usd;
+  const fields: [string, ReactNode][] = [
+    ["Time", dateTime(r.ts)],
+    ["Request id", <Code key="r">{r.request_id}</Code>],
+    ["Trace id", r.trace_id ? <Code key="t">{r.trace_id}</Code> : "—"],
+    ["Model", <Code key="m">{r.model_name || "—"}</Code>],
+    ["Upstream", r.upstream_name ? `${r.upstream_name}${r.provider_name ? ` · ${r.provider_name}` : ""}` : "—"],
+    ["Key", r.key_name ?? "—"],
+    ["Status", `${r.status_code}${r.error_code ? ` · ${r.error_code}` : ""}`],
+    ["Attempts", r.attempts ? String(r.attempts) : "—"],
+    ["Streamed", r.stream ? "yes" : "no"],
+    ["Latency", `${int(r.latency_ms)} ms${r.ttft_ms ? ` · ${int(r.ttft_ms)} ms to first token` : ""}`],
+    ["Tokens", `${int(r.prompt_tokens)} in · ${int(r.completion_tokens)} out`],
+    [
+      "Cost",
+      free
+        ? `$0.00 · list value ≈${money(r.notional_cost_usd ?? 0, { precise: true })}`
+        : money(r.cost_usd, { precise: true }),
+    ],
+  ];
+  return (
+    <FormDialog isOpen onClose={onClose} title="Request" subtitle="What the gateway recorded for this request.">
+      <VStack gap={2}>
+        {fields.map(([label, value]) => (
+          <HStack key={label} gap={3} vAlign="start">
+            <div style={{ width: 96, flexShrink: 0 }}>
+              <Text type="supporting" color="secondary">
+                {label}
+              </Text>
+            </div>
+            <div style={{ minWidth: 0, overflowWrap: "anywhere" }}>
+              <Text type="body">{value}</Text>
+            </div>
+          </HStack>
+        ))}
+      </VStack>
+      <HStack gap={2} hAlign="end" wrap="wrap">
+        {links.map((l) => (
+          <Button
+            key={l.name}
+            label={`Open the trace in ${l.name}`}
+            variant="secondary"
+            onClick={() => window.open(l.url, "_blank", "noreferrer")}
+          />
+        ))}
+        <Button label="Close" variant="ghost" onClick={onClose} />
+      </HStack>
+    </FormDialog>
+  );
+}
+
 export default function Requests() {
   // Seeded from the query string so "view matching requests" on the analytics
   // page lands here with the same filters, showing the rows behind the number.
@@ -64,6 +129,7 @@ export default function Requests() {
     sp.get("tag") ? [sp.get("tag")!] : [],
   );
   const [search, setSearch] = useState("");
+  const [detail, setDetail] = useState<RequestRow | null>(null);
   // Passed straight through: no control for these yet, but a drill-down that
   // silently dropped them would show a different set than it promised.
   const passthrough = {
@@ -118,7 +184,11 @@ export default function Requests() {
       key: "ts",
       header: "Time",
       width: pixel(116),
-      renderCell: (r) => <Timestamp value={r.ts} format="relative" isLive />,
+      renderCell: (r) => (
+        <button type="button" className="rowlink" title="Show this request's details" onClick={() => setDetail(r)}>
+          <Timestamp value={r.ts} format="relative" isLive />
+        </button>
+      ),
     },
     {
       key: "key_name",
@@ -301,6 +371,7 @@ export default function Requests() {
         ) : undefined
       }
     >
+      <RequestDetail row={detail} links={detail ? traceLinks(linked, detail) : []} onClose={() => setDetail(null)} />
       <VStack gap={4}>
         <Card>
           {/* Toolbar propagates its `size` to every child control via SizeContext,
