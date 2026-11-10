@@ -23,7 +23,7 @@ import { useMe,
   useUsageSummary,
 } from "../lib/hooks";
 import type { FlowEdgeRow, UsageByModel, UsageRecent } from "../lib/types";
-import { compact, dateShort, int, money, plural } from "../lib/format";
+import { compact, dateShort, int, money, moneyAxis, plural } from "../lib/format";
 import { Empty, ErrorState, Loading, Page } from "../components/Page";
 import { Breakdown, ChartCard, SERIES_COLORS, SpendArea, Stat, TokensBars, chart } from "../components/charts";
 import { Sankey, type SankeyEdge, type SankeyNode } from "../components/Sankey";
@@ -189,7 +189,12 @@ function ProviderSpend({ days, colorOf }: { days: number; colorOf: ColorOf }) {
       {rows.length === 0 ? (
         <Empty title="No provider spend in this range" />
       ) : (
-        <TokensBars data={rows as Array<Record<string, unknown>>} xKey="label" series={series} />
+        <TokensBars
+          data={rows as Array<Record<string, unknown>>}
+          xKey="label"
+          series={series}
+          formatValue={moneyAxis}
+        />
       )}
     </ChartCard>
   );
@@ -491,7 +496,7 @@ export default function Dashboard() {
               }
             >
               {metric === "cost_usd" ? (
-                <SpendArea data={trend} xKey="label" yKey="cost_usd" formatValue={(v) => money(Number(v))} />
+                <SpendArea data={trend} xKey="label" yKey="cost_usd" formatValue={(v) => moneyAxis(Number(v))} />
               ) : metric === "requests" ? (
                 <TokensBars
                   data={trend}

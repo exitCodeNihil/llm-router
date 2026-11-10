@@ -151,18 +151,29 @@ export function TokensBars({
   data,
   xKey,
   series,
+  formatValue,
 }: {
   data: Array<Record<string, unknown>>;
   xKey: string;
   series: Array<{ key: string; name: string; color: string }>;
+  formatValue?: (v: number) => string;
 }) {
   return (
     <ResponsiveContainer width="100%" height="100%">
       <BarChart data={data} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
       <CartesianGrid horizontal vertical={false} stroke={chart.grid} />
       <XAxis dataKey={xKey} tick={axisTick} axisLine={false} tickLine={false} minTickGap={24} />
-      <YAxis tick={axisTick} axisLine={false} tickLine={false} width={52} />
-      <Tooltip content={<ChartTooltip />} cursor={{ fill: "var(--color-overlay-hover)" }} />
+      <YAxis
+        tick={axisTick}
+        axisLine={false}
+        tickLine={false}
+        width={formatValue ? 64 : 52}
+        tickFormatter={formatValue && ((v) => formatValue(Number(v)))}
+      />
+      <Tooltip
+        content={<ChartTooltip format={formatValue && ((v, name) => `${name}: ${formatValue(Number(v))}`)} />}
+        cursor={{ fill: "var(--color-overlay-hover)" }}
+      />
       {series.map((s, i) => (
         <Bar
           key={s.key}

@@ -1,3 +1,10 @@
+/** Money on a chart axis or tooltip: enough decimals that even ticks ($0.015,
+ * $0.03, $0.045) don't round into uneven ones ($0.02, $0.03, $0.05). */
+export function moneyAxis(v: number): string {
+  if (v > 0 && v < 0.001) return money(v);
+  return "$" + v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+}
+
 export function money(v: number, opts?: { precise?: boolean }): string {
   // Sub-millicent amounts (one Gemini Flash call) round to "$0.0000" at four
   // places, which reads as free; two significant digits keeps them honest.
