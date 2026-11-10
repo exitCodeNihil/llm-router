@@ -108,7 +108,7 @@ function ClusterTable() {
     {
       key: "p50_ms",
       header: "p50",
-      width: pixel(80),
+      width: pixel(100),
       align: "end",
       renderCell: (n) => (n.p50_ms ? `${int(n.p50_ms)} ms` : "—"),
     },
