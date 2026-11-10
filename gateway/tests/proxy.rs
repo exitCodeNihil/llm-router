@@ -103,6 +103,11 @@ async fn gateway(model: &str, deployments: &[(&str, &str, &str)]) -> String {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let digest = ring::digest::digest(&ring::digest::SHA256, KEY.as_bytes());
     let hash: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    // Cooldowns are kept per deployment id for the whole process, so each
+    // gateway gets its own ids: one test's failed deployment must not be
+    // cooling in another's.
+    static GATEWAYS: AtomicUsize = AtomicUsize::new(0);
+    let g = GATEWAYS.fetch_add(1, Ordering::Relaxed);
     let mut providers = Vec::new();
     let mut deps = Vec::new();
     for (i, (url, flavor, auth)) in deployments.iter().enumerate() {
@@ -114,7 +119,7 @@ async fn gateway(model: &str, deployments: &[(&str, &str, &str)]) -> String {
                 "service_account_id": "svac_1", "identity_token_file": "/nonexistent/llmr-test-token"});
         }
         providers.push(p);
-        deps.push(json!({"id": format!("d{i}"), "provider_id": format!("p{i}"), "model_name": model,
+        deps.push(json!({"id": format!("g{g}-d{i}"), "provider_id": format!("p{i}"), "model_name": model,
             "upstream_name": format!("up{i}"), "api_flavor": flavor}));
     }
     let wire: Wire = serde_json::from_value(json!({
