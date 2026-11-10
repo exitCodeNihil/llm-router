@@ -3,7 +3,7 @@
 //! verdict, captured content) and the X-Llmr-Trace-Id a caller gets back.
 //! internal/gateway holds the same cases for the Go gateway.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use http::{HeaderMap, Request, Response, StatusCode};
@@ -136,10 +136,14 @@ async fn call(url: String, body: &str, traceparent: Option<&str>) -> (StatusCode
     (parts.status, parts.headers, body.collect().await.unwrap().to_bytes())
 }
 
+/// The usage events recorded for `model`. The queue is one per process and
+/// tests run in parallel, so events drained for other tests are kept for them.
 fn events(model: &str) -> Vec<Event> {
-    let (mine, rest): (Vec<Event>, Vec<Event>) =
-        usage::take(usize::MAX, usize::MAX).into_iter().partition(|e| e.model_name == model);
-    usage::requeue(rest);
+    static SEEN: Mutex<Vec<Event>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap();
+    seen.extend(usage::take(usize::MAX, usize::MAX));
+    let (mine, rest) = std::mem::take(&mut *seen).into_iter().partition(|e| e.model_name == model);
+    *seen = rest;
     mine
 }
 
