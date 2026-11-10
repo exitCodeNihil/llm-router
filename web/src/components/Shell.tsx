@@ -16,7 +16,6 @@ import {
   SideNavSection,
 } from "@astryxdesign/core/SideNav";
 import { TopNav, TopNavHeading } from "@astryxdesign/core/TopNav";
-import { NavIcon } from "@astryxdesign/core/NavIcon";
 import { HStack } from "@astryxdesign/core/Stack";
 import { Text } from "@astryxdesign/core/Text";
 import { IconButton } from "@astryxdesign/core/IconButton";
@@ -205,7 +204,7 @@ export default function Shell({
           heading={
             <TopNavHeading
               heading="llm-router"
-              logo={<NavIcon icon={<IconSignal width={16} height={16} />} />}
+              logo={<IconSignal width={24} height={24} />}
             />
           }
           endContent={

@@ -42,3 +42,23 @@ body {
 .recharts-surface:focus {
   outline: none;
 }
+
+/* A table cell that opens its row's details: reads as the cell's text, with a
+   link's affordance on hover and focus. */
+.rowlink {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-align: start;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+.rowlink:hover,
+.rowlink:focus-visible {
+  color: var(--color-accent);
+  text-decoration-style: solid;
+}

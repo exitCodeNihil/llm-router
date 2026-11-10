@@ -56,7 +56,7 @@ func watchConfigEpoch(ctx context.Context, holder *snapshot.Holder, events *metr
 		case <-t.C:
 			if s := holder.Get(); s != nil && s.Version != last {
 				if last != 0 {
-					events.Add("info", "config epoch "+strconv.FormatInt(s.Version, 10)+" applied")
+					events.Replace("config epoch ", "info", "config epoch "+strconv.FormatInt(s.Version, 10)+" applied")
 				}
 				last = s.Version
 			}

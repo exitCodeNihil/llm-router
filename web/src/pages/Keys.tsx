@@ -452,7 +452,7 @@ export default function Keys({ me }: { me: Me }) {
     {
       key: "owner",
       header: "Owner",
-      width: proportional(1),
+      width: proportional(2),
       renderCell: (k) =>
         ownerLabel(k, teamName(k.team_id), userEmail(k.user_id)),
     },

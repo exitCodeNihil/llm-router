@@ -180,6 +180,7 @@ export function TokensBars({
           dataKey={s.key}
           name={s.name}
           stackId="t"
+          maxBarSize={72}
           fill={s.color}
           isAnimationActive={false}
           radius={i === series.length - 1 ? [3, 3, 0, 0] : undefined}
