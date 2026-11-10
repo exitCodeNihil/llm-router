@@ -53,6 +53,15 @@ const CATALOG_PREFIX: Partial<Record<ProviderType, string>> = {
   openrouter: "openrouter",
 };
 
+/** Placeholder examples that match the provider picked, so an Anthropic
+ * provider isn't illustrated with an OpenAI model. */
+const EXAMPLES: Partial<Record<ProviderType, { model: string; upstream: string; catalog: string }>> = {
+  anthropic: { model: "claude-sonnet-5-5", upstream: "claude-sonnet-5-5", catalog: "anthropic/claude-sonnet-5-5" },
+  gcp_vertex: { model: "claude-sonnet-5-5", upstream: "claude-sonnet-5-5", catalog: "gcp/claude-sonnet-5-5" },
+  openrouter: { model: "gpt-4o", upstream: "openai/gpt-4o", catalog: "openrouter/openai/gpt-4o" },
+};
+const DEFAULT_EXAMPLE = { model: "gpt-4o", upstream: "gpt-4o-2024-08-06", catalog: "azure/gpt-4o-2024-08-06" };
+
 function DeploymentForm({
   editing,
   onClose,
@@ -96,6 +105,8 @@ function DeploymentForm({
   const selectedProvider = (providers.data ?? []).find(
     (p) => p.id === providerId,
   );
+
+  const example = (selectedProvider && EXAMPLES[selectedProvider.type]) || DEFAULT_EXAMPLE;
 
   type UpstreamMeta = { model?: string; isManual?: boolean };
 
@@ -239,7 +250,7 @@ function DeploymentForm({
             label="Model name"
             value={modelName}
             onChange={setModelName}
-            placeholder="gpt-4o"
+            placeholder={example.model}
             description="What clients send as the model. End with * to match a prefix, e.g. claude-*"
             isRequired
           />
@@ -248,7 +259,7 @@ function DeploymentForm({
             value={selectedItem}
             onChange={pickUpstream}
             searchSource={searchSource}
-            placeholder="gpt-4o-2024-08-06"
+            placeholder={example.upstream}
             description={upstreamHint}
             hasEntriesOnFocus
             isRequired
@@ -313,7 +324,7 @@ function DeploymentForm({
                 label="Catalog model id"
                 value={catalogId}
                 onChange={setCatalogId}
-                placeholder="azure/gpt-4o-2024-08-06"
+                placeholder={example.catalog}
                 description="Uses the native price catalog"
               />
             ) : (
