@@ -55,8 +55,13 @@ func (m *Server) metricsLive(w http.ResponseWriter, r *http.Request) {
 		if total > 0 {
 			share = float64(p.Count) / float64(total) * 100
 		}
+		// Traffic outlives the provider that served it.
+		name := provName[p.ID]
+		if name == "" {
+			name = "(deleted provider)"
+		}
 		providers = append(providers, map[string]any{
-			"id": p.ID, "name": provName[p.ID], "p50_ms": p.P50, "p95_ms": p.P95,
+			"id": p.ID, "name": name, "p50_ms": p.P50, "p95_ms": p.P95,
 			"err_pct": round1(p.ErrPct), "rpm": p.RPM, "share_pct": round1(share), "led": ledFor(p.ErrPct),
 		})
 	}
