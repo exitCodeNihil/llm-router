@@ -12,11 +12,13 @@
  * chats it created itself.
  */
 import { chromium } from "playwright";
+import { fixtures } from "./fixtures.mjs";
 
 const BASE = process.argv[2] ?? "http://localhost:5173";
 const API = process.argv[3] ?? "http://localhost:8080";
 const USER = process.env.LLMR_USER ?? "dev@local";
 const PASS = process.env.LLMR_PASS ?? "devpassword123";
+const cleanup = await fixtures(API, process.env.LLMR_TOKEN ?? "dev-admin-token");
 
 const TAG = `probe-${Date.now()}`;
 const results = [];
@@ -214,6 +216,7 @@ const leftover = (await listChats()).length;
 check("cleanup left pre-existing chats intact", leftover === preExisting.size, `${leftover} chats remain`);
 
 await browser.close();
+await cleanup();
 const failed = results.filter((r) => !r).length;
 console.log(`\n${results.length - failed}/${results.length} playground checks passed`);
 process.exit(failed ? 1 : 0);

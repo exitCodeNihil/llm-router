@@ -1,0 +1,321 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "llm-router"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "llm-router"
+          },
+          "spans": [
+            {
+              "traceId": "S/kvNXezTaajzpKdDg5HNg==",
+              "spanId": "mRLXhH1abCo=",
+              "parentSpanId": "APBnqgupArc=",
+              "name": "chat claude-sonnet-5-5",
+              "kind": "SPAN_KIND_CLIENT",
+              "startTimeUnixNano": "1793966400000000000",
+              "endTimeUnixNano": "1793966401500000000",
+              "attributes": [
+                {
+                  "key": "gen_ai.operation.name",
+                  "value": {
+                    "stringValue": "chat"
+                  }
+                },
+                {
+                  "key": "gen_ai.provider.name",
+                  "value": {
+                    "stringValue": "anthropic"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.model",
+                  "value": {
+                    "stringValue": "claude-sonnet-5-5"
+                  }
+                },
+                {
+                  "key": "gen_ai.response.model",
+                  "value": {
+                    "stringValue": "claude-sonnet-5-5-20261001"
+                  }
+                },
+                {
+                  "key": "gen_ai.request.stream",
+                  "value": {
+                    "boolValue": true
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.input_tokens",
+                  "value": {
+                    "intValue": "1200"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.output_tokens",
+                  "value": {
+                    "intValue": "80"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.cache_read.input_tokens",
+                  "value": {
+                    "intValue": "1000"
+                  }
+                },
+                {
+                  "key": "gen_ai.usage.cache_write.input_tokens",
+                  "value": {
+                    "intValue": "150"
+                  }
+                },
+                {
+                  "key": "llmr.usage.cache_write_1h.input_tokens",
+                  "value": {
+                    "intValue": "50"
+                  }
+                },
+                {
+                  "key": "http.response.status_code",
+                  "value": {
+                    "intValue": "200"
+                  }
+                },
+                {
+                  "key": "server.address",
+                  "value": {
+                    "stringValue": "api.anthropic.com"
+                  }
+                },
+                {
+                  "key": "user.id",
+                  "value": {
+                    "stringValue": "22222222-2222-2222-2222-222222222222"
+                  }
+                },
+                {
+                  "key": "llmr.request.id",
+                  "value": {
+                    "stringValue": "req_0123456789abcdef"
+                  }
+                },
+                {
+                  "key": "llmr.key.id",
+                  "value": {
+                    "stringValue": "11111111-1111-1111-1111-111111111111"
+                  }
+                },
+                {
+                  "key": "llmr.team.id",
+                  "value": {
+                    "stringValue": "33333333-3333-3333-3333-333333333333"
+                  }
+                },
+                {
+                  "key": "llmr.gateway.group.id",
+                  "value": {
+                    "stringValue": "77777777-7777-7777-7777-777777777777"
+                  }
+                },
+                {
+                  "key": "llmr.gateway.instance.id",
+                  "value": {
+                    "stringValue": "66666666-6666-6666-6666-666666666666"
+                  }
+                },
+                {
+                  "key": "llmr.deployment.id",
+                  "value": {
+                    "stringValue": "44444444-4444-4444-4444-444444444444"
+                  }
+                },
+                {
+                  "key": "llmr.provider.id",
+                  "value": {
+                    "stringValue": "55555555-5555-5555-5555-555555555555"
+                  }
+                },
+                {
+                  "key": "llmr.cost.usd",
+                  "value": {
+                    "doubleValue": 0.0123
+                  }
+                },
+                {
+                  "key": "llmr.cost.basis",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "llmr.inference_geo",
+                  "value": {
+                    "stringValue": "us"
+                  }
+                },
+                {
+                  "key": "llmr.speed",
+                  "value": {
+                    "stringValue": "standard"
+                  }
+                },
+                {
+                  "key": "llmr.attempts",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "llmr.ttft_ms",
+                  "value": {
+                    "intValue": "300"
+                  }
+                },
+                {
+                  "key": "llmr.rule.id",
+                  "value": {
+                    "stringValue": "rule-1"
+                  }
+                },
+                {
+                  "key": "gen_ai.system_instructions",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "kvlistValue": {
+                            "values": [
+                              {
+                                "key": "type",
+                                "value": {
+                                  "stringValue": "text"
+                                }
+                              },
+                              {
+                                "key": "content",
+                                "value": {
+                                  "stringValue": "Answer briefly."
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "gen_ai.input.messages",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "kvlistValue": {
+                            "values": [
+                              {
+                                "key": "role",
+                                "value": {
+                                  "stringValue": "user"
+                                }
+                              },
+                              {
+                                "key": "parts",
+                                "value": {
+                                  "arrayValue": {
+                                    "values": [
+                                      {
+                                        "kvlistValue": {
+                                          "values": [
+                                            {
+                                              "key": "type",
+                                              "value": {
+                                                "stringValue": "text"
+                                              }
+                                            },
+                                            {
+                                              "key": "content",
+                                              "value": {
+                                                "stringValue": "What is 6*7?"
+                                              }
+                                            }
+                                          ]
+                                        }
+                                      }
+                                    ]
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  }
+                },
+                {
+                  "key": "gen_ai.output.messages",
+                  "value": {
+                    "arrayValue": {
+                      "values": [
+                        {
+                          "kvlistValue": {
+                            "values": [
+                              {
+                                "key": "role",
+                                "value": {
+                                  "stringValue": "assistant"
+                                }
+                              },
+                              {
+                                "key": "parts",
+                                "value": {
+                                  "arrayValue": {
+                                    "values": [
+                                      {
+                                        "kvlistValue": {
+                                          "values": [
+                                            {
+                                              "key": "type",
+                                              "value": {
+                                                "stringValue": "text"
+                                              }
+                                            },
+                                            {
+                                              "key": "content",
+                                              "value": {
+                                                "stringValue": "42"
+                                              }
+                                            }
+                                          ]
+                                        }
+                                      }
+                                    ]
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

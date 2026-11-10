@@ -91,7 +91,13 @@ func (g *Server) authenticate(next http.Handler) http.Handler {
 			var err error
 			id, err = g.CloudAuth(r.Context(), snap, token)
 			if err != nil {
-				writeAuthError(w, "invalid identity token: "+err.Error())
+				// The detail can name the issuer's URLs or a database error.
+				if auth.IssuerUnavailable(err) {
+					slog.Warn("identity token not verified", "err", err)
+				} else {
+					slog.Debug("identity token refused", "err", err)
+				}
+				writeAuthError(w, "invalid identity token: "+auth.TokenErrorReason(err))
 				return
 			}
 		}
@@ -100,15 +106,17 @@ func (g *Server) authenticate(next http.Handler) http.Handler {
 			return
 		}
 
+		tr := newTrace(w, r)
 		if g.Limits != nil {
 			if ok, status, code, msg := g.Limits.Check(id, snap); !ok {
 				writeLimitError(w, status, code, msg)
 				// A denial used to leave no trace at all, so "how often is this
 				// key throttled" was unanswerable. The check runs before the body
 				// is parsed, so model_name is necessarily blank here.
-				g.emit(snap, id, nil, &reqBody{}, requestID(), usageCounts{}, status,
-					time.Now(), nil, "", telemetryDecision(snap, id),
-					emitExtra{ErrorCode: code})
+				reqID := requestID()
+				g.emit(snap, id, nil, &reqBody{}, reqID, usageCounts{}, status,
+					time.Now(), nil, "", telemetryDecision(snap, id, reqID, tr),
+					emitExtra{ErrorCode: code, Trace: tr})
 				return
 			}
 		}
@@ -118,7 +126,7 @@ func (g *Server) authenticate(next http.Handler) http.Handler {
 		if !viaAuthz {
 			in.Authorization = r.Header.Get("Authorization")
 		}
-		ctx := provider.WithInbound(r.Context(), in)
+		ctx := withTrace(provider.WithInbound(r.Context(), in), tr)
 		next.ServeHTTP(w, r.WithContext(context.WithValue(ctx, identityKey, id)))
 	})
 }
@@ -139,7 +147,8 @@ func (g *Server) ServeAuthed(w http.ResponseWriter, r *http.Request, id *auth.Id
 			return
 		}
 	}
-	g.handleProxy(w, r.WithContext(context.WithValue(r.Context(), identityKey, id)))
+	ctx := withTrace(context.WithValue(r.Context(), identityKey, id), newTrace(w, r))
+	g.handleProxy(w, r.WithContext(ctx))
 }
 
 func (g *Server) handleModels(w http.ResponseWriter, r *http.Request) {

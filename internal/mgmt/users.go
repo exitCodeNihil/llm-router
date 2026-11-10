@@ -126,6 +126,7 @@ func (m *Server) deleteTeam(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusNotFound, "not found")
 		return
 	}
+	m.removeFromScopes(r.Context(), "team_values", id.String())
 	m.bump(r.Context())
 	w.WriteHeader(http.StatusNoContent)
 }

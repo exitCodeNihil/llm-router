@@ -1,8 +1,11 @@
-# Local development / testing stack: Postgres (gateway DB), Zitadel (OIDC IdP),
-# and Langfuse (observability). Works with `docker compose` and `podman compose`.
+# Local development / testing stack: Postgres (gateway DB) and Zitadel (OIDC IdP),
+# plus two optional telemetry destinations behind profiles. Works with
+# `docker compose` and `podman compose`.
 #
 #   cd deploy
-#   docker compose -f docker-compose.dev.yml up -d
+#   docker compose -f docker-compose.dev.yml up -d                      # Postgres + Zitadel
+#   docker compose -f docker-compose.dev.yml --profile otel up -d       # + Grafana LGTM (OTLP)
+#   docker compose -f docker-compose.dev.yml --profile langfuse up -d   # + Langfuse v4
 #   ./dev-stack-setup.sh          # creates Zitadel project, SSO app, test users
 #
 # Run the gateway on the HOST, not in this compose file — the Zitadel issuer is
@@ -16,9 +19,11 @@
 # Credentials (dev-only, hardcoded on purpose):
 #   Zitadel console   http://localhost:8082  zitadel-admin@zitadel.localhost / Password1!
 #   Zitadel SSO user  testdev / Password1!               (created by the setup script)
+#   Grafana           http://localhost:3000  (anonymous admin; Explore → Tempo for traces)
+#     → console: Observability → Add destination → OTLP, endpoint http://localhost:4318
 #   Langfuse UI       http://localhost:3001  admin@example.com / Password1!
 #   Langfuse API      public pk-lf-dev-1234 · secret sk-lf-dev-1234
-#     → paste these into the console: Settings → Observability, host http://localhost:3001
+#     → console: Observability → Add destination → Langfuse, host http://localhost:3001
 
 services:
   postgres:
@@ -80,12 +85,29 @@ services:
       ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_EXPIRATIONDATE: "2030-01-01T00:00:00Z"
       ZITADEL_FIRSTINSTANCE_PATPATH: /pat/pat.txt
 
+  # ── profile otel: Grafana, Tempo, Loki, Prometheus and an OTLP collector in one image
+  otel-lgtm:
+    image: docker.io/grafana/otel-lgtm:0.39.0
+    profiles: [otel]
+    ports:
+      - "127.0.0.1:3000:3000" # Grafana
+      - "127.0.0.1:3200:3200" # Tempo query API (end-to-end tests read traces back here)
+      - "127.0.0.1:4317:4317" # OTLP gRPC
+      - "127.0.0.1:4318:4318" # OTLP HTTP
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+
+  # ── profile langfuse: Langfuse v4 (web, worker, Postgres, ClickHouse, Redis, MinIO; ~2 GB RAM)
   langfuse-db:
-    image: postgres:17
+    image: docker.io/postgres:17
+    profiles: [langfuse]
     environment:
       POSTGRES_USER: langfuse
       POSTGRES_PASSWORD: langfuse
       POSTGRES_DB: langfuse
+      TZ: UTC
+      PGTZ: UTC
     volumes:
       - langfuse-pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -94,20 +116,95 @@ services:
       timeout: 2s
       retries: 15
 
-  langfuse:
-    image: docker.io/langfuse/langfuse:2
-    depends_on:
-      langfuse-db:
-        condition: service_healthy
-    ports:
-      - "3001:3000"
+  langfuse-clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:26.3.62.3
+    profiles: [langfuse]
+    user: "101:101"
     environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    volumes:
+      - langfuse-clickhouse:/var/lib/clickhouse
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  langfuse-redis:
+    image: docker.io/redis:7
+    profiles: [langfuse]
+    command: --requirepass redis --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  langfuse-minio:
+    image: cgr.dev/chainguard/minio
+    profiles: [langfuse]
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" /data'
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
+    volumes:
+      - langfuse-minio:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  langfuse-worker:
+    image: docker.langfuse.com/langfuse/langfuse-worker:4
+    profiles: [langfuse]
+    depends_on: &langfuse-deps
+      langfuse-db: {condition: service_healthy}
+      langfuse-clickhouse: {condition: service_healthy}
+      langfuse-redis: {condition: service_healthy}
+      langfuse-minio: {condition: service_healthy}
+    environment: &langfuse-env
       DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
-      NEXTAUTH_SECRET: dev-nextauth-secret-0123456789abcdef
       NEXTAUTH_URL: http://localhost:3001
       SALT: dev-salt
+      ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
       TELEMETRY_ENABLED: "false"
-      # deterministic dev project + login so the gateway config is copy-paste
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: langfuse-redis
+      REDIS_AUTH: redis
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      # Ingest within seconds, so end-to-end tests can read traces straight back.
+      LANGFUSE_INGESTION_QUEUE_DELAY_MS: "1000"
+      LANGFUSE_INGESTION_CLICKHOUSE_WRITE_INTERVAL_MS: "1000"
+
+  langfuse:
+    image: docker.langfuse.com/langfuse/langfuse:4
+    profiles: [langfuse]
+    depends_on: *langfuse-deps
+    ports:
+      - "127.0.0.1:3001:3000"
+    environment:
+      <<: *langfuse-env
+      NEXTAUTH_SECRET: dev-nextauth-secret-0123456789abcdef
+      # deterministic dev project + login so the destination config is copy-paste
       LANGFUSE_INIT_ORG_ID: org-dev
       LANGFUSE_INIT_ORG_NAME: llm-router
       LANGFUSE_INIT_PROJECT_ID: proj-dev
@@ -122,3 +219,5 @@ volumes:
   pgdata-dev:
   zitadel-pgdata:
   langfuse-pgdata:
+  langfuse-clickhouse:
+  langfuse-minio:

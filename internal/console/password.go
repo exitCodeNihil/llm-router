@@ -4,15 +4,20 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )
 
 // Password auth: first-run setup creates the initial admin; after that,
-// email+password login works alongside SSO and the bootstrap token.
-// ponytail: no login rate limiting beyond bcrypt's inherent cost; add a
-// per-IP limiter if this ever faces the open internet directly.
+// email+password login works alongside SSO and the bootstrap token. Attempts
+// are rate limited (ratelimit.go).
+
+func (a *Auth) signInLimits() *signInLimits {
+	a.limitsOnce.Do(func() { a.limits = newSignInLimits(a.TrustedProxies) })
+	return a.limits
+}
 
 func (a *Auth) registerPassword(mux *http.ServeMux) {
 	mux.HandleFunc("GET /auth/setup", a.handleSetupStatus)
@@ -41,6 +46,10 @@ func (a *Auth) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Auth) handleSetup(w http.ResponseWriter, r *http.Request) {
+	lim := a.signInLimits()
+	if !lim.admit(w, lim.clientIP(r), "", time.Now()) {
+		return
+	}
 	needed, err := a.setupNeeded(r)
 	if err != nil || !needed {
 		http.Error(w, "setup is already complete", http.StatusForbidden)
@@ -88,6 +97,18 @@ func (a *Auth) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
+	email := normEmail(req.Email)
+	if email == "" || len(email) > maxEmail {
+		http.Error(w, "incorrect email or password", http.StatusUnauthorized)
+		return
+	}
+	lim := a.signInLimits()
+	ip := lim.clientIP(r)
+	// A failure is reserved before the password is checked, and given back on
+	// success, so concurrent guesses cannot all slip in under the limit.
+	if !lim.admit(w, ip, email, time.Now()) {
+		return
+	}
 	var userID string
 	var hash []byte
 	err := a.Store.Pool.QueryRow(r.Context(),
@@ -98,6 +119,7 @@ func (a *Auth) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "incorrect email or password", http.StatusUnauthorized)
 		return
 	}
+	lim.succeeded(ip, email)
 	setSessionCookie(w, r, a.EncryptionKey, a.CookieDomain, userID)
 	w.WriteHeader(http.StatusNoContent)
 }

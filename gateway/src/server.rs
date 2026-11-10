@@ -17,16 +17,20 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
+use hyper::service::service_fn;
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto;
+use hyper_util::server::graceful::GracefulShutdown;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use crate::body::{Body, InFlight, Sse};
 use crate::config::{AuthMode, Config, Deployment, Flavor, Key};
 use crate::metrics::{self, Attempt, Route};
+use crate::telemetry::{self, Trace};
 use crate::translate::{self, BadRequest, SseTransform};
 use crate::upstream::{self, BuildError, Inbound};
 use crate::usage::Emit;
@@ -48,12 +52,57 @@ impl State {
     }
 }
 
-pub type HttpsClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+/// Serves `listener` until `shutdown` resolves, then drains: reports not
+/// ready, stops accepting, and asks every connection to close once its
+/// current request is done. An idle keep-alive connection closes at once, so
+/// a client holding one opens a new connection, which reaches another
+/// gateway, instead of sending this one requests until the drain runs out and
+/// they are cut off. Returns once every connection is closed and no request
+/// is in flight, or after `drain`.
+pub async fn run(
+    listener: tokio::net::TcpListener,
+    st: &'static State,
+    shutdown: impl Future<Output = ()>,
+    drain: Duration,
+) {
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder.http1().timer(TokioTimer::new()).header_read_timeout(Duration::from_secs(10));
+    builder.http2().timer(TokioTimer::new());
+    let builder = Arc::new(builder);
+    let graceful = GracefulShutdown::new();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let Ok((stream, _)) = accepted else { continue };
+                let _ = stream.set_nodelay(true);
+                let builder = builder.clone();
+                let watcher = graceful.watcher();
+                let conn = metrics::Connection::open();
+                tokio::spawn(async move {
+                    let _conn = conn;
+                    let svc = service_fn(move |req| handle(st, req));
+                    let _ = watcher.watch(builder.serve_connection(TokioIo::new(stream), svc)).await;
+                });
+            }
+            _ = &mut shutdown => break,
+        }
+    }
+    st.draining.store(true, Ordering::Relaxed);
+    drop(listener);
+    let deadline = Instant::now() + drain;
+    let _ = tokio::time::timeout_at(deadline.into(), graceful.shutdown()).await;
+    while metrics::IN_FLIGHT.load(Ordering::Relaxed) > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+pub type HttpsClient = Client<HttpsConnector<HttpConnector<crate::dns::Resolver>>, Full<Bytes>>;
 
 /// An HTTP client with its own connection pool, for the control plane or for
 /// one worker thread's upstream calls.
 pub fn https_client(pool: usize) -> HttpsClient {
-    let mut http = HttpConnector::new();
+    let mut http = HttpConnector::new_with_resolver(crate::dns::Resolver::default());
     http.set_nodelay(true);
     http.set_connect_timeout(Some(Duration::from_secs(5)));
     http.enforce_http(false);
@@ -76,13 +125,17 @@ pub fn https_client(pool: usize) -> HttpsClient {
         .build(https)
 }
 
+/// Idle upstream connections a worker keeps per host. A burst opens as many as
+/// it needs; afterwards only this many wait for reuse, not thousands for 90 s.
+const MAX_IDLE_UPSTREAM: usize = 256;
+
 thread_local! {
     // One pool per worker: a shared pool is one lock every request takes.
     static UPSTREAM: RefCell<Option<HttpsClient>> = const { RefCell::new(None) };
 }
 
 pub(crate) fn upstream_client() -> HttpsClient {
-    UPSTREAM.with(|c| c.borrow_mut().get_or_insert_with(|| https_client(4096)).clone())
+    UPSTREAM.with(|c| c.borrow_mut().get_or_insert_with(|| https_client(MAX_IDLE_UPSTREAM)).clone())
 }
 
 pub async fn handle(st: &'static State, req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
@@ -129,8 +182,12 @@ async fn dispatch(st: &'static State, req: Request<Incoming>) -> Response<Body> 
             }
         }
         (&Method::GET, "/metrics") => {
-            let body =
-                metrics::render(st.is_ready(), crate::usage::queued(), crate::usage::DROPPED.load(Ordering::Relaxed));
+            let body = metrics::render(
+                st.is_ready(),
+                crate::usage::queued(),
+                crate::usage::capacity(),
+                crate::usage::DROPPED.load(Ordering::Relaxed),
+            );
             let mut r = Response::new(Body::full(body));
             r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; version=0.0.4"));
             r
@@ -152,40 +209,80 @@ async fn dispatch(st: &'static State, req: Request<Incoming>) -> Response<Body> 
                     "gateway has no config snapshot yet",
                 );
             };
-            let (key, inbound) = match authenticate(&cfg, req.headers()) {
+            let (caller, inbound) = match authenticate(&cfg, req.headers()) {
                 Ok(v) => v,
                 Err(r) => return r,
             };
-            let route = route_of(req.method(), path);
-            if let Err(d) = limits::check(&key) {
-                metrics::denial(d.code);
-                let mut r = oai_error(StatusCode::TOO_MANY_REQUESTS, "insufficient_quota", d.code, &d.message);
-                if let Some(s) = d.retry_after_s {
-                    r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(s));
-                }
-                // Recorded, so "how often is this key throttled" has an answer;
-                // the body isn't read yet, so the model is blank.
-                emit(&cfg, &key, String::new(), false).send(429, d.code, Default::default(), 0);
-                return r;
+            let key = match caller {
+                Caller::Key(key) => key,
+                Caller::Token(token) => match crate::cloud::jwt::identities().authenticate(&cfg, &token).await {
+                    Ok(key) => key,
+                    Err(e) => return auth_error(&format!("invalid identity token: {e}")),
+                },
+            };
+            // Every authenticated response names its trace, so a caller can
+            // find it whether or not it sent a traceparent.
+            let trace = Trace::read(req.headers());
+            let mut resp = serve(cfg, key, inbound, req, trace).await;
+            if let Ok(v) = HeaderValue::from_bytes(&trace.hex()) {
+                resp.headers_mut().insert("x-llmr-trace-id", v);
             }
-            match route {
-                Route::Chat => proxy_openai(cfg, key, inbound, req, "/chat/completions").await,
-                Route::Completions => proxy_openai(cfg, key, inbound, req, "/completions").await,
-                Route::Embeddings => proxy_openai(cfg, key, inbound, req, "/embeddings").await,
-                Route::Messages => proxy_anthropic(cfg, key, inbound, req).await,
-                Route::Models => models(&cfg, &key, &inbound),
-                Route::CountTokens => count_tokens(req).await,
-                Route::Other => not_found(),
-            }
+            resp
         }
         _ => not_found(),
     }
 }
 
+async fn serve(
+    cfg: Arc<Config>,
+    key: Arc<Key>,
+    inbound: Inbound,
+    req: Request<Incoming>,
+    trace: Trace,
+) -> Response<Body> {
+    let path = req.uri().path();
+    let route = route_of(req.method(), path);
+    let rq = Rq { trace, operation: telemetry::operation(path) };
+    if let Err(d) = limits::check(&key) {
+        metrics::denial(d.code);
+        let mut r = oai_error(StatusCode::TOO_MANY_REQUESTS, "insufficient_quota", d.code, &d.message);
+        if let Some(s) = d.retry_after_s {
+            r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(s));
+        }
+        // Recorded, so "how often is this key throttled" has an answer;
+        // the body isn't read yet, so the model is blank.
+        emit(&cfg, &key, String::new(), false, rq).send(429, d.code, Default::default(), 0);
+        return r;
+    }
+    match route {
+        Route::Chat => proxy_openai(cfg, key, inbound, req, "/chat/completions", rq).await,
+        Route::Completions => proxy_openai(cfg, key, inbound, req, "/completions", rq).await,
+        Route::Embeddings => proxy_openai(cfg, key, inbound, req, "/embeddings", rq).await,
+        Route::Messages => proxy_anthropic(cfg, key, inbound, req, rq).await,
+        Route::Models => models(&cfg, &key, &inbound),
+        Route::CountTokens => count_tokens(req).await,
+        Route::Other => not_found(),
+    }
+}
+
+/// A request's trace and operation, for its usage event.
+#[derive(Clone, Copy)]
+struct Rq {
+    trace: Trace,
+    operation: telemetry::Operation,
+}
+
+/// Who a request says it is: a gateway key, resolved, or an identity token,
+/// which needs verifying.
+enum Caller {
+    Key(Arc<Key>),
+    Token(String),
+}
+
 /// Resolve the caller (gateway.authenticate): X-Llmr-Key first, so a
 /// pass-through client can keep Authorization for its own upstream token, then
 /// Authorization, then x-api-key.
-fn authenticate(cfg: &Config, h: &HeaderMap) -> Result<(Arc<Key>, Inbound), Response<Body>> {
+fn authenticate(cfg: &Config, h: &HeaderMap) -> Result<(Caller, Inbound), Response<Body>> {
     let header_str = |name: &str| h.get(name).and_then(|v| v.to_str().ok()).filter(|s| !s.is_empty());
     let mut via_authz = false;
     let token = match header_str("x-llmr-key") {
@@ -201,36 +298,51 @@ fn authenticate(cfg: &Config, h: &HeaderMap) -> Result<(Arc<Key>, Inbound), Resp
             },
         },
     };
-    let key = token
-        .starts_with("llmr_")
-        .then(|| {
-            let digest = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(digest.as_ref());
-            cfg.keys.get(&hash).cloned()
-        })
-        .flatten()
-        .filter(|k| k.expires_at == 0 || now_ms() / 1000 <= k.expires_at);
-    let Some(key) = key else { return Err(auth_error("invalid API key")) };
+    let caller = if !token.starts_with("llmr_") && token.bytes().filter(|&b| b == b'.').count() == 2 {
+        Some(Caller::Token(token.to_string()))
+    } else {
+        token
+            .starts_with("llmr_")
+            .then(|| {
+                let digest = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(digest.as_ref());
+                cfg.keys.get(&hash).cloned()
+            })
+            .flatten()
+            .filter(|k| k.expires_at == 0 || now_ms() / 1000 <= k.expires_at)
+            .map(Caller::Key)
+    };
+    let Some(caller) = caller else { return Err(auth_error("invalid API key")) };
     let inbound = Inbound {
         // Only when it wasn't the gateway key: that must never travel upstream.
         authorization: if via_authz { None } else { h.get(header::AUTHORIZATION).cloned() },
         anthropic_beta: h.get("anthropic-beta").cloned(),
     };
-    Ok((key, inbound))
+    Ok((caller, inbound))
 }
 
-fn emit(cfg: &Arc<Config>, key: &Arc<Key>, model: String, stream: bool) -> Emit {
+fn emit(cfg: &Arc<Config>, key: &Arc<Key>, model: String, stream: bool, rq: Rq) -> Emit {
+    let request_id = format!("req_{:016x}", fastrand::u64(..));
+    let verdict = telemetry::decide(&cfg.telemetry, cfg.data_rule, key, &request_id);
     Emit {
         cfg: cfg.clone(),
         key: key.clone(),
         model,
-        request_id: format!("req_{:016x}", fastrand::u64(..)),
+        request_id,
         stream,
         start: Instant::now(),
-        ts_ms: now_ms(),
+        // The control plane's clock, so a gateway's own skew can't move usage
+        // into another day or month.
+        ts_ms: limits::cp_now_ms(),
         deployment: None,
         attempts: 0,
+        trace: rq.trace,
+        operation: rq.operation,
+        verdict,
+        content: None,
+        output: Default::default(),
+        reserved: Default::default(),
     }
 }
 
@@ -350,6 +462,7 @@ async fn proxy_openai(
     inbound: Inbound,
     req: Request<Incoming>,
     path: &str,
+    rq: Rq,
 ) -> Response<Body> {
     let body = match read_body(req).await {
         Ok(b) => b,
@@ -362,7 +475,7 @@ async fn proxy_openai(
     if p.model.is_empty() {
         return oai_error(StatusCode::BAD_REQUEST, "invalid_request_error", "missing_model", "model field is required");
     }
-    let mut em = emit(&cfg, &key, p.model.clone(), p.stream);
+    let mut em = emit(&cfg, &key, p.model.clone(), p.stream, rq);
     let Some(resolved) = cfg.resolve(&p.model) else {
         if !key.model_allowed(&[&p.model]) {
             return refuse_oai(em, "model_not_allowed");
@@ -412,20 +525,31 @@ async fn proxy_openai(
     };
     em.deployment = Some(dep.clone());
     em.attempts = attempts;
+    em.capture_request(&body, false);
+    let capture = em.verdict.capture;
     let status = resp.status();
     let mut out = routed(status, &em.request_id, &dep, attempts, resp.headers());
     let sse = p.stream && status == StatusCode::OK;
     match (dep.flavor, sse) {
         (Flavor::Anthropic, true) => {
-            stream(out, resp, Box::new(translate::AnthToOaiStream::new(&p.model, &em.request_id)), em)
+            let t = translate::AnthToOaiStream::new(&p.model, &em.request_id).capturing(capture);
+            stream(out, resp, Box::new(t), em)
         }
-        (Flavor::OpenAI, true) => stream(out, resp, Box::new(translate::OaiPassthrough::new(inject)), em),
+        (Flavor::OpenAI, true) => {
+            stream(out, resp, Box::new(translate::OaiPassthrough::new(inject).capturing(capture)), em)
+        }
         (flavor, false) => {
             let ct = resp.headers().get(header::CONTENT_TYPE).cloned();
             let bytes = match collect(resp).await {
                 Ok(b) => b,
                 Err(r) => return r,
             };
+            if capture > 0 && status == StatusCode::OK {
+                em.set_output(match flavor {
+                    Flavor::Anthropic => translate::anth_json_text(&bytes, capture),
+                    Flavor::OpenAI => translate::oai_json_text(&bytes, capture),
+                });
+            }
             let (bytes, usage) = if status != StatusCode::OK {
                 (bytes, Default::default())
             } else if flavor == Flavor::Anthropic {
@@ -449,7 +573,13 @@ async fn proxy_openai(
     }
 }
 
-async fn proxy_anthropic(cfg: Arc<Config>, key: Arc<Key>, inbound: Inbound, req: Request<Incoming>) -> Response<Body> {
+async fn proxy_anthropic(
+    cfg: Arc<Config>,
+    key: Arc<Key>,
+    inbound: Inbound,
+    req: Request<Incoming>,
+    rq: Rq,
+) -> Response<Body> {
     let body = match read_body(req).await {
         Ok(b) => b,
         Err(_) => return anth_error(StatusCode::BAD_REQUEST, "invalid_request_error", "unreadable or oversized body"),
@@ -461,7 +591,7 @@ async fn proxy_anthropic(cfg: Arc<Config>, key: Arc<Key>, inbound: Inbound, req:
     if p.model.is_empty() {
         return anth_error(StatusCode::BAD_REQUEST, "invalid_request_error", "model is required");
     }
-    let mut em = emit(&cfg, &key, p.model.clone(), p.stream);
+    let mut em = emit(&cfg, &key, p.model.clone(), p.stream, rq);
     let refuse = |em: Emit, code: &'static str| {
         let why = if code == "model_not_allowed" { "is not available for this API key" } else { "does not exist" };
         em.send(404, code, Default::default(), 0);
@@ -512,6 +642,9 @@ async fn proxy_anthropic(cfg: Arc<Config>, key: Arc<Key>, inbound: Inbound, req:
     };
     em.deployment = Some(dep.clone());
     em.attempts = attempts;
+    // The request's own bytes, not a re-encoding.
+    em.capture_request(&body, true);
+    let capture = em.verdict.capture;
     let status = resp.status();
     let mut out = routed(status, &em.request_id, &dep, attempts, resp.headers());
     if status != StatusCode::OK {
@@ -526,9 +659,12 @@ async fn proxy_anthropic(cfg: Arc<Config>, key: Arc<Key>, inbound: Inbound, req:
         return r;
     }
     match (dep.flavor, p.stream) {
-        (Flavor::Anthropic, true) => stream(out, resp, Box::new(translate::AnthPassthrough::new()), em),
+        (Flavor::Anthropic, true) => {
+            stream(out, resp, Box::new(translate::AnthPassthrough::new().capturing(capture)), em)
+        }
         (Flavor::OpenAI, true) => {
-            stream(out, resp, Box::new(translate::OaiToAnthStream::new(&p.model, &em.request_id)), em)
+            let t = translate::OaiToAnthStream::new(&p.model, &em.request_id).capturing(capture);
+            stream(out, resp, Box::new(t), em)
         }
         (flavor, false) => {
             let ct = resp.headers().get(header::CONTENT_TYPE).cloned();
@@ -536,6 +672,12 @@ async fn proxy_anthropic(cfg: Arc<Config>, key: Arc<Key>, inbound: Inbound, req:
                 Ok(b) => b,
                 Err(r) => return r,
             };
+            if capture > 0 {
+                em.set_output(match flavor {
+                    Flavor::Anthropic => translate::anth_json_text(&bytes, capture),
+                    Flavor::OpenAI => translate::oai_json_text(&bytes, capture),
+                });
+            }
             let (bytes, usage) = if flavor == Flavor::Anthropic {
                 let u = translate::anth_json_usage(&bytes);
                 (bytes, u)
@@ -606,7 +748,7 @@ fn routed(status: StatusCode, req_id: &str, d: &Deployment, attempts: i64, upstr
     h.insert("x-llmr-attempts", HeaderValue::from(attempts));
     h.insert(
         "access-control-expose-headers",
-        HeaderValue::from_static("X-Request-Id, X-Llmr-Provider, X-Llmr-Upstream, X-Llmr-Attempts"),
+        HeaderValue::from_static("X-Request-Id, X-Llmr-Trace-Id, X-Llmr-Provider, X-Llmr-Upstream, X-Llmr-Attempts"),
     );
     // The upstream's advice on a 429 or 503, so the client knows when to come back.
     if (status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE)
@@ -679,8 +821,8 @@ async fn try_deployments(
                 continue;
             }
         };
-        if let Some(wif) = &d.provider.wif {
-            match wif.bearer().await {
+        if let Some(token) = &d.provider.token {
+            match token.bearer().await {
                 Ok(v) => {
                     headers.insert(header::AUTHORIZATION, v);
                 }
@@ -690,8 +832,8 @@ async fn try_deployments(
                 }
             }
         }
-        let body = match build(d) {
-            Ok(b) => b,
+        let (url, body) = match build(d).and_then(|b| upstream::finish(d, url, b)) {
+            Ok(v) => v,
             Err(BadRequest(m)) => return Outcome::BadBody(m),
         };
         let mut req = match Request::post(url).body(Full::new(body)) {

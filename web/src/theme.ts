@@ -91,6 +91,18 @@ export const llmRouterTheme = defineTheme({
     "--color-text-blue": [...info],
     "--color-icon-blue": [...info],
     "--color-border-blue": [...info],
+
+    // Categorical series hues, for charts with one line per entity. Astryx's
+    // defaults use one step for both modes; these are stepped per surface and
+    // checked as a set, in this order (lightness band, chroma, colour-blind
+    // and normal-vision separation of neighbours). Brown carries the yellow
+    // slot. Green and red stay out: they read as status here.
+    "--color-data-categorical-blue": ["#2a78d6", "#3987e5"],
+    "--color-data-categorical-orange": ["#eb6834", "#d95926"],
+    "--color-data-categorical-teal": ["#1baf7a", "#199e70"],
+    "--color-data-categorical-brown": ["#eda100", "#c98500"],
+    "--color-data-categorical-pink": ["#e87ba4", "#d55181"],
+    "--color-data-categorical-purple": ["#6250d6", "#9085e9"],
   },
 
   components: {

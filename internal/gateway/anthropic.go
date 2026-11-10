@@ -92,6 +92,7 @@ func (g *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	id := IdentityFrom(r.Context())
 	start := time.Now()
 	reqID := requestID()
+	tr := traceFrom(r.Context())
 
 	raw, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil || len(raw) > maxBodyBytes {
@@ -114,8 +115,8 @@ func (g *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			map[string]string{"model_not_allowed": " is not available for this API key",
 				"model_not_found": " does not exist"}[code])
 		g.emit(snap, id, nil, &reqBody{Model: areq.Model, Stream: areq.Stream}, reqID,
-			usageCounts{}, http.StatusNotFound, start, nil, "", telemetryDecision(snap, id),
-			emitExtra{ErrorCode: code})
+			usageCounts{}, http.StatusNotFound, start, nil, "", telemetryDecision(snap, id, reqID, tr),
+			emitExtra{Trace: tr, ErrorCode: code})
 	}
 	alias, deployments := snap.Resolve(areq.Model)
 	if !id.ModelAllowed(areq.Model, alias) {
@@ -126,7 +127,7 @@ func (g *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		refuse("model_not_found")
 		return
 	}
-	dec := telemetryDecision(snap, id)
+	dec := telemetryDecision(snap, id, reqID, tr)
 
 	oaiBody, err := anthToOpenAI(&areq)
 	if err != nil {
@@ -155,19 +156,19 @@ func (g *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		if code := callerErrorCode(err); code != "" {
 			writeAnthError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			g.emit(snap, id, nil, &reqBody{Model: areq.Model, Stream: areq.Stream}, reqID, usageCounts{},
-				http.StatusBadRequest, start, nil, "", dec, emitExtra{Attempts: attempts, ErrorCode: code})
+				http.StatusBadRequest, start, nil, "", dec, emitExtra{Trace: tr, Attempts: attempts, ErrorCode: code})
 			return
 		}
 		writeAnthError(w, http.StatusInternalServerError, "api_error", err.Error())
 		g.emit(snap, id, nil, &reqBody{Model: areq.Model, Stream: areq.Stream}, reqID, usageCounts{},
-			http.StatusInternalServerError, start, nil, "", dec, emitExtra{Attempts: attempts, ErrorCode: "internal_error"})
+			http.StatusInternalServerError, start, nil, "", dec, emitExtra{Trace: tr, Attempts: attempts, ErrorCode: "internal_error"})
 		return
 	}
 	body := &reqBody{Model: areq.Model, Stream: areq.Stream}
 	if resp == nil {
 		writeAnthError(w, http.StatusBadGateway, "api_error", "all deployments for model "+areq.Model+" failed")
 		g.emit(snap, id, nil, body, reqID, usageCounts{}, http.StatusBadGateway, start, nil, "", dec,
-			emitExtra{Attempts: attempts, ErrorCode: "upstream_unavailable"})
+			emitExtra{Trace: tr, Attempts: attempts, ErrorCode: "upstream_unavailable"})
 		return
 	}
 	defer resp.Body.Close()
@@ -177,7 +178,7 @@ func (g *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	forwardRetryAfter(w, resp)
 	forwardRateLimits(w, resp)
 
-	capture := dec.CaptureContent
+	capture := contentCap(snap, id, dec)
 	var counts usageCounts
 	var output string
 	if chosen.APIFlavor == "anthropic" && resp.StatusCode == http.StatusOK {
@@ -197,12 +198,11 @@ func (g *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeAnthError(w, resp.StatusCode, "api_error", strings.TrimSpace(string(errBody)))
 	}
 
-	var input json.RawMessage
-	if capture {
-		input, _ = json.Marshal(areq.Messages)
-	}
+	// The request's own bytes, not a re-encoding.
+	input, system, output, cut := capContent(capture, passBody.fields["messages"], passBody.fields["system"], output)
 	e := g.emit(snap, id, chosen, body, reqID, counts, resp.StatusCode, start, input, output, dec,
-		emitExtra{Attempts: attempts, ErrorCode: upstreamErrorCode(resp.StatusCode)})
+		emitExtra{Trace: tr, Attempts: attempts, ErrorCode: upstreamErrorCode(resp.StatusCode),
+			System: system, Truncated: cut})
 	if g.Limits != nil {
 		g.Limits.RecordUsage(id, counts.Prompt+counts.Completion, e.CostUSD)
 	}
@@ -372,7 +372,7 @@ func anthStopReason(finish string) string {
 }
 
 // writeAnthResponse translates a non-streaming OpenAI response.
-func writeAnthResponse(w http.ResponseWriter, resp *http.Response, model, reqID string, capture bool) (usageCounts, string) {
+func writeAnthResponse(w http.ResponseWriter, resp *http.Response, model, reqID string, capture int) (usageCounts, string) {
 	var counts usageCounts
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if err != nil {
@@ -425,7 +425,7 @@ func writeAnthResponse(w http.ResponseWriter, resp *http.Response, model, reqID 
 		"usage":         map[string]int{"input_tokens": counts.Prompt, "output_tokens": counts.Completion},
 	})
 	var output string
-	if capture && choice.Message.Content != nil {
+	if capture > 0 && choice.Message.Content != nil {
 		output = *choice.Message.Content
 	}
 	return counts, output
@@ -433,7 +433,7 @@ func writeAnthResponse(w http.ResponseWriter, resp *http.Response, model, reqID 
 
 // streamAnthropic consumes the upstream OpenAI SSE stream and re-emits it as
 // Anthropic SSE events.
-func streamAnthropic(w http.ResponseWriter, resp *http.Response, model, reqID string, capture bool) (usageCounts, string) {
+func streamAnthropic(w http.ResponseWriter, resp *http.Response, model, reqID string, capture int) (usageCounts, string) {
 	var counts usageCounts
 	var output strings.Builder
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -506,7 +506,7 @@ func streamAnthropic(w http.ResponseWriter, resp *http.Response, model, reqID st
 		}
 
 		if c.Delta.Content != nil && *c.Delta.Content != "" {
-			if capture && output.Len() < 64<<10 {
+			if output.Len() < capture {
 				output.WriteString(*c.Delta.Content)
 			}
 			if blockType != "text" {

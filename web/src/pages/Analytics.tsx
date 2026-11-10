@@ -36,7 +36,7 @@ import {
   usageQueryString,
 } from "../lib/hooks";
 import type { BreakdownDim, BreakdownRow, UsageQuery } from "../lib/types";
-import { plural, compact, dateShort, money, int } from "../lib/format";
+import { plural, compact, dateShort, money, moneyAxis, int } from "../lib/format";
 
 const RANGES = [
   { v: "1", label: "24h" },
@@ -434,7 +434,7 @@ export default function Analytics() {
                     : "cost_usd"
               }
               formatValue={(v) =>
-                metric === "cost_usd" ? money(Number(v)) : compact(Number(v))
+                metric === "cost_usd" ? moneyAxis(Number(v)) : compact(Number(v))
               }
             />
           )}

@@ -365,7 +365,8 @@ function TokenIssuers() {
           <VStack gap={0}>
             <Heading level={4}>Cloud token issuers</Heading>
             <Text type="supporting" color="secondary">
-              Let callers authenticate with an Azure or GCP identity token instead of a gateway key.
+              Let callers authenticate with an identity token from Azure, Google Cloud or another OIDC issuer instead of a
+              gateway key.
             </Text>
           </VStack>
           {addButton}

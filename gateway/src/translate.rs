@@ -33,6 +33,9 @@ pub struct Usage {
     /// Request options that raise every rate.
     pub us_inference: bool,
     pub fast: bool,
+    /// inference_geo and speed as an Anthropic upstream reported them.
+    pub geo: Tag,
+    pub speed: Tag,
 }
 
 impl Usage {
@@ -46,6 +49,129 @@ impl Usage {
         }
         self.us_inference |= n.us_inference;
         self.fast |= n.fast;
+        if !n.geo.is_empty() {
+            self.geo = n.geo;
+        }
+        if !n.speed.is_empty() {
+            self.speed = n.speed;
+        }
+    }
+}
+
+/// A short string an upstream reports, such as inference_geo, kept inline so
+/// [`Usage`] stays `Copy` and reading it allocates nothing. Longer values are
+/// cut at 31 bytes.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tag {
+    len: u8,
+    buf: [u8; 31],
+}
+
+impl Tag {
+    pub fn new(s: &str) -> Tag {
+        let mut n = s.len().min(31);
+        while !s.is_char_boundary(n) {
+            n -= 1;
+        }
+        let mut t = Tag { len: n as u8, buf: [0; 31] };
+        t.buf[..n].copy_from_slice(&s.as_bytes()[..n]);
+        t
+    }
+
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.buf[..self.len as usize]).unwrap_or_default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl std::fmt::Debug for Tag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
+
+impl serde::Serialize for Tag {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Tag {
+    /// A string, or null for none.
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl de::Visitor<'_> for V {
+            type Value = Tag;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Tag, E> {
+                Ok(Tag::new(v))
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Tag, E> {
+                Ok(Tag::default())
+            }
+            fn visit_none<E: de::Error>(self) -> Result<Tag, E> {
+                Ok(Tag::default())
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// Response text kept for telemetry: at most `cap` bytes, cut at a
+/// character. Go keeps whole deltas while fewer than `cap` bytes are kept and
+/// cuts the text to the cap when the event is sent; this keeps the same text
+/// without ever holding more, and its buffer never grows past the cap. A cap
+/// of 0 keeps nothing and costs nothing.
+#[derive(Default)]
+pub struct Capture {
+    cap: usize,
+    text: String,
+    /// Some text was left out.
+    cut: bool,
+}
+
+impl Capture {
+    pub fn new(cap: usize) -> Capture {
+        Capture { cap, ..Capture::default() }
+    }
+
+    #[inline]
+    fn wants(&self) -> bool {
+        !self.cut && self.text.len() < self.cap
+    }
+
+    fn push(&mut self, s: JStr) {
+        let inner = s.inner();
+        let room = self.cap.saturating_sub(self.text.len());
+        // Escaped text is never shorter than its value: this is room enough.
+        self.grow(inner.len().min(room));
+        if inner.contains('\\') {
+            self.cut |= unescape_into(inner, &mut self.text, room);
+        } else if inner.len() > room {
+            self.text.push_str(&inner[..floor_boundary(inner, room)]);
+            self.cut = true;
+        } else {
+            self.text.push_str(inner);
+        }
+    }
+
+    /// Room for `n` more bytes: doubling as a String does, up to the cap.
+    fn grow(&mut self, n: usize) {
+        let need = self.text.len() + n;
+        if need > self.text.capacity() {
+            let want = (self.text.capacity() * 2).clamp(need, self.cap.max(need));
+            self.text.reserve_exact(want - self.text.len());
+        }
+    }
+
+    /// The text kept, and whether any was left out.
+    pub fn into_parts(self) -> (String, bool) {
+        (self.text, self.cut)
     }
 }
 
@@ -513,6 +639,35 @@ pub fn anth_json_usage(body: &[u8]) -> Usage {
     }
 }
 
+/// The assistant text of an OpenAI chat-completion JSON, at most `cap` bytes
+/// of it, for telemetry (Go: copyJSON, writeAnthResponse).
+pub fn oai_json_text(body: &[u8], cap: usize) -> Capture {
+    let mut c = Capture::new(cap);
+    if let Ok(r) = parse::<OaiResponse>(body)
+        && let Some(choice) = r.choices.first()
+        && c.wants()
+    {
+        c.push(choice.message.content);
+    }
+    c
+}
+
+/// The text blocks of an Anthropic message JSON, joined, at most `cap` bytes
+/// of them, for telemetry (Go: passthroughAnthJSON, anthRespToOAI).
+pub fn anth_json_text(body: &[u8], cap: usize) -> Capture {
+    let mut c = Capture::new(cap);
+    if let Ok(r) = parse::<AnthResponse>(body) {
+        for b in r.content.iter().filter(|b| b.typ.is("text")) {
+            if !c.wants() {
+                c.cut |= !b.text.is_empty();
+                continue;
+            }
+            c.push(b.text);
+        }
+    }
+    c
+}
+
 /// A streaming converter, fed one event at a time.
 pub trait SseTransform: Send {
     /// One upstream event (lines joined by "\n", no trailing blank line).
@@ -521,6 +676,10 @@ pub trait SseTransform: Send {
     fn finish(&mut self, out: &mut Vec<u8>);
     /// Usage seen so far.
     fn usage(&self) -> Usage;
+    /// The response text captured for telemetry; empty unless asked for.
+    fn take_output(&mut self) -> Capture {
+        Capture::default()
+    }
 }
 
 /// OpenAI SSE passthrough that reads usage (Go: streamSSE). With
@@ -529,11 +688,18 @@ pub trait SseTransform: Send {
 pub struct OaiPassthrough {
     drop_usage_chunk: bool,
     usage: Usage,
+    capture: Capture,
 }
 
 impl OaiPassthrough {
     pub fn new(drop_usage_chunk: bool) -> Self {
-        Self { drop_usage_chunk, usage: Usage::default() }
+        Self { drop_usage_chunk, usage: Usage::default(), capture: Capture::default() }
+    }
+
+    /// Keep up to `cap` bytes of the response text for telemetry.
+    pub fn capturing(mut self, cap: usize) -> Self {
+        self.capture = Capture::new(cap);
+        self
     }
 }
 
@@ -541,6 +707,15 @@ impl SseTransform for OaiPassthrough {
     fn event(&mut self, ev: &[u8], out: &mut Vec<u8>) {
         let start = out.len();
         for line in lines(ev) {
+            if self.capture.wants()
+                && let Some(data) = line.strip_prefix(b"data: ")
+                && data != b"[DONE]"
+                && memmem::find(data, br#""content""#).is_some()
+                && let Ok(chunk) = parse::<DeltaChunk>(data)
+                && let Some(c) = chunk.choices.first()
+            {
+                self.capture.push(c.delta.content);
+            }
             if let Some(data) = line.strip_prefix(b"data: ")
                 && data != b"[DONE]"
                 && memmem::find(data, br#""usage""#).is_some()
@@ -563,16 +738,26 @@ impl SseTransform for OaiPassthrough {
     fn usage(&self) -> Usage {
         self.usage
     }
+    fn take_output(&mut self) -> Capture {
+        std::mem::take(&mut self.capture)
+    }
 }
 
 /// Anthropic SSE passthrough that reads usage (Go: streamAnthPassthrough).
 pub struct AnthPassthrough {
     usage: Usage,
+    capture: Capture,
 }
 
 impl AnthPassthrough {
     pub fn new() -> Self {
-        Self { usage: Usage::default() }
+        Self { usage: Usage::default(), capture: Capture::default() }
+    }
+
+    /// Keep up to `cap` bytes of the response text for telemetry.
+    pub fn capturing(mut self, cap: usize) -> Self {
+        self.capture = Capture::new(cap);
+        self
     }
 }
 
@@ -608,6 +793,13 @@ impl SseTransform for AnthPassthrough {
                     }
                 }
             }
+            if self.capture.wants()
+                && let Some(data) = line.strip_prefix(b"data: ")
+                && memmem::find(data, br#""text_delta""#).is_some()
+                && let Ok(bd) = parse::<DeltaChoice>(data)
+            {
+                self.capture.push(bd.delta.text);
+            }
             out.extend_from_slice(line);
             out.push(b'\n');
         }
@@ -618,6 +810,9 @@ impl SseTransform for AnthPassthrough {
     fn finish(&mut self, _out: &mut Vec<u8>) {}
     fn usage(&self) -> Usage {
         self.usage
+    }
+    fn take_output(&mut self) -> Capture {
+        std::mem::take(&mut self.capture)
     }
 }
 
@@ -632,6 +827,7 @@ pub struct OaiToAnthStream {
     tools: Vec<(i64, i64)>,
     stop_reason: &'static str,
     usage: Usage,
+    capture: Capture,
 }
 
 impl OaiToAnthStream {
@@ -651,7 +847,14 @@ impl OaiToAnthStream {
             tools: Vec::new(),
             stop_reason: "end_turn",
             usage: Usage::default(),
+            capture: Capture::default(),
         }
+    }
+
+    /// Keep up to `cap` bytes of the response text for telemetry.
+    pub fn capturing(mut self, cap: usize) -> Self {
+        self.capture = Capture::new(cap);
+        self
     }
 
     fn started(&mut self, out: &mut Vec<u8>) {
@@ -693,6 +896,9 @@ impl OaiToAnthStream {
             self.stop_reason = anth_stop_reason(c.finish_reason);
         }
         if !c.delta.content.is_empty() {
+            if self.capture.wants() {
+                self.capture.push(c.delta.content);
+            }
             if !self.in_text {
                 self.block_start(out);
                 put(out, r#"{"type":"text","text":""}}"#);
@@ -762,6 +968,9 @@ impl SseTransform for OaiToAnthStream {
     fn usage(&self) -> Usage {
         self.usage
     }
+    fn take_output(&mut self) -> Capture {
+        std::mem::take(&mut self.capture)
+    }
 }
 
 /// Anthropic SSE upstream -> OpenAI SSE client (Go: anthStreamToOAI).
@@ -776,6 +985,7 @@ pub struct AnthToOaiStream {
     /// Anthropic block index -> OpenAI tool_calls index.
     tools: Vec<(i64, i64)>,
     usage: Usage,
+    capture: Capture,
 }
 
 #[derive(Clone, Copy)]
@@ -804,7 +1014,14 @@ impl AnthToOaiStream {
             tool_index: -1,
             tools: Vec::new(),
             usage: Usage::default(),
+            capture: Capture::default(),
         }
+    }
+
+    /// Keep up to `cap` bytes of the response text for telemetry.
+    pub fn capturing(mut self, cap: usize) -> Self {
+        self.capture = Capture::new(cap);
+        self
     }
 
     /// Writes a chunk's opening; the caller writes the delta, then `chunk_end`.
@@ -859,6 +1076,9 @@ impl AnthToOaiStream {
                     return;
                 };
                 if bd.delta.typ.is("text_delta") {
+                    if self.capture.wants() {
+                        self.capture.push(bd.delta.text);
+                    }
                     self.chunk(out);
                     put(out, r#"{"content":"#);
                     put(out, bd.delta.text.raw());
@@ -923,6 +1143,9 @@ impl SseTransform for AnthToOaiStream {
     }
     fn usage(&self) -> Usage {
         self.usage
+    }
+    fn take_output(&mut self) -> Capture {
+        std::mem::take(&mut self.capture)
     }
 }
 
@@ -1061,18 +1284,92 @@ impl<'a> JStr<'a> {
         &r[1..r.len() - 1]
     }
 
+    /// The text. A surrogate escape without its pair, which serde_json
+    /// refuses, reads as U+FFFD, as Go's encoding/json reads it.
     fn value(self) -> Cow<'a, str> {
         let inner = self.inner();
-        if inner.contains('\\') {
-            Cow::Owned(serde_json::from_str(self.raw()).unwrap_or_default())
-        } else {
-            Cow::Borrowed(inner)
+        if !inner.contains('\\') {
+            return Cow::Borrowed(inner);
         }
+        Cow::Owned(serde_json::from_str(self.raw()).unwrap_or_else(|_| {
+            let mut s = String::with_capacity(inner.len());
+            unescape_into(inner, &mut s, usize::MAX);
+            s
+        }))
     }
 
     fn is(self, s: &str) -> bool {
         self.value() == s
     }
+}
+
+/// Appends the text of an escaped JSON string body to `out`, at most `max`
+/// bytes of it, cut at a character; whether any was left out. Lenient as Go's
+/// encoding/json is: an unpaired surrogate escape, or any escape that isn't
+/// JSON, reads as U+FFFD and the rest of the text is kept.
+pub(crate) fn unescape_into(inner: &str, out: &mut String, max: usize) -> bool {
+    let b = inner.as_bytes();
+    let start = out.len();
+    let room = |out: &String| max - (out.len() - start);
+    let mut i = 0;
+    while i < b.len() {
+        let end = memchr::memchr(b'\\', &b[i..]).map_or(b.len(), |n| i + n);
+        if end > i {
+            let run = &inner[i..end];
+            if run.len() > room(out) {
+                out.push_str(&run[..floor_boundary(run, room(out))]);
+                return true;
+            }
+            out.push_str(run);
+            i = end;
+            continue;
+        }
+        let (c, next) = match b.get(i + 1) {
+            Some(b'"') => ('"', i + 2),
+            Some(b'\\') => ('\\', i + 2),
+            Some(b'/') => ('/', i + 2),
+            Some(b'b') => ('\u{8}', i + 2),
+            Some(b'f') => ('\u{c}', i + 2),
+            Some(b'n') => ('\n', i + 2),
+            Some(b'r') => ('\r', i + 2),
+            Some(b't') => ('\t', i + 2),
+            Some(b'u') => match hex4(b, i + 2) {
+                Some(hi @ 0xd800..0xdc00) => match (b.get(i + 6..i + 8), hex4(b, i + 8)) {
+                    (Some(br"\u"), Some(lo @ 0xdc00..0xe000)) => {
+                        let c = char::from_u32(0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00));
+                        (c.unwrap_or(char::REPLACEMENT_CHARACTER), i + 12)
+                    }
+                    _ => (char::REPLACEMENT_CHARACTER, i + 6),
+                },
+                // a trailing surrogate on its own is no char either
+                Some(u) => (char::from_u32(u).unwrap_or(char::REPLACEMENT_CHARACTER), i + 6),
+                None => (char::REPLACEMENT_CHARACTER, i + 2),
+            },
+            // not JSON: drop the backslash, keep what follows
+            _ => (char::REPLACEMENT_CHARACTER, i + 1),
+        };
+        if c.len_utf8() > room(out) {
+            return true;
+        }
+        out.push(c);
+        i = next;
+    }
+    false
+}
+
+/// Four hex digits at `at`.
+fn hex4(b: &[u8], at: usize) -> Option<u32> {
+    let digits = b.get(at..at + 4)?;
+    digits.iter().try_fold(0u32, |n, &c| Some(n << 4 | (c as char).to_digit(16)?))
+}
+
+/// The longest prefix of `s` of at most `n` bytes that ends at a character.
+fn floor_boundary(s: &str, n: usize) -> usize {
+    let mut n = n.min(s.len());
+    while !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    n
 }
 
 impl<'de: 'a, 'a> Deserialize<'de> for JStr<'a> {
@@ -1203,9 +1500,9 @@ struct AnthUsage {
     #[serde(default)]
     cache_creation: Option<CacheCreation>,
     #[serde(default)]
-    inference_geo: Option<String>,
+    inference_geo: Tag,
     #[serde(default)]
-    speed: Option<String>,
+    speed: Tag,
 }
 
 #[derive(Deserialize, Default)]
@@ -1229,8 +1526,10 @@ impl AnthUsage {
             cached: self.cache_read_input_tokens,
             write_5m: self.cache_creation_input_tokens.wrapping_sub(write_1h),
             write_1h,
-            us_inference: self.inference_geo.as_deref() == Some("us"),
-            fast: self.speed.as_deref() == Some("fast"),
+            us_inference: self.inference_geo.as_str() == "us",
+            fast: self.speed.as_str() == "fast",
+            geo: self.inference_geo,
+            speed: self.speed,
         }
     }
 }
@@ -1515,9 +1814,191 @@ struct OaiToolDelta<'a> {
     function: OaiFunction<'a>,
 }
 
+/// The text of a streamed delta, as the Go gateway captures it: an OpenAI
+/// chunk's choices[].delta.content, an Anthropic text_delta's delta.text.
+#[derive(Deserialize, Default)]
+struct DeltaChunk<'a> {
+    #[serde(default, borrow, deserialize_with = "nul")]
+    choices: Vec<DeltaChoice<'a>>,
+}
+
+#[derive(Deserialize, Default)]
+struct DeltaChoice<'a> {
+    #[serde(default, borrow, deserialize_with = "nul")]
+    delta: DeltaText<'a>,
+}
+
+#[derive(Deserialize, Default)]
+struct DeltaText<'a> {
+    #[serde(default, borrow)]
+    content: JStr<'a>,
+    #[serde(default, borrow)]
+    text: JStr<'a>,
+}
+
 #[derive(Deserialize, Default)]
 struct UsageChunk {
     usage: Option<OaiUsage>,
     #[serde(default, deserialize_with = "nul")]
     choices: Vec<IgnoredAny>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jstr(raw: &str) -> String {
+        JStr(Some(raw)).value().into_owned()
+    }
+
+    /// What serde_json reads, it reads the same; what it refuses for an
+    /// unpaired surrogate, it reads as Go does, U+FFFD in its place.
+    #[test]
+    fn unescapes_like_go() {
+        for s in ["", "plain", "a\"b\\c/d\u{8}\u{c}\n\r\t", "\u{1}\u{1f}é😀\u{ffff}", "x\u{7f}y", "\\u0041"] {
+            let raw = serde_json::to_string(s).unwrap();
+            assert_eq!(jstr(&raw), s, "{raw}");
+            let mut out = String::new();
+            assert!(!unescape_into(&raw[1..raw.len() - 1], &mut out, usize::MAX));
+            assert_eq!(out, s, "{raw}");
+        }
+        let mut out = String::new();
+        unescape_into(r"é😀\/", &mut out, usize::MAX);
+        assert_eq!(out, "é😀/");
+        assert_eq!(jstr(r#""a\ud83d""#), "a\u{fffd}");
+        assert_eq!(jstr(r#""\ude00 tail""#), "\u{fffd} tail");
+        assert_eq!(jstr(r#""\ud83d😀!""#), "\u{fffd}😀!");
+        assert_eq!(jstr(r#""\ud83dx\n""#), "\u{fffd}x\n");
+        // not JSON at all, but never a panic
+        assert_eq!(jstr(r#""\q\u12""#), "\u{fffd}q\u{fffd}12");
+        let mut out = String::new();
+        unescape_into("é\\", &mut out, usize::MAX);
+        assert_eq!(out, "é\u{fffd}");
+    }
+
+    /// A surrogate pair split across two deltas: each delta keeps its text.
+    #[test]
+    fn a_split_surrogate_keeps_the_delta() {
+        let mut t = OaiPassthrough::new(false).capturing(100);
+        let mut out = Vec::new();
+        for d in [r"a\ud83d", r"\ude00 tail"] {
+            t.event(format!(r#"data: {{"choices":[{{"delta":{{"content":"{d}"}}}}]}}"#).as_bytes(), &mut out);
+        }
+        assert_eq!(t.take_output().into_parts(), ("a\u{fffd}\u{fffd} tail".to_string(), false));
+    }
+
+    fn run(t: &mut dyn SseTransform, events: &[String]) -> (String, bool) {
+        let mut out = Vec::new();
+        for e in events {
+            t.event(e.as_bytes(), &mut out);
+        }
+        t.finish(&mut out);
+        t.take_output().into_parts()
+    }
+
+    fn oai_chunk(content: &str) -> String {
+        format!(r#"data: {{"choices":[{{"index":0,"delta":{{"content":{content}}}}}]}}"#)
+    }
+
+    fn anth_delta(index: usize, delta: &str) -> String {
+        format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{index},\"delta\":{delta}}}"
+        )
+    }
+
+    /// Every converter captures the response text, unescaped, non-ASCII
+    /// intact, and nothing of tool calls, thinking or a second choice.
+    #[test]
+    fn converters_capture_the_text() {
+        let want = "a\"b\n\u{e9}😀 ü tail";
+        let oai: Vec<String> = vec![
+            oai_chunk(r#""a\"b\n\u00e9\ud83d\ude00""#),
+            oai_chunk(r#"" ü""#),
+            r#"data: {"choices":[{"index":0,"delta":{"content":null,"tool_calls":[{"index":0,"id":"t","function":{"name":"f","arguments":"{\"content\":1}"}}]}}]}"#.into(),
+            oai_chunk(r#"" tail""#),
+            r#"data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":7}}"#.into(),
+            "data: [DONE]".into(),
+        ];
+        let anth: Vec<String> = vec![
+            anth_delta(0, r#"{"type":"thinking_delta","thinking":"hmm"}"#),
+            anth_delta(1, r#"{"type":"text_delta","text":"a\"b\n\u00e9\ud83d\ude00"}"#),
+            anth_delta(1, r#"{"type":"text_delta","text":" ü"}"#),
+            anth_delta(2, r#"{"type":"input_json_delta","partial_json":"{\"text_delta\":1}"}"#),
+            anth_delta(1, r#"{"type":"text_delta","text":" tail"}"#),
+        ];
+        let full = |t: &mut dyn SseTransform, evs: &[String]| run(t, evs);
+        assert_eq!(full(&mut OaiPassthrough::new(true).capturing(1000), &oai), (want.into(), false));
+        assert_eq!(full(&mut OaiToAnthStream::new("m", "r").capturing(1000), &oai), (want.into(), false));
+        assert_eq!(full(&mut AnthPassthrough::new().capturing(1000), &anth), (want.into(), false));
+        assert_eq!(full(&mut AnthToOaiStream::new("m", "r").capturing(1000), &anth), (want.into(), false));
+
+        // cut at the cap, at a character: "a\"b\n" is 4 bytes, é 2
+        let cut = ("a\"b\n".to_string(), true);
+        assert_eq!(full(&mut OaiPassthrough::new(true).capturing(5), &oai), cut);
+        assert_eq!(full(&mut OaiToAnthStream::new("m", "r").capturing(5), &oai), cut);
+        assert_eq!(full(&mut AnthPassthrough::new().capturing(5), &anth), cut);
+        assert_eq!(full(&mut AnthToOaiStream::new("m", "r").capturing(5), &anth), cut);
+        // not asked for: nothing
+        assert_eq!(full(&mut OaiPassthrough::new(true), &oai), (String::new(), false));
+        assert_eq!(full(&mut AnthPassthrough::new(), &anth), (String::new(), false));
+
+        // A response that only calls tools has no text to capture.
+        let tools_only = [r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"t","type":"function","function":{"name":"f","arguments":"{\"content\":\"x\"}"}}]}}]}"#.to_string()];
+        assert_eq!(full(&mut OaiPassthrough::new(false).capturing(100), &tools_only), (String::new(), false));
+        assert_eq!(full(&mut OaiToAnthStream::new("m", "r").capturing(100), &tools_only), (String::new(), false));
+        let tools_only = [anth_delta(0, r#"{"type":"input_json_delta","partial_json":"{\"text\":\"x\"}"}"#)];
+        assert_eq!(full(&mut AnthPassthrough::new().capturing(100), &tools_only), (String::new(), false));
+        assert_eq!(full(&mut AnthToOaiStream::new("m", "r").capturing(100), &tools_only), (String::new(), false));
+    }
+
+    #[test]
+    fn json_responses_capture_the_text() {
+        let oai = br#"{"choices":[{"message":{"content":"x\u00e9\ud83d\ude00 \"q\""}}]}"#;
+        assert_eq!(oai_json_text(oai, 100).into_parts(), ("xé😀 \"q\"".into(), false));
+        assert_eq!(oai_json_text(oai, 2).into_parts(), ("x".into(), true));
+        let tools = br#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"t","function":{"name":"f","arguments":"{}"}}]}}]}"#;
+        assert_eq!(oai_json_text(tools, 100).into_parts(), (String::new(), false));
+        let anth = r#"{"content":[{"type":"thinking","thinking":"hm"},{"type":"text","text":"x\u00e9"},
+            {"type":"tool_use","id":"t","name":"f","input":{"text":"in"}},{"type":"text","text":"ü"}]}"#;
+        let anth = anth.as_bytes();
+        assert_eq!(anth_json_text(anth, 100).into_parts(), ("xéü".into(), false));
+        assert_eq!(anth_json_text(anth, 3).into_parts(), ("xé".into(), true));
+        assert_eq!(anth_json_text(anth, 2).into_parts(), ("x".into(), true));
+        let tools = br#"{"content":[{"type":"tool_use","id":"t","name":"f","input":{"text":"in"}}]}"#;
+        assert_eq!(anth_json_text(tools, 100).into_parts(), (String::new(), false));
+        assert_eq!(oai_json_text(b"not json", 100).into_parts(), (String::new(), false));
+    }
+
+    /// However long the response, what is kept, and the memory it holds,
+    /// stays within the cap.
+    #[test]
+    fn captures_never_hold_more_than_the_cap() {
+        let cap = 10_000;
+        let mut t = OaiPassthrough::new(false).capturing(cap);
+        let mut out = Vec::new();
+        for _ in 0..5_000 {
+            t.event(oai_chunk(r#""0123456789\n\u00e9""#).as_bytes(), &mut out);
+            assert!(t.capture.text.capacity() <= cap, "{}", t.capture.text.capacity());
+        }
+        let (text, cut) = t.take_output().into_parts();
+        assert!(cut && text.len() <= cap && text.len() > cap - 4, "{}", text.len());
+        assert!(text.capacity() <= cap);
+
+        let long = format!(r#"{{"choices":[{{"message":{{"content":"{}"}}}}]}}"#, "y".repeat(2 << 20));
+        let (text, cut) = oai_json_text(long.as_bytes(), 64 << 10).into_parts();
+        assert!(cut && text.len() == 64 << 10 && text.capacity() == 64 << 10);
+    }
+
+    #[test]
+    fn unescapes_within_a_limit() {
+        let mut out = String::from("ab");
+        assert!(unescape_into(r"cé\n", &mut out, 2));
+        assert_eq!(out, "abc", "é doesn't fit in what is left");
+        let mut out = String::new();
+        assert!(unescape_into(r"\n😀", &mut out, 4));
+        assert_eq!(out, "\n");
+        let mut out = String::new();
+        assert!(!unescape_into(r"\n😀", &mut out, 5));
+        assert_eq!(out, "\n😀");
+    }
 }

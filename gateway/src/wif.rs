@@ -8,22 +8,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use http::{HeaderValue, Request, StatusCode, header};
 use http_body_util::{BodyExt, Full, Limited};
 use serde::Deserialize;
 
-/// Renewal starts about halfway through a token's life, in the background, so an
-/// outage of the identity provider or Anthropic shorter than that costs nothing;
-/// and always this long before expiry at the latest.
-const ADVISORY_REFRESH: Duration = Duration::from_secs(120);
-/// Too close to expiry to send: requests wait for a new token instead.
-const MANDATORY_REFRESH: Duration = Duration::from_secs(30);
-/// A refused exchange isn't retried on every request: a token with a jti claim is
-/// single use, and the file has to rotate before another try can work.
-const RETRY_AFTER: Duration = Duration::from_secs(5);
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+use crate::cloud::token::{FetchError, Fetched, RefreshingToken, TokenSource, millis};
+
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_ASSERTION: usize = 16 << 10; // Anthropic's limit
 
@@ -38,55 +29,16 @@ pub struct WifConfig {
     pub identity_token_file: String,
 }
 
-struct Token {
-    header: HeaderValue,
-    expires: Instant,
-    refresh_at: Instant,
-}
+/// An Anthropic token kept fresh by exchanging this machine's identity token.
+pub type Wif = RefreshingToken<Exchange>;
 
-impl Token {
-    fn new(header: HeaderValue, lifetime: Duration) -> Token {
-        let now = Instant::now();
-        Token { header, expires: now + lifetime, refresh_at: now + refresh_after(lifetime) }
-    }
-}
-
-/// Half the lifetime, give or take a tenth, so gateways that started together
-/// don't all renew in the same second.
-fn refresh_after(lifetime: Duration) -> Duration {
-    let spread = lifetime / 5;
-    lifetime / 2 - lifetime / 10 + spread.mul_f64(fastrand::f64())
-}
-
-/// Doubles from RETRY_AFTER up to MAX_RETRY_AFTER, with jitter.
-fn backoff(failures: u32) -> Duration {
-    let d = (RETRY_AFTER * 2u32.pow(failures.saturating_sub(1).min(4))).min(MAX_RETRY_AFTER);
-    d / 2 + (d / 2).mul_f64(fastrand::f64())
-}
-
-/// Instants as milliseconds since the process started, for an atomic.
-fn millis(t: Instant) -> u64 {
-    static START: OnceLock<Instant> = OnceLock::new();
-    t.saturating_duration_since(*START.get_or_init(Instant::now)).as_millis() as u64
-}
-
-#[derive(Default)]
-struct Refresh {
-    failures: u32,
-    last_err: Option<String>,
-    /// A hash of the identity token behind `current`.
-    used: Option<u64>,
-}
-
-pub struct Wif {
+pub struct Exchange {
     cfg: WifConfig,
     base_url: String,
     source: Source,
-    current: ArcSwapOption<Token>,
-    /// No exchange before this (see `millis`).
-    next_try: AtomicU64,
-    /// One exchange at a time.
-    refresh: Arc<tokio::sync::Mutex<Refresh>>,
+    /// A hash of the identity token behind the current Anthropic token. A token
+    /// with a jti claim is single use, so the same one isn't exchanged twice.
+    used: Mutex<Option<u64>>,
 }
 
 /// Outlives config reloads: a reload builds new providers, and exchanging again
@@ -97,100 +49,35 @@ pub fn state(base_url: &str, cfg: WifConfig) -> Arc<Wif> {
     static STATES: OnceLock<Mutex<HashMap<Key, Arc<Wif>>>> = OnceLock::new();
     let key = (base_url.to_string(), cfg.clone());
     let mut states = STATES.get_or_init(Default::default).lock().unwrap();
-    states.entry(key).or_insert_with(|| Arc::new(Wif::new(base_url, cfg, Source::from_env()))).clone()
+    states.entry(key).or_insert_with(|| Arc::new(new(base_url, cfg, Source::from_env()))).clone()
 }
 
-impl Wif {
-    fn new(base_url: &str, cfg: WifConfig, source: Source) -> Wif {
-        Wif {
-            cfg,
-            base_url: base_url.to_string(),
-            source,
-            current: ArcSwapOption::empty(),
-            next_try: AtomicU64::new(0),
-            refresh: Default::default(),
-        }
+fn new(base_url: &str, cfg: WifConfig, source: Source) -> Wif {
+    RefreshingToken::new(Exchange { cfg, base_url: base_url.to_string(), source, used: Mutex::new(None) })
+}
+
+impl TokenSource for Exchange {
+    fn what(&self) -> &str {
+        "anthropic workload identity exchange"
     }
 
-    /// The Authorization header for the next upstream request.
-    pub async fn bearer(self: &Arc<Self>) -> Result<HeaderValue, String> {
-        let now = Instant::now();
-        if let Some(t) = self.current.load_full()
-            && t.expires.saturating_duration_since(now) > MANDATORY_REFRESH
-        {
-            let due = now >= t.refresh_at || t.expires.saturating_duration_since(now) <= ADVISORY_REFRESH;
-            if due
-                && millis(now) >= self.next_try.load(Ordering::Relaxed)
-                && let Ok(mut guard) = self.refresh.clone().try_lock_owned()
-            {
-                let me = self.clone();
-                tokio::spawn(async move {
-                    let _ = me.exchange(&mut guard).await;
-                });
-            }
-            return Ok(t.header.clone());
-        }
-        // Nothing usable: this request waits for an exchange.
-        let mut guard = self.refresh.lock().await;
-        self.exchange(&mut guard).await
-    }
-
-    /// Gets a new token if one is due and allowed, and returns the header to send.
-    async fn exchange(&self, r: &mut Refresh) -> Result<HeaderValue, String> {
-        let now = Instant::now();
-        let cur = self.current.load_full();
-        let left = cur.as_ref().map_or(Duration::ZERO, |t| t.expires.saturating_duration_since(now));
-        let usable = left > MANDATORY_REFRESH;
-        if let Some(t) = &cur
-            && usable
-            && now < t.refresh_at
-            && left > ADVISORY_REFRESH
-        {
-            return Ok(t.header.clone()); // another exchange just finished
-        }
-        // Backing off: after a failure, or while waiting for the file to rotate.
-        // Once the current token is too close to expiry, only a failure stops a try.
-        if millis(now) < self.next_try.load(Ordering::Relaxed) && (usable || r.last_err.is_some()) {
-            return match (&cur, usable) {
-                (Some(t), true) => Ok(t.header.clone()),
-                _ => Err(r.last_err.clone().unwrap_or_default()),
-            };
-        }
-        let assertion = self.source.identity_token(&self.cfg.identity_token_file).await;
-        let hash = assertion.as_deref().ok().map(hash_token);
+    async fn fetch(&self, usable: bool) -> Result<Fetched, FetchError> {
+        let assertion = self.source.identity_token(&self.cfg.identity_token_file).await?;
+        let hash = hash_token(&assertion);
         // The file hasn't rotated yet. Sending it again would only be refused as a
         // replay, so wait while the current token lasts. Near expiry it is sent
         // anyway, since an issuer with check_jti off accepts it.
-        if usable && hash.is_some() && hash == r.used {
-            self.next_try.store(millis(now + RETRY_AFTER), Ordering::Relaxed);
-            return Ok(cur.unwrap().header.clone());
+        if usable && *self.used.lock().unwrap() == Some(hash) {
+            return Ok(Fetched::NotYet);
         }
-        let exchanged = match assertion {
-            Ok(a) => self.exchange_once(a).await,
-            Err(e) => Err(e),
-        };
-        match exchanged {
-            Ok(t) => {
-                let header = t.header.clone();
-                self.current.store(Some(Arc::new(t)));
-                *r = Refresh { failures: 0, last_err: None, used: hash };
-                self.next_try.store(0, Ordering::Relaxed);
-                Ok(header)
-            }
-            Err(message) => {
-                eprintln!("anthropic workload identity exchange failed: {message}");
-                r.failures += 1;
-                r.last_err = Some(message.clone());
-                self.next_try.store(millis(now + backoff(r.failures)), Ordering::Relaxed);
-                match (cur, usable) {
-                    (Some(t), true) => Ok(t.header.clone()),
-                    _ => Err(message),
-                }
-            }
-        }
+        let (header, lifetime) = self.exchange_once(assertion).await?;
+        *self.used.lock().unwrap() = Some(hash);
+        Ok(Fetched::Token(header, lifetime))
     }
+}
 
-    async fn exchange_once(&self, assertion: String) -> Result<Token, String> {
+impl Exchange {
+    async fn exchange_once(&self, assertion: String) -> Result<(HeaderValue, Duration), String> {
         let endpoint = endpoint(&self.base_url)?;
         let mut grant = serde_json::json!({
             "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
@@ -234,9 +121,8 @@ impl Wif {
         if out.access_token.is_empty() || out.expires_in == 0 {
             return Err(bad());
         }
-        let mut header = HeaderValue::try_from(format!("Bearer {}", out.access_token)).map_err(|_| bad())?;
-        header.set_sensitive(true);
-        Ok(Token::new(header, Duration::from_secs(out.expires_in)))
+        let header = HeaderValue::try_from(format!("Bearer {}", out.access_token)).map_err(|_| bad())?;
+        Ok((header, Duration::from_secs(out.expires_in)))
     }
 }
 
@@ -495,22 +381,12 @@ mod tests {
         }
     }
 
-    fn wif(url: &str, path: &str) -> Arc<Wif> {
-        Arc::new(Wif::new(url, cfg(path), Source::default()))
+    fn wif(url: &str, path: &str) -> Wif {
+        new(url, cfg(path), Source::default())
     }
 
-    /// Waits for a background renewal to finish.
-    async fn idle(w: &Arc<Wif>) {
-        let _ = w.refresh.lock().await;
-    }
-
-    fn header(token: &str, expires: Duration, refresh_at: Option<Instant>) -> Arc<Token> {
-        let now = Instant::now();
-        Arc::new(Token {
-            header: HeaderValue::from_str(token).unwrap(),
-            expires: now + expires,
-            refresh_at: refresh_at.unwrap_or(now + expires),
-        })
+    async fn idle(w: &Wif) {
+        w.idle().await;
     }
 
     #[tokio::test]
@@ -572,10 +448,10 @@ mod tests {
         let (url, hits, _) = stub(vec![(200, 3600), (200, 3600)]).await;
         let w = wif(&url, &file("skipthenexpiry", "aaa.bbb.ccc"));
         w.bearer().await.unwrap();
-        w.current.store(Some(header("Bearer sk-ant-oat01-0", Duration::from_secs(100), None)));
+        w.set_current("Bearer sk-ant-oat01-0", Duration::from_secs(100), None);
         w.bearer().await.unwrap(); // advisory: skipped, file unchanged
         idle(&w).await;
-        w.current.store(Some(header("Bearer sk-ant-oat01-0", Duration::from_secs(10), None)));
+        w.set_current("Bearer sk-ant-oat01-0", Duration::from_secs(10), None);
         assert_eq!(w.bearer().await.unwrap(), "Bearer sk-ant-oat01-1");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
@@ -588,27 +464,12 @@ mod tests {
         w.bearer().await.unwrap();
         // Half its life gone, still well before expiry.
         let past = Instant::now() - Duration::from_secs(1);
-        w.current.store(Some(header("old", Duration::from_secs(1800), Some(past))));
+        w.set_current("old", Duration::from_secs(1800), Some(past));
         std::fs::write(&path, "ddd.eee.fff").unwrap();
         assert_eq!(w.bearer().await.unwrap(), "old", "the request must not wait for the renewal");
         idle(&w).await;
         assert_eq!(w.bearer().await.unwrap(), "Bearer sk-ant-oat01-1");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn refresh_timing_and_backoff() {
-        for _ in 0..200 {
-            let d = refresh_after(Duration::from_secs(3600));
-            assert!(d >= Duration::from_secs(24 * 60) && d <= Duration::from_secs(36 * 60), "{d:?}");
-        }
-        for n in 1..=8 {
-            let d = backoff(n);
-            assert!(d >= RETRY_AFTER / 2 && d <= MAX_RETRY_AFTER, "backoff({n}) = {d:?}");
-            if n >= 5 {
-                assert!(d >= MAX_RETRY_AFTER / 2, "backoff({n}) = {d:?} should reach the cap");
-            }
-        }
     }
 
     #[tokio::test]
@@ -733,7 +594,7 @@ mod tests {
     async fn kubernetes_token_per_exchange() {
         let (k, k8s_hits, requests) = k8s_stub("perexchange", 201).await;
         let (url, hits, seen) = stub(vec![(200, 10), (200, 3600)]).await;
-        let w = Arc::new(Wif::new(&url, cfg(""), Source { kubernetes: Some(k), ..Default::default() }));
+        let w = new(&url, cfg(""), Source { kubernetes: Some(k), ..Default::default() });
         w.bearer().await.unwrap();
         w.bearer().await.unwrap(); // 10 s left after the first: the second needs a new token
         assert_eq!((k8s_hits.load(Ordering::SeqCst), hits.load(Ordering::SeqCst)), (2, 2));
@@ -753,7 +614,7 @@ mod tests {
         let (k, _, _) = k8s_stub("fallback", 403).await;
         let (url, _, seen) = stub(vec![(200, 3600)]).await;
         let source = Source { file: Some(file("fallback", "fff.ggg.hhh")), kubernetes: Some(k), ..Default::default() };
-        Arc::new(Wif::new(&url, cfg(""), source)).bearer().await.unwrap();
+        new(&url, cfg(""), source).bearer().await.unwrap();
         assert_eq!(seen.lock().unwrap()[0]["assertion"], "fff.ggg.hhh");
     }
 
@@ -761,7 +622,7 @@ mod tests {
     async fn kubernetes_error_without_a_file() {
         let (k, _, _) = k8s_stub("nofile", 403).await;
         let (url, hits, _) = stub(vec![(200, 3600)]).await;
-        let w = Arc::new(Wif::new(&url, cfg(""), Source { kubernetes: Some(k), ..Default::default() }));
+        let w = new(&url, cfg(""), Source { kubernetes: Some(k), ..Default::default() });
         let err = w.bearer().await.unwrap_err();
         assert!(err.contains("403") && err.contains("forbidden") && !err.contains("pod-api-token"), "{err}");
         assert_eq!(hits.load(Ordering::SeqCst), 0);

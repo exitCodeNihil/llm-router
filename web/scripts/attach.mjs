@@ -8,11 +8,13 @@
  * inspected. Non-destructive: removes any conversation it creates.
  */
 import { chromium } from "playwright";
+import { fixtures } from "./fixtures.mjs";
 
 const BASE = process.argv[2] ?? "http://localhost:5173";
 const API = process.argv[3] ?? "http://localhost:8080";
 const USER = process.env.LLMR_USER ?? "dev@local";
 const PASS = process.env.LLMR_PASS ?? "devpassword123";
+const cleanup = await fixtures(API, process.env.LLMR_TOKEN ?? "dev-admin-token");
 
 const results = [];
 const check = (name, pass, detail = "") => {
@@ -189,6 +191,7 @@ for (const c of await mine()) await context.request.delete(`${API}/api/chats/${c
 check("cleanup left pre-existing chats intact", (await listChats()).length === preExisting.size);
 
 await browser.close();
+await cleanup();
 const failed = results.filter((r) => !r).length;
 console.log(`\n${results.length - failed}/${results.length} composer input checks passed`);
 process.exit(failed ? 1 : 0);

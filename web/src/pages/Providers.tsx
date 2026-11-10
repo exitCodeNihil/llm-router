@@ -173,7 +173,7 @@ function ProviderForm({ editing, onClose }: { editing: Provider | null; onClose:
           hasAutoFocus
         />
 
-        <Grid columns={{ minWidth: 200, repeat: "fit" }} gap={3}>
+        <Grid columns={{ minWidth: 200, repeat: "fit" }} gap={3} align="end">
           <Selector
             label="Type"
             value={type}
@@ -220,7 +220,7 @@ function ProviderForm({ editing, onClose }: { editing: Provider | null; onClose:
         )}
 
         {authMode === "anthropic_wif" && (
-          <Grid columns={{ minWidth: 200, repeat: "fit" }} gap={3}>
+          <Grid columns={{ minWidth: 200, repeat: "fit" }} gap={3} align="end">
             <TextInput
               label="Federation rule ID"
               value={wif.federation_rule_id}
@@ -262,7 +262,7 @@ function ProviderForm({ editing, onClose }: { editing: Provider | null; onClose:
         )}
 
         {isVertex && (
-          <Grid columns={{ minWidth: 200, repeat: "fit" }} gap={3}>
+          <Grid columns={{ minWidth: 200, repeat: "fit" }} gap={3} align="end">
             <TextInput
               label="Project ID"
               value={project}

@@ -43,6 +43,8 @@ func (u *anthUsage) counts() usageCounts {
 		Write1h:     u.CacheCreation.Ephemeral1h,
 		USInference: u.InferenceGeo == "us",
 		Fast:        u.Speed == "fast",
+		Geo:         u.InferenceGeo,
+		Speed:       u.Speed,
 	}
 }
 
@@ -56,6 +58,12 @@ func (c *usageCounts) setInput(n usageCounts) {
 	}
 	c.USInference = c.USInference || n.USInference
 	c.Fast = c.Fast || n.Fast
+	if n.Geo != "" {
+		c.Geo = n.Geo
+	}
+	if n.Speed != "" {
+		c.Speed = n.Speed
+	}
 }
 
 // oaiToAnthBody converts an OpenAI chat-completions request into an Anthropic
@@ -282,7 +290,7 @@ func oaiFinishReason(stopReason string) string {
 }
 
 // anthRespToOAI translates a non-streaming Anthropic response to OpenAI shape.
-func anthRespToOAI(w http.ResponseWriter, resp *http.Response, model, reqID string, capture bool) (usageCounts, string) {
+func anthRespToOAI(w http.ResponseWriter, resp *http.Response, model, reqID string, capture int) (usageCounts, string) {
 	var counts usageCounts
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if err != nil {
@@ -339,7 +347,7 @@ func anthRespToOAI(w http.ResponseWriter, resp *http.Response, model, reqID stri
 			"total_tokens": counts.Prompt + counts.Completion,
 		},
 	})
-	if !capture {
+	if capture == 0 {
 		text = ""
 	}
 	return counts, text
@@ -362,7 +370,7 @@ func anthEvents(body io.Reader, fn func(event string, data []byte)) error {
 }
 
 // anthStreamToOAI re-emits an Anthropic SSE stream as OpenAI chunks.
-func anthStreamToOAI(w http.ResponseWriter, resp *http.Response, model, reqID string, capture bool, ttftStart time.Time) (usageCounts, string) {
+func anthStreamToOAI(w http.ResponseWriter, resp *http.Response, model, reqID string, capture int, ttftStart time.Time) (usageCounts, string) {
 	var counts usageCounts
 	var output strings.Builder
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -430,7 +438,7 @@ func anthStreamToOAI(w http.ResponseWriter, resp *http.Response, model, reqID st
 			}
 			switch bd.Delta.Type {
 			case "text_delta":
-				if capture && output.Len() < 64<<10 {
+				if output.Len() < capture {
 					output.WriteString(bd.Delta.Text)
 				}
 				chunk(map[string]any{"content": bd.Delta.Text}, nil)
@@ -480,7 +488,7 @@ func anthStreamToOAI(w http.ResponseWriter, resp *http.Response, model, reqID st
 }
 
 // passthroughAnthJSON forwards an Anthropic response verbatim, extracting usage.
-func passthroughAnthJSON(w http.ResponseWriter, resp *http.Response, capture bool) (usageCounts, string) {
+func passthroughAnthJSON(w http.ResponseWriter, resp *http.Response, capture int) (usageCounts, string) {
 	var counts usageCounts
 	var output string
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
@@ -496,7 +504,7 @@ func passthroughAnthJSON(w http.ResponseWriter, resp *http.Response, capture boo
 		if ar.Usage != nil {
 			counts = ar.Usage.counts()
 		}
-		if capture {
+		if capture > 0 {
 			var parts []string
 			for _, b := range ar.Content {
 				if b.Type == "text" {
@@ -516,7 +524,7 @@ func passthroughAnthJSON(w http.ResponseWriter, resp *http.Response, capture boo
 
 // streamAnthPassthrough copies an Anthropic SSE stream verbatim while
 // extracting usage (and text when capturing).
-func streamAnthPassthrough(w http.ResponseWriter, resp *http.Response, capture bool, ttftStart time.Time) (usageCounts, string) {
+func streamAnthPassthrough(w http.ResponseWriter, resp *http.Response, capture int, ttftStart time.Time) (usageCounts, string) {
 	var counts usageCounts
 	var output strings.Builder
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -561,7 +569,7 @@ func streamAnthPassthrough(w http.ResponseWriter, resp *http.Response, capture b
 					}
 				}
 			}
-			if capture && output.Len() < 64<<10 && bytes.Contains(data, []byte(`"text_delta"`)) {
+			if output.Len() < capture && bytes.Contains(data, []byte(`"text_delta"`)) {
 				var bd struct {
 					Delta struct {
 						Text string `json:"text"`

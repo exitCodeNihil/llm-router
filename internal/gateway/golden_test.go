@@ -111,25 +111,25 @@ func runGolden(t *testing.T, g golden) (json.RawMessage, *goldenUsage, string) {
 		}
 		return out, nil, ""
 	case "oai_resp_to_anth":
-		c, _ = writeAnthResponse(rec, resp, g.Model, g.ReqID, false)
+		c, _ = writeAnthResponse(rec, resp, g.Model, g.ReqID, 0)
 		return bytes.TrimSpace(rec.Body.Bytes()), usageOf(c), ""
 	case "anth_resp_to_oai":
-		c, _ = anthRespToOAI(rec, resp, g.Model, g.ReqID, false)
+		c, _ = anthRespToOAI(rec, resp, g.Model, g.ReqID, 0)
 		return bytes.TrimSpace(rec.Body.Bytes()), usageOf(c), ""
 	case "oai_json_usage": // the body itself passes through untouched
-		c, _ = copyJSON(rec, resp, false)
+		c, _ = copyJSON(rec, resp, 0)
 		return nil, usageOf(c), ""
 	case "anth_json_usage":
-		c, _ = passthroughAnthJSON(rec, resp, false)
+		c, _ = passthroughAnthJSON(rec, resp, 0)
 		return nil, usageOf(c), ""
 	case "oai_passthrough":
-		c, _ = (&Server{}).streamSSE(rec, resp, g.DropUsageChunk, false, time.Now())
+		c, _ = (&Server{}).streamSSE(rec, resp, g.DropUsageChunk, 0, time.Now())
 	case "anth_passthrough":
-		c, _ = streamAnthPassthrough(rec, resp, false, time.Now())
+		c, _ = streamAnthPassthrough(rec, resp, 0, time.Now())
 	case "oai_to_anth_stream":
-		c, _ = streamAnthropic(rec, resp, g.Model, g.ReqID, false)
+		c, _ = streamAnthropic(rec, resp, g.Model, g.ReqID, 0)
 	case "anth_to_oai_stream":
-		c, _ = anthStreamToOAI(rec, resp, g.Model, g.ReqID, false, time.Now())
+		c, _ = anthStreamToOAI(rec, resp, g.Model, g.ReqID, 0, time.Now())
 	default:
 		t.Fatalf("unknown fn %q", g.Fn)
 	}

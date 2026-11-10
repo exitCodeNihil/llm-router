@@ -17,8 +17,9 @@ import (
 )
 
 const (
-	windowSecs  = 60  // sliding window width
-	latRingSize = 512 // bounded latency reservoir per provider
+	nodeForgetSecs = 30 * 60 // as long as the node store keeps a gateway
+	windowSecs     = 60      // sliding window width
+	latRingSize    = 512     // bounded latency reservoir per provider
 )
 
 // wcounter is a 60-bucket ring of per-second counts over the sliding window.
@@ -111,6 +112,9 @@ type Live struct {
 	providers map[string]*provStat
 	edges     map[edgeKey]*wcounter
 	nodes     map[string]*wcounter // gateway_id ("" = the control plane) -> rps
+	nodeLat   map[string]*latring  // gateway_id -> latency reservoir (node p50)
+	nodeSeen  map[string]int64     // gateway_id -> last second it served, to forget replaced pods
+	pruned    int64
 	scopes    map[string]*wcounter // "key:id"|"user:id"|"team:id"|"tag:val" -> rule match rates
 	global    latring              // all-provider latency reservoir (node p50/p95)
 }
@@ -121,6 +125,8 @@ func NewLive() *Live {
 		providers: map[string]*provStat{},
 		edges:     map[edgeKey]*wcounter{},
 		nodes:     map[string]*wcounter{},
+		nodeLat:   map[string]*latring{},
+		nodeSeen:  map[string]int64{},
 		scopes:    map[string]*wcounter{},
 	}
 }
@@ -153,6 +159,23 @@ func (l *Live) Write(e usage.Event) {
 		l.nodes[e.GatewayID] = &wcounter{}
 	}
 	l.nodes[e.GatewayID].add(sec, isErr)
+	l.nodeSeen[e.GatewayID] = sec
+	if sec-l.pruned > 60 {
+		// Every autoscaled pod or restart is a new gateway id: forget the
+		// ones that stopped serving, as the node store does.
+		l.pruned = sec
+		for id, seen := range l.nodeSeen {
+			if id != "" && sec-seen > nodeForgetSecs {
+				delete(l.nodes, id)
+				delete(l.nodeLat, id)
+				delete(l.nodeSeen, id)
+			}
+		}
+	}
+	if l.nodeLat[e.GatewayID] == nil {
+		l.nodeLat[e.GatewayID] = &latring{}
+	}
+	l.nodeLat[e.GatewayID].push(e.LatencyMS)
 
 	for st, val := range map[string]string{"key": e.APIKeyID, "user": e.UserID, "team": e.TeamID} {
 		if val == "" {
@@ -258,6 +281,16 @@ func (l *Live) NodeRPS(id string) float64 {
 	}
 	count, _ := c.totals(sec)
 	return float64(count) / windowSecs
+}
+
+// NodeP50 is one node's median latency over its recent requests.
+func (l *Live) NodeP50(id string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if r := l.nodeLat[id]; r != nil {
+		return percentile(r.buf, 50)
+	}
+	return 0
 }
 
 // TotalRPM sums request counts across providers over the window.

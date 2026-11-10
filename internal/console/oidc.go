@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"sync"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -31,6 +32,12 @@ type Auth struct {
 	Store         *store.Store
 	EncryptionKey string
 	CookieDomain  string
+	// TrustedProxies are the proxies whose X-Forwarded-For names the client
+	// for sign-in rate limits (LLMR_TRUSTED_PROXIES).
+	TrustedProxies []netip.Prefix
+
+	limitsOnce sync.Once
+	limits     *signInLimits
 
 	mu       sync.Mutex
 	provider *oidc.Provider

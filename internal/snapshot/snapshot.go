@@ -5,7 +5,6 @@
 package snapshot
 
 import (
-	"math/rand"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -155,97 +154,6 @@ type Spend struct {
 	USD float64
 }
 
-// Telemetry is the observability-exporter config (settings key 'telemetry').
-// Generic by design: Type selects the backend (only "langfuse" today).
-type Telemetry struct {
-	Type           string `json:"type"`
-	Host           string `json:"host"`
-	PublicKey      string `json:"public_key"`
-	SecretKey      string `json:"secret_key"`
-	Enabled        bool   `json:"enabled"`
-	CaptureContent bool   `json:"capture_content"` // default capture for "everything" mode
-	// Mode selects how requests are exported:
-	//   "everything" (default) — export all traffic, capture per CaptureContent
-	//   "by_rule"    — first matching enabled rule (by Order) decides
-	//   "off"        — export nothing
-	Mode  string          `json:"mode,omitempty"`
-	Rules []TelemetryRule `json:"rules,omitempty"`
-}
-
-// TelemetryRule is one ordered export rule (by_rule mode).
-type TelemetryRule struct {
-	ID         string `json:"id"`
-	Order      int    `json:"order"`
-	ScopeType  string `json:"scope_type"`  // team | user | key | tag
-	ScopeValue string `json:"scope_value"` // id or tag string
-	Capture    string `json:"capture"`     // content | meta
-	Sample     int    `json:"sample"`      // 0..100, percent of matches exported
-	Enabled    bool   `json:"enabled"`
-}
-
-// Decision is the per-request export verdict computed once post-auth.
-type Decision struct {
-	Export         bool
-	CaptureContent bool
-	RuleID         string
-}
-
-// Evaluate decides whether this request is exported and whether its content is
-// captured. First enabled rule (by Order) whose scope matches wins.
-func (t Telemetry) Evaluate(keyID, userID, teamID string, tags []string) Decision {
-	if !t.Enabled {
-		return Decision{}
-	}
-	switch t.Mode {
-	case "off":
-		return Decision{}
-	case "by_rule":
-		rules := append([]TelemetryRule(nil), t.Rules...)
-		sort.SliceStable(rules, func(i, j int) bool { return rules[i].Order < rules[j].Order })
-		for _, r := range rules {
-			if !r.Enabled || !ruleMatches(r, keyID, userID, teamID, tags) {
-				continue
-			}
-			if !sampleGate(r.Sample) {
-				return Decision{RuleID: r.ID} // matched but sampled out
-			}
-			return Decision{Export: true, CaptureContent: r.Capture == "content", RuleID: r.ID}
-		}
-		return Decision{}
-	default: // "" or "everything"
-		return Decision{Export: true, CaptureContent: t.CaptureContent}
-	}
-}
-
-func ruleMatches(r TelemetryRule, keyID, userID, teamID string, tags []string) bool {
-	switch r.ScopeType {
-	case "key":
-		return r.ScopeValue == keyID
-	case "user":
-		return r.ScopeValue == userID
-	case "team":
-		return r.ScopeValue == teamID
-	case "tag":
-		for _, tag := range tags {
-			if tag == r.ScopeValue {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// sampleGate passes sample% of calls. Bounds are exact: 0 never, 100 always.
-func sampleGate(sample int) bool {
-	if sample >= 100 {
-		return true
-	}
-	if sample <= 0 {
-		return false
-	}
-	return rand.Float64()*100 < float64(sample) // ponytail: probabilistic per-request sampling
-}
-
 type Snapshot struct {
 	Version            int64
 	KeysByHash         map[[32]byte]*Key
@@ -259,6 +167,7 @@ type Snapshot struct {
 	Spend         map[string]Spend
 	Telemetry     Telemetry
 	GatewayGroups map[string]*GatewayGroup
+	Destinations  []*Destination // by name
 }
 
 // Holder is the atomic snapshot pointer the hot path reads through.

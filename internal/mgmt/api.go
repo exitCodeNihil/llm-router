@@ -39,23 +39,30 @@ type Server struct {
 	// IDE is served from this mux, which shares the console's origin).
 	IDEOrigin string
 
-	rtMu      sync.Mutex
-	rt        workspace.Runtime
-	rtCfg     workspace.Config
-	rtAt      time.Time
+	rtMu  sync.Mutex
+	rt    workspace.Runtime
+	rtCfg workspace.Config
+	rtAt  time.Time
+	// TokenGuard limits failed admin-token attempts per client address.
+	TokenGuard interface {
+		AdminTokenBlocked(http.ResponseWriter, *http.Request) bool
+		AdminTokenFailed(*http.Request)
+	}
 	Live      *metrics.Live
 	NodeStore *metrics.NodeStore
-	Events    *metrics.Events
-	Recorder  *telemetry.Recorder
-	// Exporter reports delivery health; nil when no exporter runs in-process.
-	Exporter interface{ Health() telemetry.Health }
-
-	// Cached Langfuse trace URL prefix, keyed by host+public key.
-	traceMu    sync.Mutex
-	traceCache map[string]string
-	Gateway    *gateway.Server // chat playground bridge into the data plane
-	Version    string          // control-plane build version
-	Started    time.Time       // control-plane process start
+	// GatewaySync names the providers an older gateway is not sent.
+	GatewaySync interface {
+		UnservedProviders(group string, schema int) []string
+	}
+	HTTP     *metrics.HTTP // the control plane's own listener
+	Events   *metrics.Events
+	Recorder *telemetry.Recorder
+	// Telemetry reports destination health and trace links; nil when no
+	// exporter runs in-process.
+	Telemetry *telemetry.Manager
+	Gateway   *gateway.Server // chat playground bridge into the data plane
+	Version   string          // control-plane build version
+	Started   time.Time       // control-plane process start
 }
 
 func (m *Server) Register(mux *http.ServeMux) {
@@ -149,7 +156,7 @@ func (m *Server) Register(mux *http.ServeMux) {
 
 	mux.Handle("GET /api/token-issuers", h(m.listTokenIssuers))
 	mux.Handle("POST /api/token-issuers", h(m.createTokenIssuer))
-	mux.Handle("PATCH /api/token-issuers/{id}", h(m.patchRow("token_issuers", tokenIssuerPatchCols)))
+	mux.Handle("PATCH /api/token-issuers/{id}", h(m.patchTokenIssuer))
 	mux.Handle("DELETE /api/token-issuers/{id}", h(m.deleteRow("token_issuers")))
 
 	mux.Handle("POST /api/chat/completions", ha(m.chatCompletions))
@@ -176,8 +183,16 @@ func (m *Server) Register(mux *http.ServeMux) {
 
 	mux.Handle("GET /api/metrics/live", h(m.metricsLive))
 	mux.Handle("GET /api/nodes", h(m.listNodes))
+	mux.Handle("GET /api/nodes/history", h(m.nodesHistory))
 
-	mux.Handle("POST /api/observability/test", h(m.observabilityTest))
+	mux.Handle("GET /api/telemetry/kinds", h(m.telemetryKinds))
+	mux.Handle("GET /api/telemetry/destinations", h(m.listDestinations))
+	mux.Handle("GET /api/telemetry/destinations/{id}", h(m.getDestination))
+	mux.Handle("POST /api/telemetry/destinations", h(m.createDestination))
+	mux.Handle("PUT /api/telemetry/destinations/{id}", h(m.putDestination))
+	mux.Handle("PATCH /api/telemetry/destinations/{id}", h(m.patchDestination))
+	mux.Handle("DELETE /api/telemetry/destinations/{id}", h(m.deleteDestination))
+	mux.Handle("POST /api/telemetry/destinations/test", h(m.testDestination))
 	mux.Handle("GET /api/observability/exported", h(m.observabilityExported))
 	mux.Handle("GET /api/observability/rules/stats", h(m.observabilityRulesStats))
 }

@@ -46,7 +46,7 @@ GO_SOURCES := $(shell find . -name '*.go' -not -path './web/node_modules/*' 2>/d
 .DEFAULT_GOAL := help
 .PHONY: help dev dev-api dev-web build web theme run test test-go test-web \
         check test-db fmt fmt-check vet tidy audit verify verify-chat demo-gifs tools clean distclean \
-        deps db-url stack stack-down stack-logs db-wait db-reset db-shell image image-gateway image-run bench bench-images bench-rgw
+        deps db-url stack stack-telemetry stack-down stack-logs db-wait db-reset db-shell image image-gateway image-run bench bench-images bench-rgw
 
 # ── Help ─────────────────────────────────────────────────────────────────────
 
@@ -109,7 +109,7 @@ test-db: ## Tests that need Postgres, against a throwaway container
 	@$(ENGINE) run -d --rm --name llmr-test-db -e POSTGRES_USER=t -e POSTGRES_PASSWORD=t -e POSTGRES_DB=t \
 	  -p 127.0.0.1:55433:5432 docker.io/library/postgres:17 >/dev/null
 	@until $(ENGINE) exec llmr-test-db pg_isready -U t >/dev/null 2>&1; do sleep 1; done; sleep 1
-	@LLMR_TEST_DATABASE_URL='postgres://t:t@127.0.0.1:55433/t?sslmode=disable' go test -p 1 ./internal/gwsync ./internal/mgmt; \
+	@LLMR_TEST_DATABASE_URL='postgres://t:t@127.0.0.1:55433/t?sslmode=disable' go test -p 1 ./internal/... ./cmd/...; \
 	  s=$$?; $(ENGINE) rm -f llmr-test-db >/dev/null; exit $$s
 
 test-web: $(NODE_DEPS) ## Console typecheck
@@ -139,7 +139,7 @@ audit: $(NODE_DEPS) ## Console audit: every route x 3 viewports (AUDIT_MODE=both
 
 verify: $(NODE_DEPS) ## Browser suite: audit + interactions + e2e + CRUD + observability + guards
 	@AUDIT_MODE=both node $(WEB)/scripts/audit.mjs http://localhost:$(WEB_PORT)
-	@node $(WEB)/scripts/interact.mjs http://localhost:$(WEB_PORT)
+	@node $(WEB)/scripts/interact.mjs http://localhost:$(WEB_PORT) http://localhost:$(PORT)
 	@node $(WEB)/scripts/e2e.mjs      http://localhost:$(WEB_PORT) http://localhost:$(PORT)
 	@node $(WEB)/scripts/crud.mjs     http://localhost:$(WEB_PORT) http://localhost:$(PORT)
 	@node $(WEB)/scripts/obs.mjs      http://localhost:$(WEB_PORT) http://localhost:$(PORT)
@@ -188,16 +188,21 @@ db-url: ## Print the database URL make dev will use
 
 # ── Containers (podman by default, docker if podman is absent) ───────────────
 
-stack: ## Start the dev stack: Postgres, Zitadel (OIDC), Langfuse
+stack: ## Start the dev stack: Postgres, Zitadel (OIDC)
 	@$(COMPOSE) -f $(DEV_STACK) up -d
 	@$(MAKE) --no-print-directory db-wait
-	@printf "\n  Postgres  localhost:5433\n  Zitadel   http://localhost:8082\n  Langfuse  http://localhost:3001\n\n"
+	@printf "\n  Postgres  localhost:5433\n  Zitadel   http://localhost:8082\n\n"
+
+stack-telemetry: ## Also start Grafana with Tempo (OTLP) and Langfuse v4, for telemetry work and make verify
+	@$(COMPOSE) -f $(DEV_STACK) --profile otel --profile langfuse up -d
+	@$(MAKE) --no-print-directory db-wait
+	@printf "\n  Grafana   http://localhost:3000 (OTLP http://localhost:4318, Tempo :3200)\n  Langfuse  http://localhost:3001 (pk-lf-dev-1234 / sk-lf-dev-1234)\n\n"
 
 stack-down: ## Stop the dev stack (volumes are kept)
-	@$(COMPOSE) -f $(DEV_STACK) down
+	@$(COMPOSE) -f $(DEV_STACK) --profile otel --profile langfuse down
 
 stack-logs: ## Follow dev stack logs
-	@$(COMPOSE) -f $(DEV_STACK) logs -f
+	@$(COMPOSE) -f $(DEV_STACK) --profile otel --profile langfuse logs -f
 
 # The gateway creates its own tables on startup but cannot create the database
 # itself, so block until Postgres is actually accepting connections.

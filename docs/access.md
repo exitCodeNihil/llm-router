@@ -52,6 +52,9 @@ locally against the issuer's published keys. Add one under **Settings → Add is
 | Google Cloud | `gcp` | `https://accounts.google.com` | any, e.g. `https://router.example.com` |
 | Other OIDC | `oidc` | your issuer | your `aud` |
 
+The issuer URL must use https (plain http only for `localhost`), and so must the key set it
+publishes: the control plane and every gateway fetch keys from it.
+
 For Entra, set `accessTokenAcceptedVersion: 2` in the app registration manifest and **Email claim**
 to `preferred_username`. For OIDC machine tokens with no email, point **Email claim** at a stable
 claim such as `client_id`. Callers are matched to a gateway user by that claim; unknown users are
@@ -64,3 +67,12 @@ curl https://router.example.com/v1/chat/completions -H "Authorization: Bearer $T
   -H "Content-Type: application/json" \
   -d '{"model":"my-model","messages":[{"role":"user","content":"hi"}]}'
 ```
+
+[Gateways](deploy.md#gateways) verify identity tokens too, with the issuer's keys and no call to
+the control plane for people they know. A gateway group limited to some teams serves their members,
+and creates new users only when **Map to team** is one of its teams. A new person's first request
+goes to the control plane once, which checks the token itself before it creates the user, so a
+gateway can't create users on its own. The control plane must therefore reach the issuer too (its
+`/.well-known/openid-configuration` and `jwks_uri`): while it can't, new people's first requests
+fail, the gateway asks again a few seconds later, and nobody is refused for it. To map tokens to
+users, gateways get every user they serve and a hash of each email address, not the address.

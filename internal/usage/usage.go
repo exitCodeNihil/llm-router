@@ -4,15 +4,20 @@
 package usage
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -36,6 +41,21 @@ type Event struct {
 	StatusCode       int       `json:"status_code"`
 	Stream           bool      `json:"stream"`
 	GatewayID        string    `json:"gateway_id,omitempty"` // the gateway instance that served it; "" = the control plane
+	// GatewayGroupID is the instance's group, set by the control plane when a
+	// gateway syncs; "" = the control plane. Telemetry scopes use it; not stored.
+	GatewayGroupID string `json:"gateway_group_id,omitempty"`
+
+	// TraceID (32 hex) comes from the caller's traceparent or is new;
+	// ParentSpanID (16 hex) is the caller's span, not stored.
+	TraceID      string `json:"trace_id,omitempty"`
+	ParentSpanID string `json:"parent_span_id,omitempty"`
+	// InferenceGeo and Speed are what an Anthropic upstream reported. CostBasis
+	// is the pricing CostUSD was computed with (CostBasisCurrent); 0 = unknown.
+	InferenceGeo string `json:"inference_geo,omitempty"`
+	// Operation is gen_ai.operation.name; "" = chat. Not stored.
+	Operation string `json:"operation,omitempty"`
+	Speed     string `json:"speed,omitempty"`
+	CostBasis int    `json:"cost_basis,omitempty"`
 
 	// Attempts is 1 when the first-choice deployment answered, higher after
 	// failover. ErrorCode is the gateway's own reason for a failure, which
@@ -63,7 +83,13 @@ type Event struct {
 	// enabled. Consumed by telemetry exporters; never written to Postgres.
 	Input  json.RawMessage `json:"input,omitempty"`
 	Output string          `json:"output,omitempty"`
+	System json.RawMessage `json:"system,omitempty"` // Anthropic's top-level system
+	// ContentTruncated is set when captured content was cut to the cap.
+	ContentTruncated bool `json:"content_truncated,omitempty"`
 }
+
+// CostBasisCurrent marks costs computed with 0.3.0's pricing.
+const CostBasisCurrent = 1
 
 type Writer interface {
 	Write(e Event) // must never block the request path
@@ -92,7 +118,14 @@ func NewPGWriter(pool *pgxpool.Pool) *PGWriter {
 
 const flushBatchSize = 1000
 
+// Queued is the events waiting to be written, of Capacity.
+func (w *PGWriter) Queued() int   { return len(w.ch) }
+func (w *PGWriter) Capacity() int { return cap(w.ch) }
+
 func (w *PGWriter) Write(e Event) {
+	// Content is never stored; dropping it here keeps up to 65k queued events
+	// from holding on to request and response bodies.
+	e.Input, e.Output, e.System = nil, "", nil
 	for {
 		select {
 		case w.ch <- e:
@@ -170,8 +203,12 @@ func (w *PGWriter) flush(ctx context.Context, events []Event) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if err := InsertEvents(ctx, tx, events); err != nil {
+	kept, err := InsertEvents(ctx, tx, events)
+	if err != nil {
 		return err
+	}
+	if n := len(events) - len(kept); n > 0 {
+		slog.Warn("usage rows refused", "refused", n, "of", len(events))
 	}
 	return tx.Commit(ctx)
 }
@@ -196,31 +233,108 @@ func ScopeKeys(e Event) []string {
 }
 
 // InsertEvents writes events and their spend_counters in tx: one multi-row
-// batch plus one aggregated upsert per (scope, day).
-func InsertEvents(ctx context.Context, tx pgx.Tx, events []Event) error {
+// batch plus one aggregated upsert per (scope, day). It returns the events it
+// stored. When Postgres refuses a row's data (error classes 22 and 23), the
+// batch is split in halves until the refused rows are found and skipped, so
+// one bad row cannot sink the rest; skipped rows add no spend. Any other
+// error, a missing partition included, is returned so the caller can retry.
+func InsertEvents(ctx context.Context, tx pgx.Tx, events []Event) ([]Event, error) {
+	kept := make([]Event, 0, len(events))
+	var refused []Event
+	var insert func([]Event) error
+	insert = func(part []Event) error {
+		err := savepoint(ctx, tx, func(sp pgx.Tx) error {
+			b := &pgx.Batch{}
+			for _, e := range part {
+				queueRow(b, e)
+			}
+			return sp.SendBatch(ctx, b).Close()
+		})
+		switch {
+		case err == nil:
+			kept = append(kept, part...)
+			return nil
+		case !refusedRow(err):
+			return err
+		case len(part) == 1:
+			refused = append(refused, part[0])
+			if len(refused) == 1 {
+				slog.Warn("usage row refused", "request_id", part[0].RequestID, "ts", part[0].TS, "err", err)
+			}
+			return nil
+		}
+		half := len(part) / 2
+		if err := insert(part[:half]); err != nil {
+			return err
+		}
+		return insert(part[half:])
+	}
+	if len(events) > 0 {
+		if err := insert(events); err != nil {
+			return nil, err
+		}
+	}
+	if len(refused) > 1 {
+		slog.Warn("usage rows refused", "refused", len(refused), "of", len(events))
+	}
+	return kept, writeCounters(ctx, tx, kept)
+}
+
+// savepoint runs fn in a nested transaction, so a failure rolls back only
+// what fn did and leaves tx usable.
+func savepoint(ctx context.Context, tx pgx.Tx, fn func(pgx.Tx) error) error {
+	sp, err := tx.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	if err := fn(sp); err != nil {
+		sp.Rollback(ctx)
+		return err
+	}
+	return sp.Commit(ctx)
+}
+
+// refusedRow reports whether Postgres refused a row's data (classes 22, data
+// exception, and 23, integrity constraint violation), as opposed to a failure
+// retrying could fix. A missing partition (23514) is not the row's fault:
+// timestamps are clamped into the partition window, so it means partitions
+// failed to be created, and the caller should retry rather than lose the row.
+func refusedRow(err error) bool {
+	var pg *pgconn.PgError
+	if !errors.As(err, &pg) || len(pg.Code) < 2 || pg.Code == "23514" {
+		return false
+	}
+	return pg.Code[:2] == "22" || pg.Code[:2] == "23"
+}
+
+func queueRow(b *pgx.Batch, e Event) {
+	b.Queue(`INSERT INTO usage_events
+		(ts, request_id, api_key_id, user_id, team_id, model_name, deployment_id, provider_id,
+		 prompt_tokens, completion_tokens, cached_tokens, cost_usd, unpriced, latency_ms, status_code, stream, gateway_id,
+		 attempts, error_code, ttft_ms, notional_cost_usd, cache_write_5m_tokens, cache_write_1h_tokens,
+		 trace_id, inference_geo, speed, cost_basis)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)`,
+		e.TS, e.RequestID, nilIfEmpty(e.APIKeyID), nilIfEmpty(e.UserID), nilIfEmpty(e.TeamID),
+		e.ModelName, nilIfEmpty(e.DeploymentID), nilIfEmpty(e.ProviderID),
+		e.PromptTokens, e.CompletionTokens, e.CachedTokens, e.CostUSD, e.Unpriced,
+		e.LatencyMS, e.StatusCode, e.Stream, nilIfEmpty(e.GatewayID),
+		zeroIfNil(e.Attempts), nilIfEmpty(e.ErrorCode), zeroIfNil(e.TTFTMs), zeroFloatIfNil(e.NotionalCostUSD),
+		e.CacheWrite5m, e.CacheWrite1h,
+		nilIfEmpty(e.TraceID), nilIfEmpty(e.InferenceGeo), nilIfEmpty(e.Speed), zeroIfNil(e.CostBasis))
+}
+
+// writeCounters adds the events' spend: one upsert per (scope, day).
+func writeCounters(ctx context.Context, tx pgx.Tx, events []Event) error {
 	type counter struct {
 		scopeType, scopeID string
 		day                time.Time
 	}
-	agg := map[counter]*struct {
+	type total struct {
 		usd    float64
 		tokens int64
-	}{}
-
-	b := &pgx.Batch{}
+	}
+	agg := map[counter]*total{}
 	for _, e := range events {
-		b.Queue(`INSERT INTO usage_events
-			(ts, request_id, api_key_id, user_id, team_id, model_name, deployment_id, provider_id,
-			 prompt_tokens, completion_tokens, cached_tokens, cost_usd, unpriced, latency_ms, status_code, stream, gateway_id,
-			 attempts, error_code, ttft_ms, notional_cost_usd, cache_write_5m_tokens, cache_write_1h_tokens)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
-			e.TS, e.RequestID, nilIfEmpty(e.APIKeyID), nilIfEmpty(e.UserID), nilIfEmpty(e.TeamID),
-			e.ModelName, nilIfEmpty(e.DeploymentID), nilIfEmpty(e.ProviderID),
-			e.PromptTokens, e.CompletionTokens, e.CachedTokens, e.CostUSD, e.Unpriced,
-			e.LatencyMS, e.StatusCode, e.Stream, nilIfEmpty(e.GatewayID),
-			zeroIfNil(e.Attempts), nilIfEmpty(e.ErrorCode), zeroIfNil(e.TTFTMs), zeroFloatIfNil(e.NotionalCostUSD),
-			e.CacheWrite5m, e.CacheWrite1h)
-
 		day := e.TS.UTC().Truncate(24 * time.Hour)
 		tokens := int64(e.PromptTokens + e.CompletionTokens)
 		for _, key := range ScopeKeys(e) {
@@ -228,18 +342,25 @@ func InsertEvents(ctx context.Context, tx pgx.Tx, events []Event) error {
 			k := counter{scopeType, scopeID, day}
 			c := agg[k]
 			if c == nil {
-				c = &struct {
-					usd    float64
-					tokens int64
-				}{}
+				c = &total{}
 				agg[k] = c
 			}
 			c.usd += e.CostUSD
 			c.tokens += tokens
 		}
 	}
-	// one aggregated upsert per (scope, day) instead of three per event
-	for k, c := range agg {
+	if len(agg) == 0 {
+		return nil
+	}
+	// Upsert in one fixed order: concurrent syncs that share counters (a
+	// user's, a team's) would otherwise lock them in opposite orders and
+	// deadlock.
+	keys := slices.SortedFunc(maps.Keys(agg), func(a, b counter) int {
+		return cmp.Or(strings.Compare(a.scopeType, b.scopeType), strings.Compare(a.scopeID, b.scopeID), a.day.Compare(b.day))
+	})
+	b := &pgx.Batch{}
+	for _, k := range keys {
+		c := agg[k]
 		b.Queue(`INSERT INTO spend_counters (scope_type, scope_id, period_start, usd, tokens)
 			VALUES ($1,$2,$3,$4,$5)
 			ON CONFLICT (scope_type, scope_id, period_start)
@@ -251,7 +372,7 @@ func InsertEvents(ctx context.Context, tx pgx.Tx, events []Event) error {
 }
 
 // EnsurePartitions creates last, this and next month's usage_events
-// partitions. Called once at startup, where a failure is fatal: without a
+// partitions, the months in Window. Called once at startup, where a failure is fatal: without a
 // partition every usage row is silently dropped while the gateway reports
 // healthy. Last month is included so late gateway batches still land.
 func (w *PGWriter) EnsurePartitions(ctx context.Context) error {
@@ -259,9 +380,9 @@ func (w *PGWriter) EnsurePartitions(ctx context.Context) error {
 }
 
 func (w *PGWriter) ensurePartitions(ctx context.Context, now time.Time) error {
-	cur := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	lo, hi := Window(now)
 	var firstErr error
-	for _, start := range []time.Time{cur.AddDate(0, -1, 0), cur, cur.AddDate(0, 1, 0)} {
+	for start := lo; start.Before(hi); start = start.AddDate(0, 1, 0) {
 		end := start.AddDate(0, 1, 0)
 		name := "usage_events_" + start.Format("2006_01")
 		// DDL cannot take bind params; bounds are generated, not user input

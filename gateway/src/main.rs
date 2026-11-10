@@ -4,9 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use hyper_util::server::conn::auto;
 use llmr_gateway::cp::{ControlPlane, VERSION};
 use llmr_gateway::metrics;
 use llmr_gateway::server::{self, State};
@@ -41,6 +38,10 @@ fn main() {
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
+        // Blocking work is a sync body's encoding and the odd file or DNS
+        // lookup. Every blocking thread keeps its own allocator heap, so a
+        // burst must not start hundreds of them.
+        .max_blocking_threads(16)
         .enable_all()
         .build()
         .expect("tokio runtime");
@@ -59,36 +60,17 @@ fn main() {
             std::process::exit(1);
         });
         eprintln!("llmr-gateway {VERSION} listening on {listen} with {workers} workers");
-        let mut builder = auto::Builder::new(TokioExecutor::new());
-        builder.http1().timer(TokioTimer::new()).header_read_timeout(Duration::from_secs(10));
-        builder.http2().timer(TokioTimer::new());
-        let builder = Arc::new(builder);
-
-        let mut term =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal handler");
-        loop {
+        let shutdown = async {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal handler");
             tokio::select! {
-                accepted = listener.accept() => {
-                    let Ok((stream, _)) = accepted else { continue };
-                    let _ = stream.set_nodelay(true);
-                    let builder = builder.clone();
-                    tokio::spawn(async move {
-                        let svc = service_fn(move |req| server::handle(st, req));
-                        let _ = builder.serve_connection(TokioIo::new(stream), svc).await;
-                    });
-                }
-                _ = term.recv() => break,
-                _ = tokio::signal::ctrl_c() => break,
+                _ = term.recv() => {}
+                _ = tokio::signal::ctrl_c() => {}
             }
-        }
-        // Drain: report not ready so load balancers move on, let requests in
-        // flight finish, then upload the last usage.
-        st.draining.store(true, Ordering::Relaxed);
-        drop(listener);
-        let deadline = Instant::now() + drain;
-        while metrics::IN_FLIGHT.load(Ordering::Relaxed) > 0 && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        };
+        // Drain: report not ready so load balancers move on, close connections
+        // as their requests finish, then upload the last usage.
+        server::run(listener, st, shutdown, drain).await;
         cp.flush(Instant::now() + Duration::from_secs(10)).await;
         eprintln!("llmr-gateway stopped");
     });

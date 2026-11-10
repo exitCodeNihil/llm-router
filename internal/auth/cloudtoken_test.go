@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -113,12 +114,12 @@ func TestCloudTokenValidation(t *testing.T) {
 	}
 
 	cases := map[string]string{
-		"wrong tenant":    iss.mint(t, map[string]any{"preferred_username": "dev@example.com", "tid": "evil"}),
-		"wrong audience":  iss.mint(t, map[string]any{"preferred_username": "dev@example.com", "tid": "tenant-1", "aud": "api://other"}),
-		"unknown user":    iss.mint(t, map[string]any{"preferred_username": "stranger@example.com", "tid": "tenant-1"}),
-		"missing email":   iss.mint(t, map[string]any{"tid": "tenant-1"}),
-		"expired":         iss.mint(t, map[string]any{"preferred_username": "dev@example.com", "tid": "tenant-1", "exp": time.Now().Add(-time.Hour).Unix()}),
-		"garbage":         "not.a.jwt",
+		"wrong tenant":   iss.mint(t, map[string]any{"preferred_username": "dev@example.com", "tid": "evil"}),
+		"wrong audience": iss.mint(t, map[string]any{"preferred_username": "dev@example.com", "tid": "tenant-1", "aud": "api://other"}),
+		"unknown user":   iss.mint(t, map[string]any{"preferred_username": "stranger@example.com", "tid": "tenant-1"}),
+		"missing email":  iss.mint(t, map[string]any{"tid": "tenant-1"}),
+		"expired":        iss.mint(t, map[string]any{"preferred_username": "dev@example.com", "tid": "tenant-1", "exp": time.Now().Add(-time.Hour).Unix()}),
+		"garbage":        "not.a.jwt",
 	}
 	for name, tok := range cases {
 		if _, err := v.Validate(ctx, s, tok); err == nil {
@@ -130,5 +131,66 @@ func TestCloudTokenValidation(t *testing.T) {
 	other := newFakeIssuer(t)
 	if _, err := v.Validate(ctx, s, other.mint(t, map[string]any{"preferred_username": "dev@example.com", "tid": "tenant-1"})); err == nil {
 		t.Error("token from unconfigured issuer must be rejected")
+	}
+}
+
+// TestCloudTokenErrors: refusals carry a short reason without URLs, and an
+// issuer that can't be reached is told apart from a bad token.
+func TestCloudTokenErrors(t *testing.T) {
+	iss := newFakeIssuer(t)
+	s := testSnapshot(iss)
+	v := NewCloudValidator(nil)
+	ctx := context.Background()
+	claims := func(extra map[string]any) map[string]any {
+		c := map[string]any{"preferred_username": "dev@example.com", "tid": "tenant-1"}
+		for k, val := range extra {
+			c[k] = val
+		}
+		return c
+	}
+	for want, tok := range map[string]string{
+		"expired":         iss.mint(t, claims(map[string]any{"exp": time.Now().Add(-time.Hour).Unix()})),
+		"wrong audience":  iss.mint(t, claims(map[string]any{"aud": "api://other"})),
+		"claim mismatch":  iss.mint(t, claims(map[string]any{"tid": "evil"})),
+		"no email claim":  iss.mint(t, map[string]any{"tid": "tenant-1"}),
+		"malformed token": "not.a.jwt",
+		"unknown issuer":  iss.mint(t, claims(map[string]any{"iss": "https://evil.example.com"})),
+	} {
+		_, err := v.Verify(ctx, s, tok)
+		if got := TokenErrorReason(err); got != want || IssuerUnavailable(err) {
+			t.Errorf("%s: reason %q (unavailable %v), err %v", want, got, IssuerUnavailable(err), err)
+		}
+	}
+
+	// Discovery failing is the issuer's outage, not the token's fault.
+	down := newFakeIssuer(t)
+	tok := down.mint(t, claims(nil))
+	down.srv.Close()
+	s.Issuers[0].IssuerURL = down.srv.URL
+	_, err := v.Verify(ctx, s, tok)
+	if !IssuerUnavailable(err) || TokenErrorReason(err) != "issuer unavailable" {
+		t.Fatalf("issuer down: %v", err)
+	}
+	if strings.Contains(TokenErrorReason(err), down.srv.URL) {
+		t.Fatalf("the reason names the issuer's URL: %q", TokenErrorReason(err))
+	}
+}
+
+// TestCloudTokenEmailLowercase: emails are lowercased rune by rune
+// (strings.ToLower), as gateways do (gateway/src/cloud/jwt.rs lower_email),
+// so the email hashes in a gateway's config match what it computes.
+func TestCloudTokenEmailLowercase(t *testing.T) {
+	iss := newFakeIssuer(t)
+	s := testSnapshot(iss)
+	v := NewCloudValidator(nil)
+	for in, want := range map[string]string{
+		"İstanbul@x.com":  "istanbul@x.com",
+		"ΟΔΥΣΣΕΥΣ@x.com":  "οδυσσευσ@x.com", // no final ς
+		"Dev@Example.COM": "dev@example.com",
+	} {
+		vt, err := v.Verify(context.Background(), s, iss.mint(t, map[string]any{"preferred_username": in, "tid": "tenant-1"}))
+		if err != nil || vt.Email != want {
+			t.Errorf("%s: %+v %v, want %s", in, vt, err, want)
+		}
 	}
 }

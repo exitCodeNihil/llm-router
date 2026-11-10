@@ -2,8 +2,8 @@
 //! client sees of rate-limit headers and of routes a deployment can't serve.
 //! internal/gateway/proxy_test.go holds the same cases for the Go gateway.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use http::{HeaderMap, Request, Response, StatusCode};
@@ -103,6 +103,11 @@ async fn gateway(model: &str, deployments: &[(&str, &str, &str)]) -> String {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let digest = ring::digest::digest(&ring::digest::SHA256, KEY.as_bytes());
     let hash: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    // Cooldowns are kept per deployment id for the whole process, so each
+    // gateway gets its own ids: one test's failed deployment must not be
+    // cooling in another's.
+    static GATEWAYS: AtomicUsize = AtomicUsize::new(0);
+    let g = GATEWAYS.fetch_add(1, Ordering::Relaxed);
     let mut providers = Vec::new();
     let mut deps = Vec::new();
     for (i, (url, flavor, auth)) in deployments.iter().enumerate() {
@@ -114,7 +119,7 @@ async fn gateway(model: &str, deployments: &[(&str, &str, &str)]) -> String {
                 "service_account_id": "svac_1", "identity_token_file": "/nonexistent/llmr-test-token"});
         }
         providers.push(p);
-        deps.push(json!({"id": format!("d{i}"), "provider_id": format!("p{i}"), "model_name": model,
+        deps.push(json!({"id": format!("g{g}-d{i}"), "provider_id": format!("p{i}"), "model_name": model,
             "upstream_name": format!("up{i}"), "api_flavor": flavor}));
     }
     let wire: Wire = serde_json::from_value(json!({
@@ -151,6 +156,18 @@ async fn post(url: String, body: Value) -> (StatusCode, HeaderMap, Bytes) {
     let resp = server::https_client(1).request(req).await.unwrap();
     let (parts, body) = resp.into_parts();
     (parts.status, parts.headers, body.collect().await.unwrap().to_bytes())
+}
+
+/// The usage events recorded for `model`. The queue is one per process and
+/// tests run in parallel, so draining it takes other tests' events too: those
+/// are kept for whoever asks next.
+fn usage_for(model: &str) -> Vec<usage::Event> {
+    static SEEN: Mutex<Vec<usage::Event>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap();
+    seen.extend(usage::take(usize::MAX, usize::MAX));
+    let (mine, rest) = std::mem::take(&mut *seen).into_iter().partition(|e| e.model_name == model);
+    *seen = rest;
+    mine
 }
 
 fn values<'a>(h: &'a HeaderMap, name: &str) -> Vec<&'a str> {
@@ -231,7 +248,7 @@ async fn unsupported_route_is_the_callers_mistake() {
         assert_eq!(v["error"]["type"], "invalid_request_error", "{model}");
         assert_eq!(v["error"]["code"], "unsupported_route", "{model}");
         assert!(v["error"]["message"].as_str().unwrap().contains("is not supported"), "{model}");
-        let events: Vec<_> = usage::take(usize::MAX).into_iter().filter(|e| e.model_name == model).collect();
+        let events = usage_for(model);
         assert_eq!(events.len(), 1, "{model}");
         assert_eq!((events[0].status_code, events[0].error_code), (400, "unsupported_route"), "{model}");
     }
@@ -276,8 +293,30 @@ async fn unreachable_provider_is_recorded() {
         )
         .await;
         assert_eq!(status, 500, "{path}: {}", String::from_utf8_lossy(&raw));
-        let events: Vec<_> = usage::take(usize::MAX).into_iter().filter(|e| e.model_name == model).collect();
+        let events = usage_for(model);
         assert_eq!(events.len(), 1, "{path}");
         assert_eq!((events[0].status_code, events[0].error_code), (500, "internal_error"), "{path}");
     }
+}
+
+/// A JWT goes to identity-token verification, not the key lookup; with no
+/// issuers configured it is refused as the control plane's /v1 refuses it.
+#[tokio::test]
+async fn identity_tokens_are_verified_not_looked_up() {
+    let (up, hits) = upstream(Reply { status: 200, flavor: "openai", headers: &[] }).await;
+    let gw = gateway("m", &[(&up, "openai", "none")]).await;
+    for (token, want) in [
+        ("eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJ4In0.c2ln", "invalid identity token: no token issuers configured"),
+        ("not-a-key", "invalid API key"),
+    ] {
+        let req = Request::post(format!("{gw}/v1/chat/completions"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Full::new(Bytes::from(json!({"model": "m", "messages": []}).to_string())))
+            .unwrap();
+        let resp = server::https_client(1).request(req).await.unwrap();
+        assert_eq!(resp.status(), 401, "{token}");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains(want), "{token}: {}", String::from_utf8_lossy(&body));
+    }
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
 }
