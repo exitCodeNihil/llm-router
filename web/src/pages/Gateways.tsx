@@ -115,7 +115,7 @@ function ClusterTable() {
     {
       key: "open_connections",
       header: "Connections",
-      width: pixel(100),
+      width: pixel(120),
       align: "end",
       renderCell: (n) => int(n.open_connections),
     },
@@ -293,7 +293,11 @@ function GatewayHistory() {
             <SeriesLines data={rows} xKey="label" series={series("f")} formatValue={int} />
           </ChartCard>
           <ChartCard title="Memory" height={200}>
-            <SeriesLines data={rows} xKey="label" series={memory} formatValue={bytes} />
+            {rows.some((r) => shown.some((_, i) => Number(r[`m${i}`]) > 0)) ? (
+              <SeriesLines data={rows} xKey="label" series={memory} formatValue={bytes} />
+            ) : (
+              <Empty title="No memory reported" description="Gateways report their memory on Linux." />
+            )}
           </ChartCard>
         </Grid>
       )}
