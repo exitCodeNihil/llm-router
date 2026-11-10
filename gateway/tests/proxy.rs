@@ -2,8 +2,8 @@
 //! client sees of rate-limit headers and of routes a deployment can't serve.
 //! internal/gateway/proxy_test.go holds the same cases for the Go gateway.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use http::{HeaderMap, Request, Response, StatusCode};
@@ -158,6 +158,18 @@ async fn post(url: String, body: Value) -> (StatusCode, HeaderMap, Bytes) {
     (parts.status, parts.headers, body.collect().await.unwrap().to_bytes())
 }
 
+/// The usage events recorded for `model`. The queue is one per process and
+/// tests run in parallel, so draining it takes other tests' events too: those
+/// are kept for whoever asks next.
+fn usage_for(model: &str) -> Vec<usage::Event> {
+    static SEEN: Mutex<Vec<usage::Event>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap();
+    seen.extend(usage::take(usize::MAX, usize::MAX));
+    let (mine, rest) = std::mem::take(&mut *seen).into_iter().partition(|e| e.model_name == model);
+    *seen = rest;
+    mine
+}
+
 fn values<'a>(h: &'a HeaderMap, name: &str) -> Vec<&'a str> {
     h.get_all(name).iter().map(|v| v.to_str().unwrap()).collect()
 }
@@ -236,8 +248,7 @@ async fn unsupported_route_is_the_callers_mistake() {
         assert_eq!(v["error"]["type"], "invalid_request_error", "{model}");
         assert_eq!(v["error"]["code"], "unsupported_route", "{model}");
         assert!(v["error"]["message"].as_str().unwrap().contains("is not supported"), "{model}");
-        let events: Vec<_> =
-            usage::take(usize::MAX, usize::MAX).into_iter().filter(|e| e.model_name == model).collect();
+        let events = usage_for(model);
         assert_eq!(events.len(), 1, "{model}");
         assert_eq!((events[0].status_code, events[0].error_code), (400, "unsupported_route"), "{model}");
     }
@@ -282,8 +293,7 @@ async fn unreachable_provider_is_recorded() {
         )
         .await;
         assert_eq!(status, 500, "{path}: {}", String::from_utf8_lossy(&raw));
-        let events: Vec<_> =
-            usage::take(usize::MAX, usize::MAX).into_iter().filter(|e| e.model_name == model).collect();
+        let events = usage_for(model);
         assert_eq!(events.len(), 1, "{path}");
         assert_eq!((events[0].status_code, events[0].error_code), (500, "internal_error"), "{path}");
     }
