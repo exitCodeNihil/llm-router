@@ -13,6 +13,7 @@ pub mod log;
 pub mod metrics;
 pub mod resources;
 pub mod server;
+pub mod spool;
 pub mod state;
 pub mod telemetry;
 pub mod translate;

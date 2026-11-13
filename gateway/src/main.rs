@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use llmr_gateway::cp::{ControlPlane, VERSION};
 use llmr_gateway::server::{self, State};
+use llmr_gateway::spool::Spool;
 use llmr_gateway::state::Store;
 use llmr_gateway::{log_error, log_info, metrics};
 
@@ -38,6 +39,11 @@ fn main() {
         Some(_) => {
             refuse(&format!("LLMR_MAX_CONFIG_AGE is in seconds: 0 for no limit, or at least {MIN_CONFIG_AGE_S}"))
         }
+    };
+    let spool_max = match env("LLMR_SPOOL_MAX_BYTES").map(|v| v.parse::<u64>()) {
+        None => 256 << 20,
+        Some(Ok(n)) => n,
+        Some(Err(_)) => refuse("LLMR_SPOOL_MAX_BYTES is a number of bytes: 0 keeps no usage on disk"),
     };
     let listen = env("LLMR_LISTEN").unwrap_or_else(|| "0.0.0.0:8080".into());
     // available_parallelism honours the container's CPU quota.
@@ -77,7 +83,16 @@ fn main() {
                 .map_err(|e| log_error!("LLMR_STATE_DIR: {e}; running without saved state"))
                 .ok()
         });
-        let cp = Arc::new(ControlPlane::new(&cp_url, join_token, name).with_state(state.map(Arc::new)));
+        let spool = state.as_ref().filter(|_| spool_max > 0).and_then(|state| {
+            Spool::open(&state.spool_dir(), spool_max)
+                .map_err(|e| log_error!("usage spool: {e}; unsent usage will not survive a restart"))
+                .ok()
+        });
+        let cp = Arc::new(
+            ControlPlane::new(&cp_url, join_token, name)
+                .with_state(state.map(Arc::new))
+                .with_spool(spool.map(Arc::new)),
+        );
         tokio::spawn(cp.clone().run(st));
 
         let listener = tokio::net::TcpListener::bind(&listen).await.unwrap_or_else(|e| {

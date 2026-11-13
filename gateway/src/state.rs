@@ -106,6 +106,11 @@ impl Store {
         })
     }
 
+    /// Where usage events wait on disk (see `spool`).
+    pub fn spool_dir(&self) -> PathBuf {
+        self.dir.join("spool")
+    }
+
     /// A config the control plane just sent, to save with the next write.
     pub fn put_config(&self, gzip: bool, body: Bytes, confirmed_at_ms: i64, version: i64, group: &str) {
         let mut p = self.pending.lock().unwrap();

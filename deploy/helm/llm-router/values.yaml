@@ -98,11 +98,16 @@ gateway:
   # control plane is away.
   maxConfigAge: ""
   # Keep the last config and spend, encrypted with a key derived from the join
-  # token, in an emptyDir (LLMR_STATE_DIR), so a restarted container serves
-  # before it reaches the control plane. A new pod starts without it.
+  # token, and usage the control plane has not acknowledged yet, in an emptyDir
+  # (LLMR_STATE_DIR), so a restarted container serves before it reaches the
+  # control plane and hands over the usage it held. A new pod starts without it.
+  # sizeLimit is twice the usage spool's cap (LLMR_SPOOL_MAX_BYTES, 256 MiB by
+  # default): a pod that goes over its emptyDir limit is evicted, so the config
+  # and files being written need room beside a full spool. Raise the cap
+  # through extraEnv, and this with it.
   state:
     enabled: false
-    sizeLimit: 64Mi
+    sizeLimit: 512Mi
   serviceAccount:
     create: true
     name: ""         # default: <release>-llm-router-gateway

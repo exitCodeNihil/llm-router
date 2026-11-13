@@ -72,6 +72,11 @@ Gateways only:
 | `llmr_config_age_seconds` | gauge | | Seconds since the control plane last answered a config poll, with the config or with "unchanged". Normally under 30; it grows while the control plane is unreachable. 0 before the first answer |
 | `llmr_config_stale` | gauge | | 1 while the config is older than `LLMR_MAX_CONFIG_AGE` and the gateway answers `/v1` with 503 |
 | `llmr_refused` | gauge | | 1 while the gateway does not serve because the control plane has refused its join token for 15 minutes; 0 again once a join succeeds |
+| `llmr_spool_bytes` | gauge | | Usage events on disk (`LLMR_STATE_DIR`) that the control plane has not acknowledged. Near 0 while syncs succeed; it grows while the control plane is unreachable |
+| `llmr_spool_skipped_events_total` | counter | | Usage events not written to the spool because it was at `LLMR_SPOOL_MAX_BYTES` or the write failed. They are still sent; only a crash before that loses them |
+| `llmr_replayed_events_total` | counter | | Usage events sent again, after a restart or a new join, and accepted by the control plane |
+| `llmr_replay_duplicate_events_total` | counter | | Of those, the events the control plane already had |
+| `llmr_replay_refused_events_total` | counter | | Replayed usage events dropped because the control plane could not read them |
 | `llmr_state_dir_locked` | gauge | | With `LLMR_STATE_DIR` only: 1 while this gateway holds the directory, 0 when it could not take it (another process has it, or it is not writable) and runs without saved state |
 
 The control plane only:

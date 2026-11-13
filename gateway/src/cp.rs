@@ -17,6 +17,7 @@ use crate::cloud::jwt::{BoxFuture, ProvisionError, Provisioned, Provisioner};
 use crate::config::{Config, SCHEMA, Wire};
 use crate::limits::{self, Counters, RateDelta};
 use crate::server::{HttpsClient, State, https_client};
+use crate::spool::{self, Spool};
 use crate::state::{SAVE_INTERVAL, Store};
 use crate::usage::{self, Event};
 use crate::{health, log_debug, log_error, log_info, log_warn, metrics, now_ms};
@@ -45,6 +46,14 @@ const REFUSED_HEADER: &str = "x-llmr-refused";
 /// How long the control plane must have been refusing the join before the
 /// gateway stops serving the config it holds.
 const REFUSE_AFTER: Duration = Duration::from_secs(15 * 60);
+/// The most a replay request carries: the control plane reads up to 32 MiB.
+const REPLAY_EVENTS: usize = 5000;
+const REPLAY_BYTES: usize = 8 << 20;
+/// How long the first sync waits for the replay of what an earlier process
+/// left; past that the replay goes on beside the syncs.
+const REPLAY_FIRST: Duration = Duration::from_secs(30);
+/// The wait after a failed replay of leftovers; it doubles, up to 30 s.
+const REPLAY_RETRY: Duration = Duration::from_secs(1);
 /// The oldest confirmation a config from the state directory is served on.
 const MAX_SAVED_AGE: Duration = Duration::from_secs(24 * 3600);
 /// How far ahead of this clock a saved confirmation may be: past that the
@@ -73,6 +82,10 @@ pub struct ControlPlane {
     refuse_after: Duration,
     st: OnceLock<&'static State>,
     state: Option<Arc<Store>>,
+    replay_first: Duration,
+    replay_retry: Duration,
+    /// Usage on disk until the control plane has it.
+    spool: Option<Arc<Spool>>,
     /// The sync loop's and the shutdown flush's one batch sequence: the
     /// control plane skips a batch number it has seen, so a flush counting
     /// from 1 again had its events acknowledged and dropped.
@@ -118,6 +131,9 @@ impl ControlPlane {
             refuse_after: REFUSE_AFTER,
             st: OnceLock::new(),
             state: None,
+            replay_first: REPLAY_FIRST,
+            replay_retry: REPLAY_RETRY,
+            spool: None,
             syncer: tokio::sync::Mutex::new(Syncer::default()),
         }
     }
@@ -125,6 +141,18 @@ impl ControlPlane {
     /// Keep the config and spend in `state` across restarts.
     pub fn with_state(mut self, state: Option<Arc<Store>>) -> ControlPlane {
         self.state = state;
+        self
+    }
+
+    /// Keep unsent usage in `spool` across restarts.
+    pub fn with_spool(mut self, spool: Option<Arc<Spool>>) -> ControlPlane {
+        self.spool = spool;
+        self
+    }
+
+    #[cfg(test)]
+    fn replaying_with(mut self, first: Duration, retry: Duration) -> ControlPlane {
+        (self.replay_first, self.replay_retry) = (first, retry);
         self
     }
 
@@ -307,6 +335,17 @@ impl ControlPlane {
         self.rejoin(0).await;
         loops.spawn(self.clone().renew_loop());
         loops.spawn(self.clone().config_loop(st));
+        // Usage an earlier process left goes first, so the first sync's spend
+        // figures count it.
+        if self.spool.as_ref().is_some_and(|spool| !spool.leftovers().is_empty()) {
+            let (done, finished) = tokio::sync::oneshot::channel();
+            let cp = self.clone();
+            loops.spawn(async move {
+                cp.replay_leftovers().await;
+                let _ = done.send(());
+            });
+            let _ = tokio::time::timeout(self.replay_first, finished).await;
+        }
         self.sync_loop(st).await;
     }
 
@@ -503,9 +542,183 @@ impl ControlPlane {
         }
     }
 
+    /// Send events to the control plane's replay, which stores each request
+    /// once however often it is sent (POST /gw/v1/replay).
+    async fn replay(&self, body: Bytes, events: usize) -> Replay {
+        let (session, generation) = self.session();
+        match self.call(Method::POST, "/gw/v1/replay", &session, Some((body, true)), &[], Duration::from_secs(30)).await
+        {
+            Ok(Call::Ok(StatusCode::OK, _, bytes)) => {
+                let r: Replayed = serde_json::from_slice(&bytes).unwrap_or_default();
+                metrics::REPLAYED_EVENTS.fetch_add(events as u64, Ordering::Relaxed);
+                metrics::REPLAY_DUPLICATE_EVENTS.fetch_add(r.duplicates, Ordering::Relaxed);
+                log_info!(
+                    "replayed {events} usage events: {} stored, {} already there, {} dropped",
+                    r.stored,
+                    r.duplicates,
+                    r.dropped
+                );
+                Replay::Done
+            }
+            Ok(Call::Unauthorized(_)) => {
+                self.rejoin(generation).await;
+                Replay::Retry("the session ended".into())
+            }
+            Ok(Call::Ok(status, _, _)) if refused(status) => {
+                metrics::REPLAY_REFUSED_EVENTS.fetch_add(events as u64, Ordering::Relaxed);
+                log_error!("replay: {status}; dropping {events} usage events");
+                Replay::Done
+            }
+            Ok(Call::Ok(StatusCode::NOT_FOUND, _, _)) => Replay::Unsupported,
+            Ok(Call::Ok(StatusCode::PAYLOAD_TOO_LARGE, _, _)) => Replay::TooLarge,
+            Ok(Call::Ok(status, _, _)) => Replay::Retry(status.to_string()),
+            Err(e) => Replay::Retry(e),
+        }
+    }
+
+    /// Hand over the usage an earlier process left in the spool, oldest
+    /// first, deleting each file once the control plane has answered for all
+    /// of it. A control plane without replay leaves the files for a later
+    /// start.
+    async fn replay_leftovers(&self) {
+        let Some(spool) = self.spool.clone() else { return };
+        let mut chunk = Chunk::default();
+        for path in spool.leftovers() {
+            let file = path.clone();
+            let Ok((events, torn)) = tokio::task::spawn_blocking(move || spool::read(&file)).await else { return };
+            if torn > 0 {
+                log_warn!(
+                    "spool: {} ends in {torn} bytes that are cut short or damaged; replaying the {} events before them",
+                    path.display(),
+                    events.len()
+                );
+            }
+            for json in events {
+                chunk.bytes += json.len() + 1;
+                chunk.events.push(json);
+                if (chunk.events.len() >= REPLAY_EVENTS || chunk.bytes >= REPLAY_BYTES)
+                    && !self.replay_chunk(&spool, &mut chunk).await
+                {
+                    return;
+                }
+            }
+            // every event of the file is in a chunk now
+            chunk.files.push(path);
+        }
+        self.replay_chunk(&spool, &mut chunk).await;
+    }
+
+    /// Send one chunk until the control plane answers for it; false to stop
+    /// replaying.
+    async fn replay_chunk(&self, spool: &Spool, chunk: &mut Chunk) -> bool {
+        let n = chunk.events.len();
+        if n > 0 {
+            let events = std::mem::take(&mut chunk.events);
+            let Ok(Ok(body)) = tokio::task::spawn_blocking(move || {
+                let mut json = Vec::with_capacity(events.iter().map(|e| e.len() + 1).sum::<usize>() + 16);
+                json.extend_from_slice(b"{\"events\":[");
+                for (i, e) in events.iter().enumerate() {
+                    if i > 0 {
+                        json.push(b',');
+                    }
+                    json.extend_from_slice(e);
+                }
+                json.extend_from_slice(b"]}");
+                gzip(&json)
+            })
+            .await
+            else {
+                return false;
+            };
+            let body = Bytes::from(body);
+            let mut wait = self.replay_retry;
+            loop {
+                match self.replay(body.clone(), n).await {
+                    Replay::Done => break,
+                    Replay::Unsupported => {
+                        log_warn!(
+                            "replay: this control plane has no /gw/v1/replay; usage left by an earlier run stays in the spool until it is upgraded"
+                        );
+                        return false;
+                    }
+                    Replay::TooLarge => {
+                        log_warn!("replay: 413 for {n} usage events; retrying in {}s", wait.as_secs_f32());
+                    }
+                    Replay::Retry(why) => log_warn!("replay: {why}; retrying in {}s", wait.as_secs_f32()),
+                }
+                if self.leaving.load(Ordering::Relaxed) {
+                    return false;
+                }
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_secs(30));
+            }
+        }
+        chunk.bytes = 0;
+        spool.replayed(std::mem::take(&mut chunk.files)).await;
+        true
+    }
+
+    /// The pending batch was sent under an earlier join: the control plane
+    /// may have stored it for the instance this gateway was then, and no
+    /// longer knows its number. Its events go through the replay instead,
+    /// which stores each once; its rate counts are given up. Some(result)
+    /// when that settled it or must be tried again, None to send it as a sync
+    /// after all.
+    async fn replay_pending(&self, s: &mut Syncer, generation: u64) -> Option<bool> {
+        let mut batch = s.pending.take()?;
+        let n = batch.frozen.events.len();
+        let (body, frozen) = tokio::task::spawn_blocking(move || {
+            let frozen = batch.frozen;
+            let body = serde_json::to_vec(&ReplayRequest { events: &frozen.events })
+                .map_err(std::io::Error::other)
+                .and_then(|json| gzip(&json));
+            (body, frozen)
+        })
+        .await
+        .ok()?;
+        batch.frozen = frozen;
+        let outcome = match body {
+            Ok(body) => self.replay(body.into(), n).await,
+            Err(_) => Replay::Unsupported,
+        };
+        match outcome {
+            Replay::Done => {
+                limits::discard(&batch.scopes);
+                self.settle(batch.frozen.high()).await;
+                Some(false)
+            }
+            Replay::Unsupported | Replay::TooLarge => {
+                // An older control plane, or a proxy the sync knows how to
+                // get a large batch past.
+                batch.sent = Some(generation);
+                s.pending = Some(batch);
+                None
+            }
+            Replay::Retry(why) => {
+                metrics::SYNC_FAILURES.fetch_add(1, Ordering::Relaxed);
+                log_warn!("replay: {why}");
+                s.pending = Some(batch);
+                Some(false)
+            }
+        }
+    }
+
+    /// Every event numbered up to `seq` is acknowledged or dropped for good.
+    async fn settle(&self, seq: u64) {
+        if let Some(spool) = &self.spool
+            && seq > 0
+        {
+            spool.settle(seq).await;
+        }
+    }
+
     /// One sync: freeze a batch unless the last one is unacknowledged, send it,
     /// and settle it on success.
     async fn sync_once(&self, s: &mut Syncer) -> bool {
+        // What was queued since the last sync goes to disk before it is sent.
+        if let Some(spool) = &self.spool {
+            spool.seal().await;
+        }
         if s.pending.is_none() {
             let (events, sending) = usage::take_batch(MAX_BATCH, s.max_bytes());
             let (rates, scopes) = limits::freeze();
@@ -522,11 +735,21 @@ impl ControlPlane {
                 cpu_pct: crate::resources::cpu_pct(),
                 leaving: self.leaving.load(Ordering::Relaxed),
             };
-            let frozen = Frozen { batch: s.batch, cursor: s.cursor.clone(), events, sending, rates, stats };
+            let frozen =
+                Frozen { batch: s.batch, cursor: s.cursor.clone(), events, sending, rates, stats, dropped_high: 0 };
             s.pending = Batch::build(frozen, scopes).await;
         }
-        let Some(batch) = &s.pending else { return false };
         let (session, generation) = self.session();
+        let rejoined = |b: &Batch| b.sent.is_some_and(|sent| sent != generation) && !b.frozen.events.is_empty();
+        if s.pending.as_ref().is_some_and(rejoined)
+            && let Some(done) = self.replay_pending(s, generation).await
+        {
+            return done;
+        }
+        if let Some(batch) = &mut s.pending {
+            batch.sent = Some(generation);
+        }
+        let Some(batch) = &s.pending else { return false };
         match self
             .call(Method::POST, "/gw/v1/sync", &session, Some((batch.body.clone(), true)), &[], Duration::from_secs(30))
             .await
@@ -538,6 +761,7 @@ impl ControlPlane {
                 if let Some(state) = &self.state {
                     state.touch();
                 }
+                self.settle(batch.frozen.high()).await;
                 s.cursor = counters.cursor;
                 s.pending = None;
                 true
@@ -562,7 +786,11 @@ impl ControlPlane {
                     // Refused at the smallest batch: resending it as is would
                     // hold back every later event, and the limit counters.
                     let Some(batch) = s.pending.take() else { return false };
+                    let sent = batch.sent;
                     s.pending = batch.smaller().await;
+                    if let Some(batch) = &mut s.pending {
+                        batch.sent = sent;
+                    }
                 } else if refused(status) {
                     // Resending the same bytes would be refused again and hold
                     // back every later event: drop this batch and move on.
@@ -571,6 +799,7 @@ impl ControlPlane {
                     metrics::SYNC_REFUSED_EVENTS.fetch_add(n as u64, Ordering::Relaxed);
                     log_error!("sync: {status}: {why}; dropping a batch of {n} events");
                     limits::discard(&batch.scopes);
+                    self.settle(batch.frozen.high()).await;
                 } else {
                     log_warn!("sync: {status}: {why}");
                 }
@@ -652,6 +881,9 @@ struct Batch {
     body: Bytes,
     scopes: Vec<Arc<limits::Scope>>,
     frozen: Frozen,
+    /// The join (`generation`) it was last sent under; None before the first
+    /// send.
+    sent: Option<u64>,
 }
 
 /// A batch's contents: the same number, cursor and rates however it is built.
@@ -664,6 +896,53 @@ struct Frozen {
     sending: usage::Sending,
     rates: Vec<RateDelta>,
     stats: Stats,
+    /// The highest sequence number among events dropped from it for good.
+    dropped_high: u64,
+}
+
+impl Frozen {
+    /// The highest sequence number it accounts for: events are in order.
+    fn high(&self) -> u64 {
+        self.events.last().map_or(0, |e| e.seq).max(self.dropped_high)
+    }
+}
+
+/// What the control plane answers a replay with.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Replayed {
+    stored: u64,
+    duplicates: u64,
+    dropped: u64,
+}
+
+enum Replay {
+    /// Answered for: stored, already there, or refused for good.
+    Done,
+    /// The control plane has no replay (before 0.4).
+    Unsupported,
+    TooLarge,
+    Retry(String),
+}
+
+#[derive(Serialize)]
+struct ReplayRequest<'a> {
+    events: &'a [Event],
+}
+
+/// Leftover events on their way to the replay, and the spool files that end
+/// within them.
+#[derive(Default)]
+struct Chunk {
+    events: Vec<Vec<u8>>,
+    bytes: usize,
+    files: Vec<std::path::PathBuf>,
+}
+
+fn gzip(json: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut gz = flate2::write::GzEncoder::new(Vec::with_capacity(json.len() / 8), flate2::Compression::fast());
+    gz.write_all(json)?;
+    gz.finish()
 }
 
 impl Batch {
@@ -686,7 +965,7 @@ impl Batch {
         })
         .await;
         match body {
-            Ok((Ok(body), frozen)) => Some(Batch { body: body.into(), scopes, frozen }),
+            Ok((Ok(body), frozen)) => Some(Batch { body: body.into(), scopes, frozen, sent: None }),
             _ => {
                 log_error!("sync: could not encode a batch");
                 limits::discard(&scopes);
@@ -717,6 +996,7 @@ impl Batch {
         } else {
             metrics::SYNC_REFUSED_EVENTS.fetch_add(f.events.len() as u64, Ordering::Relaxed);
             log_error!("sync: 413 for a single event without content; dropping it");
+            f.dropped_high = f.high();
             f.events.clear();
         }
         f.sending = usage::Sending::of(&f.events);
@@ -1048,6 +1328,8 @@ mod tests {
     const ACCEPT: usize = 0;
     const REFUSE: usize = 1; // 401 with the control plane's header
     const BARE_401: usize = 2; // 401 as a proxy would send it
+    /// A replay status: the connection is closed without an answer.
+    const CUT_OFF: usize = 1;
 
     #[derive(Default)]
     struct Gwcp {
@@ -1055,11 +1337,29 @@ mod tests {
         joins: AtomicUsize,
         /// The If-None-Match of each config poll.
         polls: Mutex<Vec<Option<String>>>,
+        /// Every sync and replay in order: its path, the status answered, its JSON.
+        calls: Mutex<Vec<(String, u16, serde_json::Value)>>,
+        /// How many of the next syncs are answered 401, as an ended session is.
+        expire: AtomicUsize,
+        /// What a replay is answered with; 0 is 200, and CUT_OFF no answer at all.
+        replay_status: AtomicUsize,
+    }
+
+    impl Gwcp {
+        /// The model names of the events in each call to `path` answered `status`.
+        fn models(&self, path: &str, status: u16) -> Vec<Vec<String>> {
+            let calls = self.calls.lock().unwrap();
+            let of = |v: &serde_json::Value| {
+                v["events"].as_array().unwrap().iter().map(|e| e["model_name"].as_str().unwrap().to_string()).collect()
+            };
+            calls.iter().filter(|(p, code, _)| p.ends_with(path) && *code == status).map(|(_, _, v)| of(v)).collect()
+        }
     }
 
     /// A control plane with the whole gateway protocol: joins answered as
     /// `mode` says, sessions that end when it stops accepting, config
-    /// version 3, and syncs that report no spend.
+    /// version 3, syncs that report no spend, and a replay that calls the
+    /// first event of each request a duplicate.
     async fn gateway_cp() -> (String, Arc<Gwcp>) {
         use hyper::service::service_fn;
         use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -1078,11 +1378,10 @@ mod tests {
                             let mode = cp.mode.load(Ordering::Relaxed);
                             let resp = http::Response::builder();
                             let answer = |resp: http::response::Builder, status: u16, body: Vec<u8>| {
-                                Ok::<_, std::convert::Infallible>(
-                                    resp.status(status).body(Full::new(Bytes::from(body))).unwrap(),
-                                )
+                                Ok::<_, std::io::Error>(resp.status(status).body(Full::new(Bytes::from(body))).unwrap())
                             };
                             let path = req.uri().path().to_string();
+                            let tag = req.headers().get("if-none-match").map(|v| v.to_str().unwrap().to_string());
                             if path == "/gw/v1/join" {
                                 cp.joins.fetch_add(1, Ordering::Relaxed);
                                 return match mode {
@@ -1107,14 +1406,40 @@ mod tests {
                             }
                             match path.as_str() {
                                 "/gw/v1/config" => {
-                                    let tag =
-                                        req.headers().get("if-none-match").map(|v| v.to_str().unwrap().to_string());
                                     cp.polls.lock().unwrap().push(tag.clone());
                                     if tag.as_deref() == Some("\"v3\"") {
                                         tokio::time::sleep(Duration::from_millis(20)).await;
                                         return answer(resp, 304, Vec::new());
                                     }
                                     answer(resp, 200, wire_config(3))
+                                }
+                                "/gw/v1/sync" | "/gw/v1/replay" => {
+                                    use std::io::Read;
+                                    let gz = req.into_body().collect().await.unwrap().to_bytes();
+                                    let mut json = Vec::new();
+                                    flate2::read::GzDecoder::new(&gz[..]).read_to_end(&mut json).unwrap();
+                                    let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+                                    let n = v["events"].as_array().unwrap().len();
+                                    let (status, body) = if path.ends_with("sync") {
+                                        let expired = cp.expire.load(Ordering::Relaxed) > 0;
+                                        if expired {
+                                            cp.expire.fetch_sub(1, Ordering::Relaxed);
+                                        }
+                                        (if expired { 401 } else { 200 }, "{}".to_string())
+                                    } else {
+                                        match cp.replay_status.load(Ordering::Relaxed) {
+                                            0 => (
+                                                200,
+                                                format!("{{\"stored\":{},\"duplicates\":1,\"dropped\":0}}", n - 1),
+                                            ),
+                                            status => (status as u16, "no".to_string()),
+                                        }
+                                    };
+                                    cp.calls.lock().unwrap().push((path, status, v));
+                                    if status as usize == CUT_OFF {
+                                        return Err(std::io::Error::other("cut off"));
+                                    }
+                                    answer(resp, status, body.into_bytes())
                                 }
                                 _ => answer(resp, 200, b"{}".to_vec()),
                             }
@@ -1214,6 +1539,365 @@ mod tests {
 
         running.abort();
         let _ = running.await;
+    }
+
+    /// Queue one request's event under `model`, with captured content.
+    fn request(model: &str) {
+        let mut em = emit_capturing(model, 1 << 20);
+        em.capture_request(br#"{"messages":[{"role":"user","content":"a secret question"}]}"#, false);
+        em.set_output(crate::translate::oai_json_text(
+            br#"{"choices":[{"message":{"content":"a secret answer"}}]}"#,
+            1 << 20,
+        ));
+        em.send(200, "", Default::default(), 0);
+    }
+
+    fn spool_files(dir: &TempDir) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.0.join("spool"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A spool in `dir`, as a gateway started on it has.
+    fn spool_in(dir: &TempDir, max_bytes: u64) -> Arc<Spool> {
+        Arc::new(Spool::open(&dir.0.join("spool"), max_bytes).unwrap())
+    }
+
+    /// The spool of a gateway that died with `models` queued and sealed.
+    async fn left_behind(dir: &TempDir, models: &[&[&str]]) {
+        let spool = spool_in(dir, u64::MAX);
+        for sealed_together in models {
+            sealed_together.iter().for_each(|m| request(m));
+            spool.seal().await;
+        }
+        drop(usage::take(usize::MAX, usize::MAX));
+    }
+
+    // Each sync puts what was queued since the last on disk, once, without
+    // content; a settled batch takes with it exactly the files that end at
+    // or before its last event.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
+    async fn the_spool_holds_events_until_their_batch_is_settled() {
+        let _globals = hold_globals();
+        drop(usage::take(usize::MAX, usize::MAX));
+        let dir = TempDir::new("spool");
+        let spool = spool_in(&dir, u64::MAX);
+        spool.seal().await;
+        assert!(spool_files(&dir).is_empty(), "nothing queued, nothing written");
+
+        ["a1", "a2", "a3"].iter().for_each(|m| request(m));
+        spool.seal().await;
+        spool.seal().await;
+        ["b1", "b2"].iter().for_each(|m| request(m));
+        spool.seal().await;
+        let files = spool_files(&dir);
+        assert_eq!(files.len(), 2, "one file per seal, no event twice: {files:?}");
+        let on_disk: Vec<String> = files
+            .iter()
+            .flat_map(|f| spool::read(&dir.0.join("spool").join(f)).0)
+            .map(|json| String::from_utf8(json).unwrap())
+            .collect();
+        assert_eq!(on_disk.len(), 5);
+        assert!(
+            on_disk.iter().all(|e| e.contains("\"content_truncated\":true") && !e.contains("secret")),
+            "{on_disk:?}"
+        );
+        let size: u64 = files.iter().map(|f| std::fs::metadata(dir.0.join("spool").join(f)).unwrap().len()).sum();
+        assert_eq!(metrics::SPOOL_BYTES.load(Ordering::Relaxed) as u64, size);
+
+        let events = usage::take(usize::MAX, usize::MAX);
+        let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
+        spool.settle(seqs[1]).await;
+        assert_eq!(spool_files(&dir), files, "a file with an unsettled event stays");
+        spool.settle(seqs[3]).await;
+        assert_eq!(spool_files(&dir), files[1..], "the first file is settled, the second is not");
+        spool.settle(seqs[4]).await;
+        assert!(spool_files(&dir).is_empty());
+        assert_eq!(metrics::SPOOL_BYTES.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
+    async fn a_full_spool_skips_events_until_settled_files_make_room() {
+        let _globals = hold_globals();
+        drop(usage::take(usize::MAX, usize::MAX));
+        let dir = TempDir::new("spool-cap");
+        request("sizing");
+        let probe = spool_in(&dir, u64::MAX);
+        probe.seal().await;
+        let one = metrics::SPOOL_BYTES.load(Ordering::Relaxed) as u64;
+        let first = usage::take(usize::MAX, usize::MAX)[0].seq;
+        probe.settle(first).await;
+        drop(probe);
+
+        // room for one event's file, not two
+        let spool = spool_in(&dir, one + one / 2);
+        let skipped = metrics::SPOOL_SKIPPED_EVENTS.load(Ordering::Relaxed);
+        request("fits-1");
+        spool.seal().await;
+        ["over-1", "over-2"].iter().for_each(|m| request(m));
+        spool.seal().await;
+        assert_eq!(spool_files(&dir).len(), 1, "the unsettled file is kept, the new one is not written");
+        assert_eq!(metrics::SPOOL_SKIPPED_EVENTS.load(Ordering::Relaxed) - skipped, 2);
+        spool.seal().await;
+        assert_eq!(metrics::SPOOL_SKIPPED_EVENTS.load(Ordering::Relaxed) - skipped, 2, "counted once");
+
+        let seqs: Vec<u64> = usage::take(usize::MAX, usize::MAX).iter().map(|e| e.seq).collect();
+        spool.settle(seqs[0]).await;
+        request("fits-2");
+        spool.seal().await;
+        let files = spool_files(&dir);
+        assert_eq!(files.len(), 1);
+        let (events, _) = spool::read(&dir.0.join("spool").join(&files[0]));
+        assert!(String::from_utf8(events[0].clone()).unwrap().contains("fits-2"));
+        drop(usage::take(usize::MAX, usize::MAX));
+    }
+
+    // A gateway that died with usage queued hands it over when it starts
+    // again, before its first sync, and numbers its own events after it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
+    async fn a_restart_replays_what_the_last_run_left_before_it_syncs() {
+        let _globals = hold_globals();
+        drop(usage::take(usize::MAX, usize::MAX));
+        let dir = TempDir::new("spool-replay");
+        left_behind(&dir, &[&["left-1", "left-2"], &["left-3"]]).await;
+        // the newest file lost its tail when the process died
+        let files = spool_files(&dir);
+        let newest = dir.0.join("spool").join(&files[1]);
+        let mut bytes = std::fs::read(&newest).unwrap();
+        bytes.extend_from_slice(&[200, 0, 0, 0, 1, 2, 3, 4, b'{']);
+        std::fs::write(&newest, bytes).unwrap();
+        std::fs::write(dir.0.join("spool").join("7-9.tmp"), b"unfinished").unwrap();
+
+        let (url, mock) = gateway_cp().await;
+        let spool = spool_in(&dir, u64::MAX);
+        assert_eq!(spool_files(&dir), files, "an unfinished write is cleared away");
+        let (replayed, duplicates) = (
+            metrics::REPLAYED_EVENTS.load(Ordering::Relaxed),
+            metrics::REPLAY_DUPLICATE_EVENTS.load(Ordering::Relaxed),
+        );
+        request("new-1");
+        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into()).with_spool(Some(spool));
+        let st = new_state();
+        let running = tokio::spawn(Arc::new(cp).start(st));
+        until("the new event is synced", || mock.models("sync", 200).iter().any(|m| m == &["new-1"])).await;
+
+        let calls: Vec<String> = mock.calls.lock().unwrap().iter().map(|(path, _, _)| path.clone()).collect();
+        assert_eq!(calls[0], "/gw/v1/replay", "before the first sync: {calls:?}");
+        assert_eq!(mock.models("replay", 200), [["left-1", "left-2", "left-3"]], "once, oldest first");
+        let sent = mock.calls.lock().unwrap()[0].2.to_string();
+        assert!(sent.contains("\"content_truncated\":true") && !sent.contains("secret"), "{sent}");
+        assert_eq!(metrics::REPLAYED_EVENTS.load(Ordering::Relaxed) - replayed, 3);
+        assert_eq!(metrics::REPLAY_DUPLICATE_EVENTS.load(Ordering::Relaxed) - duplicates, 1, "as the answer said");
+        until("the spool is empty", || spool_files(&dir).is_empty()).await;
+        assert_eq!(metrics::SPOOL_BYTES.load(Ordering::Relaxed), 0);
+
+        running.abort();
+        let _ = running.await;
+    }
+
+    // A control plane from before the replay answers 404: the files wait
+    // for a later start, and syncing goes on.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
+    async fn a_control_plane_without_replay_leaves_the_spool_alone() {
+        let _globals = hold_globals();
+        drop(usage::take(usize::MAX, usize::MAX));
+        let dir = TempDir::new("spool-404");
+        left_behind(&dir, &[&["left-1"]]).await;
+        let files = spool_files(&dir);
+        let (url, mock) = gateway_cp().await;
+        mock.replay_status.store(404, Ordering::Relaxed);
+        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into()).with_spool(Some(spool_in(&dir, u64::MAX)));
+        let st = new_state();
+        let running = tokio::spawn(Arc::new(cp).start(st));
+        request("new-1");
+        until("the new event is synced", || mock.models("sync", 200).iter().any(|m| m == &["new-1"])).await;
+        until("its own file is settled", || spool_files(&dir).len() == 1).await;
+        assert_eq!(spool_files(&dir), files, "the leftover file is kept");
+        assert_eq!(mock.models("replay", 404).len(), 1, "asked once");
+        assert!(st.is_ready());
+        running.abort();
+        let _ = running.await;
+
+        // the next start, against a control plane that has it, hands it over
+        mock.replay_status.store(0, Ordering::Relaxed);
+        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into()).with_spool(Some(spool_in(&dir, u64::MAX)));
+        let running = tokio::spawn(Arc::new(cp).start(new_state()));
+        until("the leftover is replayed", || mock.models("replay", 200) == [["left-1"]]).await;
+        until("the spool is empty", || spool_files(&dir).is_empty()).await;
+        running.abort();
+        let _ = running.await;
+    }
+
+    // A batch that was sent, then the session ended: the control plane may
+    // have stored it for the instance this gateway was. After the new join
+    // its events go through the replay, with their content, not as a sync.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
+    async fn a_batch_pending_across_a_rejoin_is_replayed() {
+        let _globals = hold_globals();
+        drop(usage::take(usize::MAX, usize::MAX));
+        let dir = TempDir::new("spool-rejoin");
+        let (url, mock) = gateway_cp().await;
+        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into()).with_spool(Some(spool_in(&dir, u64::MAX)));
+        cp.join().await.unwrap();
+        let mut s = cp.syncer.lock().await;
+
+        request("pending-1");
+        mock.expire.store(1, Ordering::Relaxed);
+        assert!(!cp.sync_once(&mut s).await, "401, and it joins again");
+        assert_eq!(mock.joins.load(Ordering::Relaxed), 2);
+        assert_eq!(spool_files(&dir).len(), 1);
+        request("later-1");
+        assert!(!cp.sync_once(&mut s).await, "the pending batch is replayed");
+        assert!(s.pending.is_none());
+        assert_eq!(mock.models("replay", 200), [["pending-1"]]);
+        assert!(mock.calls.lock().unwrap().last().unwrap().2.to_string().contains("a secret answer"));
+        assert_eq!(spool_files(&dir).len(), 1, "its file is settled; the later event's stays");
+        assert!(cp.sync_once(&mut s).await);
+        assert_eq!(mock.models("sync", 200), [["later-1"]], "the batch itself is never sent as a sync again");
+        assert!(spool_files(&dir).is_empty());
+
+        // a control plane without replay: the batch is resent as a sync, as before
+        mock.replay_status.store(404, Ordering::Relaxed);
+        request("pending-2");
+        mock.expire.store(1, Ordering::Relaxed);
+        assert!(!cp.sync_once(&mut s).await);
+        assert!(cp.sync_once(&mut s).await);
+        assert_eq!(mock.models("sync", 200).last().unwrap(), &["pending-2"]);
+        assert!(spool_files(&dir).is_empty());
+
+        // a replay the control plane cannot read drops the batch, so it cannot wedge the gateway
+        mock.replay_status.store(400, Ordering::Relaxed);
+        let refused = metrics::REPLAY_REFUSED_EVENTS.load(Ordering::Relaxed);
+        request("pending-3");
+        mock.expire.store(1, Ordering::Relaxed);
+        assert!(!cp.sync_once(&mut s).await);
+        assert!(!cp.sync_once(&mut s).await);
+        assert!(s.pending.is_none() && spool_files(&dir).is_empty());
+        assert_eq!(metrics::REPLAY_REFUSED_EVENTS.load(Ordering::Relaxed) - refused, 1);
+    }
+
+    // A proxy's 413s make a batch smaller: stripped, halved, and an event too
+    // large alone dropped. Whatever is still to send stays in sequence, and
+    // each file goes once everything up to its last event is sent or dropped.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
+    async fn batches_made_smaller_stay_in_sequence_and_settle_the_spool() {
+        let _globals = hold_globals();
+        drop(usage::take(usize::MAX, usize::MAX));
+        let dir = TempDir::new("spool-413");
+        let (url, seen) = mock_cp(|_, size| if size > 3000 { 413 } else { 200 }).await;
+        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into()).with_spool(Some(spool_in(&dir, u64::MAX)));
+        let mut s = cp.syncer.lock().await;
+        s.limit_bytes = Some(MIN_BATCH_BYTES);
+        for model in ["one", "two", &"too-large-".repeat(500), "four", "five"] {
+            request(model);
+        }
+        let mut files = usize::MAX;
+        for _ in 0..30 {
+            let synced = cp.sync_once(&mut s).await;
+            let pending = s.pending.iter().flat_map(|b| &b.frozen.events).map(|e| e.seq);
+            let seqs: Vec<u64> = pending.chain(crate::usage::tests::queued_seqs()).collect();
+            assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+            assert!(spool_files(&dir).len() <= files, "files only go");
+            files = spool_files(&dir).len();
+            if synced && usage::queued() == 0 {
+                break;
+            }
+        }
+        assert!(s.pending.is_none() && usage::queued() == 0);
+        assert!(spool_files(&dir).is_empty(), "{:?}", spool_files(&dir));
+        let accepted: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, _, code)| *code == 200)
+            .flat_map(|(_, v, _)| v["events"].as_array().unwrap().clone())
+            .map(|e| e["model_name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(accepted, ["one", "two", "four", "five"]);
+    }
+
+    // While the control plane cannot take the replay, what an earlier run
+    // left stays on disk and normal syncs go on; once it can, the events are
+    // handed over once and the files go.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
+    async fn a_failing_replay_keeps_the_files_and_does_not_hold_up_syncs() {
+        let _globals = hold_globals();
+        drop(usage::take(usize::MAX, usize::MAX));
+        let dir = TempDir::new("spool-retry");
+        left_behind(&dir, &[&["left-1", "left-2"], &["left-3"]]).await;
+        let files = spool_files(&dir);
+        let (url, mock) = gateway_cp().await;
+        mock.replay_status.store(503, Ordering::Relaxed);
+        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into())
+            .with_spool(Some(spool_in(&dir, u64::MAX)))
+            .replaying_with(Duration::from_millis(100), Duration::from_millis(10));
+        let st = new_state();
+        let running = tokio::spawn(Arc::new(cp).start(st));
+        request("new-1");
+        until("the new event is synced", || mock.models("sync", 200).iter().any(|m| m == &["new-1"])).await;
+        until("its own file is settled", || spool_files(&dir).len() == files.len()).await;
+        assert!(st.is_ready());
+        assert_eq!(mock.calls.lock().unwrap()[0].0, "/gw/v1/replay", "the replay had its head start");
+        assert!(mock.models("replay", 503).len() >= 2, "and is retried");
+
+        // no answer at all
+        mock.replay_status.store(CUT_OFF, Ordering::Relaxed);
+        until("a replay is cut off", || !mock.models("replay", CUT_OFF as u16).is_empty()).await;
+        request("new-2");
+        until("syncs go on", || mock.models("sync", 200).iter().any(|m| m == &["new-2"])).await;
+        until("its own file is settled", || spool_files(&dir).len() == files.len()).await;
+        assert_eq!(spool_files(&dir), files, "the leftover files wait");
+        assert!(mock.models("replay", 200).is_empty());
+
+        mock.replay_status.store(0, Ordering::Relaxed);
+        until("the spool is empty", || spool_files(&dir).is_empty()).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(mock.models("replay", 200), [["left-1", "left-2", "left-3"]], "handed over once");
+        let synced: Vec<String> = mock.models("sync", 200).concat();
+        assert_eq!(synced, ["new-1", "new-2"], "and never as a sync");
+
+        running.abort();
+        let _ = running.await;
+    }
+
+    // The replay of a batch pending across a rejoin needs no state
+    // directory; without one nothing is written.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
+    async fn without_a_spool_nothing_is_written_and_a_rejoin_still_replays() {
+        let _globals = hold_globals();
+        drop(usage::take(usize::MAX, usize::MAX));
+        let (url, mock) = gateway_cp().await;
+        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into());
+        cp.join().await.unwrap();
+        let mut s = cp.syncer.lock().await;
+        let bytes = metrics::SPOOL_BYTES.load(Ordering::Relaxed);
+        request("plain-1");
+        mock.expire.store(1, Ordering::Relaxed);
+        assert!(!cp.sync_once(&mut s).await, "401, and it joins again");
+        assert!(!cp.sync_once(&mut s).await, "the pending batch is replayed");
+        assert!(s.pending.is_none());
+        assert_eq!(mock.models("replay", 200), [["plain-1"]]);
+        assert!(mock.models("sync", 200).is_empty());
+
+        // a control plane without replay: resent as a sync
+        mock.replay_status.store(404, Ordering::Relaxed);
+        request("plain-2");
+        mock.expire.store(1, Ordering::Relaxed);
+        assert!(!cp.sync_once(&mut s).await);
+        assert!(cp.sync_once(&mut s).await);
+        assert_eq!(mock.models("sync", 200), [["plain-2"]]);
+        assert_eq!(metrics::SPOOL_BYTES.load(Ordering::Relaxed), bytes);
     }
 
     // The control plane skips a batch number it has already stored and still

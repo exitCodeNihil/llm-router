@@ -106,6 +106,11 @@ control plane is back. To bound that, set `LLMR_MAX_CONFIG_AGE`: a gateway whose
 plane has not confirmed for that many seconds answers `/v1` with 503 `config_stale` and fails
 `/healthz` until the next config poll is answered. It polls about every 25 seconds.
 
+A gateway that has to join again while a batch of usage is unacknowledged, with or without state on
+disk, sends that batch's events to the control plane's replay, which stores each request once. A
+control plane before 0.4 has no replay: the batch is resent as a sync and, if the first attempt had
+been stored, counted twice.
+
 Deleting a group ends its gateways' sessions: each notices at its next sync or config poll, within
 seconds, and tries to join again. The control plane refuses that join, and a gateway that has been
 refused for 15 minutes stops serving: `/v1` answers 503 `gateway_refused`, `/healthz` fails, and it
@@ -159,6 +164,7 @@ A gateway logs why it refuses them, and requests to those providers fail with th
 | `LLMR_GATEWAY_NAME` | Name on the Gateways page (default: the hostname) |
 | `LLMR_MAX_CONFIG_AGE` | Seconds a gateway serves after the control plane last confirmed its config; unset or 0: no limit. At least 120 |
 | `LLMR_STATE_DIR` | Directory for [state on disk](#gateway-state-on-disk); unset: nothing is written |
+| `LLMR_SPOOL_MAX_BYTES` | With `LLMR_STATE_DIR`: the most bytes of unsent usage kept on disk (default 268435456, 256 MiB); 0 keeps none |
 | `LLMR_LOG_LEVEL` | `debug`, `info` (default), `warn` or `error` |
 | `LLMR_LOG_FORMAT` | `text` (default) or `json`, one object per line with `ts`, `level` and `msg`. Logs go to stderr |
 
@@ -182,9 +188,23 @@ shorter). Budgets continue from the saved spend; if none was saved, requests und
 control plane's config. Files it cannot read, for example after the join token changed, are deleted
 and it starts as it would without them.
 
+The directory also holds a spool of usage: before each sync, the events queued since the last one are
+written to `spool/`, without captured prompts or responses, and deleted once the control plane has
+acknowledged them. A gateway that starts and finds events there, left by a run that crashed or was
+killed, sends them to the control plane before its first sync, and the control plane stores each
+request once, however often it is sent. What a crash can still lose is the usage of requests that
+finished since the last sync, about two seconds' worth, and of requests in flight when the process
+died. Events replayed from the spool carry no prompts or responses. Replay needs a 0.4 control plane; against an
+older one the files wait for a later start. Past `LLMR_SPOOL_MAX_BYTES` new events are not spooled
+(`llmr_spool_skipped_events_total`) until acknowledged ones make room, which only happens while the
+control plane is unreachable for a long time: 256 MiB holds several hundred thousand events.
+
 One gateway uses a directory at a time: a second one logs an error and runs without saved state
 (`llmr_state_dir_locked` is 0). The chart uses an `emptyDir`, which survives a container restart but
-not the pod, so a new or rescheduled pod still needs the control plane. What is on disk is described
+not the pod, so a new or rescheduled pod still needs the control plane and a deleted pod's spool is
+gone. Its `gateway.state.sizeLimit` is 512Mi, twice the spool's cap: Kubernetes evicts a pod
+that goes over its `emptyDir` limit, so the config and files being written need room beside a full
+spool. If you raise `LLMR_SPOOL_MAX_BYTES`, raise it too. What is on disk is described
 in [SECURITY.md](../SECURITY.md#data-at-rest).
 
 ## Configuration

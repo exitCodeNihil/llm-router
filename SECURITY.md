@@ -31,9 +31,15 @@ files, readable only by the gateway's user:
 - `confirmed.bin`: when that config was last confirmed, and the spend in USD of each budgeted key,
   user and team.
 - `refused.bin`, only while the control plane refuses the gateway: the time that began.
+- `spool/`: usage events the control plane has not acknowledged yet, deleted once it has.
 
-All are encrypted with AES-256-GCM under a key derived from the group's join token (HKDF-SHA256
+The three `.bin` files are encrypted with AES-256-GCM under a key derived from the group's join token (HKDF-SHA256
 with a random salt per file). Anyone who holds both the disk and the join token can read them, so
 protect the volume as you protect the token. Replacing the join token does not re-encrypt files
 written under the old one; a gateway deletes them when it starts with the new token, and deletes
 the config and spend when the control plane has refused it for 15 minutes.
+
+The spool is not encrypted. Its events hold request and trace ids, the ids of the key, user, team,
+deployment and provider, model names, token counts, costs, latency and status. They never hold
+prompts, responses, API keys or provider credentials: captured content stays in memory and is left
+out of what is written.

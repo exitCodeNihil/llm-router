@@ -19,6 +19,12 @@ pub static REFUSED: AtomicI64 = AtomicI64::new(0);
 /// 1 while this process holds the state directory, 0 when it could not take
 /// it, -1 without LLMR_STATE_DIR.
 pub static STATE_DIR_LOCKED: AtomicI64 = AtomicI64::new(-1);
+/// Bytes of usage events on disk waiting for the control plane.
+pub static SPOOL_BYTES: AtomicI64 = AtomicI64::new(0);
+pub static SPOOL_SKIPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
+pub static REPLAYED_EVENTS: AtomicU64 = AtomicU64::new(0);
+pub static REPLAY_DUPLICATE_EVENTS: AtomicU64 = AtomicU64::new(0);
+pub static REPLAY_REFUSED_EVENTS: AtomicU64 = AtomicU64::new(0);
 pub static WORKERS: AtomicI64 = AtomicI64::new(0);
 pub static OPEN_CONNECTIONS: AtomicI64 = AtomicI64::new(0);
 pub static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
@@ -128,6 +134,11 @@ pub fn render(ready: bool, usage_queued: usize, usage_capacity: usize, usage_dro
             locked,
         );
     }
+    gauge(
+        "llmr_spool_bytes",
+        "Usage events on disk that the control plane has not acknowledged",
+        SPOOL_BYTES.load(Relaxed),
+    );
     gauge("llmr_workers", "Worker threads", WORKERS.load(Relaxed));
     gauge("llmr_usage_queued", "Usage events waiting for the next sync", usage_queued as i64);
     gauge("llmr_usage_queue_capacity", "Usage events the queue holds memory for", usage_capacity as i64);
@@ -191,6 +202,26 @@ pub fn render(ready: bool, usage_queued: usize, usage_capacity: usize, usage_dro
         "llmr_sync_refused_events_total",
         "Usage events dropped because the control plane refused their batch",
         SYNC_REFUSED_EVENTS.load(Relaxed),
+    );
+    counter(
+        "llmr_spool_skipped_events_total",
+        "Usage events not written to the spool because it was full or the write failed",
+        SPOOL_SKIPPED_EVENTS.load(Relaxed),
+    );
+    counter(
+        "llmr_replayed_events_total",
+        "Usage events sent again after a restart or a new join and accepted by the control plane",
+        REPLAYED_EVENTS.load(Relaxed),
+    );
+    counter(
+        "llmr_replay_duplicate_events_total",
+        "Replayed usage events the control plane already had",
+        REPLAY_DUPLICATE_EVENTS.load(Relaxed),
+    );
+    counter(
+        "llmr_replay_refused_events_total",
+        "Replayed usage events dropped because the control plane refused them",
+        REPLAY_REFUSED_EVENTS.load(Relaxed),
     );
     counter("llmr_usage_dropped_total", "Usage events dropped because the queue was full", usage_dropped);
     counter(

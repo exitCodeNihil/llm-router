@@ -76,6 +76,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.Handle("POST /gw/v1/renew", s.session(s.renew))
 	mux.Handle("GET /gw/v1/config", s.session(s.config))
 	mux.Handle("POST /gw/v1/sync", s.session(s.sync))
+	mux.Handle("POST /gw/v1/replay", s.session(s.replay))
 	mux.Handle("POST /gw/v1/provision", s.session(s.provision))
 }
 
@@ -354,41 +355,7 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request, p peer) {
 
 	// A gateway can only report usage for callers its group serves.
 	enc := s.encoded(snap, group, p.schema)
-	events := make([]usage.Event, 0, len(req.Events))
-	dropped, clamped, fixed := 0, 0, 0
-	now := time.Now()
-	for _, se := range req.Events {
-		e := se.Event
-		if g.AllowedTeams != nil && enc.keys[e.APIKeyID] == nil && !g.AllowedTeams[e.TeamID] &&
-			!memberOfAllowed(snap, g, e.UserID) {
-			dropped++
-			continue
-		}
-		if se.TSMS > 0 {
-			e.TS = time.UnixMilli(se.TSMS)
-		}
-		// A gateway's clock or a corrupt event must not produce a row Postgres
-		// refuses: that would fail the batch, and the gateway would resend it.
-		var moved bool
-		if e.TS, moved = usage.ClampTS(e.TS, now); moved {
-			clamped++
-		}
-		if usage.Sanitize(&e) > 0 {
-			fixed++
-		}
-		e.GatewayID, e.GatewayGroupID = instance, group
-		if e.TraceID == "" {
-			e.TraceID = usage.TraceIDFor(e.RequestID) // gateways before 0.3.0 send none
-		}
-		events = append(events, e)
-	}
-	if dropped > 0 {
-		slog.Warn("gateway reported usage outside its group", "instance", instance, "group", g.Name, "dropped", dropped)
-	}
-	if clamped > 0 || fixed > 0 {
-		slog.Warn("gateway reported usage the control plane corrected", "instance", instance,
-			"timestamps_clamped", clamped, "events_fixed", fixed)
-	}
+	events, _ := s.accept(snap, g, enc, p, req.Events)
 
 	fresh, events, err := s.record(r, instance, req.Batch, events)
 	if errors.Is(err, pgx.ErrNoRows) {
