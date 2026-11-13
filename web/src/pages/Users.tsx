@@ -3,12 +3,13 @@ import { Card } from "@astryxdesign/core/Card";
 import { VisuallyHidden } from "@astryxdesign/core/VisuallyHidden";
 import { HStack, VStack } from "@astryxdesign/core/Stack";
 import { Grid } from "@astryxdesign/core/Grid";
-import { Text } from "@astryxdesign/core/Text";
+import { Heading, Text } from "@astryxdesign/core/Text";
 import { Button } from "@astryxdesign/core/Button";
 import { IconButton } from "@astryxdesign/core/IconButton";
 import { Icon } from "@astryxdesign/core/Icon";
 import { Badge } from "@astryxdesign/core/Badge";
 import { Switch } from "@astryxdesign/core/Switch";
+import { CheckboxInput } from "@astryxdesign/core/CheckboxInput";
 import { Table, pixel, proportional } from "@astryxdesign/core/Table";
 import type { TableColumn } from "@astryxdesign/core/Table";
 import { TextInput } from "@astryxdesign/core/TextInput";
@@ -16,10 +17,12 @@ import { Selector } from "@astryxdesign/core/Selector";
 import { Timestamp } from "@astryxdesign/core/Timestamp";
 import { useToast } from "@astryxdesign/core/Toast";
 
-import type { User } from "../lib/types";
+import type { DeletedUser, User } from "../lib/types";
 import {
   useCreateUser,
   useDeleteUser,
+  useDeletedUsers,
+  useEraseUser,
   useSetUserPassword,
   useUpdateUser,
   useUsers,
@@ -183,10 +186,103 @@ function UserForm({
   );
 }
 
+const ERASES =
+  "Erasing removes their email and key names from the deleted-users list, the audit log and usage labels, " +
+  "and takes them off the workspaces allow-list. It cannot reach application logs, database backups or " +
+  "traces already exported to telemetry destinations. Usage rows keep the account's id, which then names no one.";
+
+function erasedToast(notReached: string[]) {
+  return `Erased. Not reached: ${notReached.join(", ")}.`;
+}
+
+/** Accounts that were deleted, kept by email so their history stays readable. */
+function DeletedUsers() {
+  const deleted = useDeletedUsers();
+  const erase = useEraseUser();
+  const showToast = useToast();
+  const [erasing, setErasing] = useState<DeletedUser | null>(null);
+
+  const columns: TableColumn<DeletedUser & Record<string, unknown>>[] = [
+    {
+      key: "label",
+      header: "Email",
+      width: proportional(2),
+      renderCell: (d) =>
+        d.erased_at ? (
+          <Text type="supporting" color="secondary">
+            erased
+          </Text>
+        ) : (
+          d.label
+        ),
+    },
+    {
+      key: "deleted_at",
+      header: "Deleted",
+      width: pixel(140),
+      renderCell: (d) => <Timestamp value={d.deleted_at} format="relative" />,
+    },
+    {
+      key: "actions",
+      header: <VisuallyHidden>Actions</VisuallyHidden>,
+      width: pixel(110),
+      align: "end",
+      renderCell: (d) =>
+        d.erased_at ? (
+          <Badge variant="neutral" label="erased" />
+        ) : (
+          <Button label="Erase" variant="ghost" size="sm" onClick={() => setErasing(d)} />
+        ),
+    },
+  ];
+
+  if (deleted.isLoading) return <Loading />;
+  if (deleted.error) return <ErrorState error={deleted.error} onRetry={() => deleted.refetch()} />;
+  if (!deleted.data?.length) return null;
+  return (
+    <VStack gap={2}>
+      <Heading level={4}>Deleted users</Heading>
+      <Text type="supporting" color="secondary">
+        A deleted account's email is kept so usage and history still name it. Erase it to remove it.
+      </Text>
+      <Card padding={0}>
+        <Table
+          data={deleted.data as Array<DeletedUser & Record<string, unknown>>}
+          columns={columns}
+          idKey="id"
+          density="compact"
+          dividers="rows"
+          textOverflow="truncate"
+        />
+      </Card>
+      <Confirm
+        target={erasing}
+        title="Erase deleted user"
+        description={`Erase ${erasing?.label}? ${ERASES}`}
+        actionLabel="Erase"
+        isLoading={erase.isPending}
+        onCancel={() => setErasing(null)}
+        onConfirm={async () => {
+          if (!erasing) return;
+          try {
+            const res = await erase.mutateAsync(erasing.id);
+            showToast({ body: erasedToast(res.not_reached) });
+          } catch (err) {
+            showToast({ body: err instanceof Error ? err.message : "Failed", type: "error" });
+          }
+          setErasing(null);
+        }}
+      />
+    </VStack>
+  );
+}
+
 export default function Users() {
   const users = useUsers();
   const update = useUpdateUser();
   const del = useDeleteUser();
+  const erase = useEraseUser();
+  const [alsoErase, setAlsoErase] = useState(false);
   const showToast = useToast();
 
   const [showForm, setShowForm] = useState(false);
@@ -300,7 +396,10 @@ export default function Users() {
             variant="ghost"
             size="sm"
             icon={<Icon icon={IconTrash} size="sm" />}
-            onClick={() => setDeleting(u)}
+            onClick={() => {
+              setAlsoErase(false);
+              setDeleting(u);
+            }}
           />
         </HStack>
       ),
@@ -368,6 +467,8 @@ export default function Users() {
         )}
       </Card>
 
+      <DeletedUsers />
+
       {showForm && (
         <FormDialog
           isOpen
@@ -397,26 +498,56 @@ export default function Users() {
         }}
       />
 
-      <Confirm
-        target={deleting}
-        title="Delete user"
-        description={`Delete ${deleting?.email}? Their keys stop working immediately.`}
-        isLoading={del.isPending}
-        onCancel={() => setDeleting(null)}
-        onConfirm={async () => {
-          if (!deleting) return;
-          try {
-            await del.mutateAsync(deleting.id);
-            showToast({ body: "User deleted" });
-          } catch (err) {
-            showToast({
-              body: err instanceof Error ? err.message : "Failed",
-              type: "error",
-            });
-          }
-          setDeleting(null);
-        }}
-      />
+      {deleting && (
+        <FormDialog
+          isOpen
+          onClose={() => setDeleting(null)}
+          title="Delete user"
+          subtitle={`Delete ${deleting.email}? Their keys stop working immediately.`}
+        >
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              try {
+                if (alsoErase) {
+                  const res = await erase.mutateAsync(deleting.id);
+                  showToast({ body: erasedToast(res.not_reached) });
+                } else {
+                  await del.mutateAsync(deleting.id);
+                  showToast({ body: "User deleted" });
+                }
+                setDeleting(null);
+              } catch (err) {
+                showToast({
+                  body: err instanceof Error ? err.message : "Failed",
+                  type: "error",
+                });
+              }
+            }}
+          >
+            <VStack gap={4}>
+              <Text type="supporting" color="secondary">
+                Their email stays on the deleted-users list so usage and history still name them.
+              </Text>
+              <CheckboxInput
+                label="Also erase this person's data"
+                description={ERASES}
+                value={alsoErase}
+                onChange={setAlsoErase}
+              />
+              <HStack gap={2} hAlign="end">
+                <Button label="Cancel" variant="ghost" onClick={() => setDeleting(null)} />
+                <Button
+                  label={alsoErase ? "Delete and erase" : "Delete"}
+                  variant="destructive"
+                  type="submit"
+                  isLoading={del.isPending || erase.isPending}
+                />
+              </HStack>
+            </VStack>
+          </form>
+        </FormDialog>
+      )}
     </Page>
   );
 }

@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/netip"
@@ -19,7 +19,8 @@ import (
 )
 
 // SSOConfig is the single OIDC provider configuration, stored in settings
-// under key 'sso'. It covers Entra ID, Google, Okta, and any OIDC IdP.
+// under key 'sso' with the secret encrypted (sso.go). It covers Entra ID,
+// Google, Okta, and any OIDC IdP.
 type SSOConfig struct {
 	IssuerURL    string `json:"issuer_url"`
 	ClientID     string `json:"client_id"`
@@ -65,17 +66,14 @@ func (a *Auth) Register(mux *http.ServeMux) {
 	})
 }
 
+// loadSSO is LoadSSO for sign-in. A secret it cannot decrypt is logged for
+// the admin and fails like a missing configuration.
 func (a *Auth) loadSSO(ctx context.Context) (*SSOConfig, error) {
-	var raw []byte
-	err := a.Store.Pool.QueryRow(ctx, `SELECT value FROM settings WHERE key='sso'`).Scan(&raw)
-	if err != nil {
-		return nil, err
+	cfg, err := LoadSSO(ctx, a.Store.Pool, a.EncryptionKey)
+	if errors.Is(err, ErrSSOSecret) {
+		slog.Error("sso sign-in unavailable", "err", err)
 	}
-	var cfg SSOConfig
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return nil, err
-	}
-	return &cfg, nil
+	return cfg, err
 }
 
 func (a *Auth) oidcProvider(ctx context.Context, cfg *SSOConfig) (*oidc.Provider, error) {

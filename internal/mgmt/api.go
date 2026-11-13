@@ -93,6 +93,8 @@ func (m *Server) routes(handle func(string, http.Handler)) {
 	handle("POST /api/users", h(m.createUser))
 	handle("PATCH /api/users/{id}", h(m.patchUser))
 	handle("DELETE /api/users/{id}", h(m.deleteUser))
+	handle("POST /api/users/{id}/erase", h(m.eraseUser))
+	handle("GET /api/deleted-users", h(m.listDeletedUsers))
 
 	handle("GET /api/teams", ha(m.listTeamsScoped))
 	handle("POST /api/teams", h(m.createTeam))

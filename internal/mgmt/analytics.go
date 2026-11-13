@@ -177,15 +177,21 @@ func (f *usageFilter) from() string {
 	return from
 }
 
+// deletedLabel names a deleted user, key or team from its deleted_entities
+// row (joined as alias), or is NULL when there is none.
+func deletedLabel(alias string) string {
+	return "CASE WHEN " + alias + ".erased_at IS NOT NULL THEN '(erased)' ELSE " + alias + ".label || ' (deleted)' END"
+}
+
 // breakdownDims maps a group_by value to its SQL. Whitelisted rather than
 // interpolated, since this lands directly in a GROUP BY.
 var breakdownDims = map[string]struct{ expr, label string }{
 	"model":      {"e.model_name", "coalesce(nullif(e.model_name, ''), '(none)')"},
 	"provider":   {"e.provider_id::text", "coalesce(p.name, '(none)')"},
 	"deployment": {"e.deployment_id::text", "coalesce(d.upstream_name, '(none)')"},
-	"key":        {"e.api_key_id::text", "coalesce(k2.name, '(deleted key)')"},
-	"user":       {"e.user_id::text", "coalesce(u.email, '(none)')"},
-	"team":       {"e.team_id::text", "coalesce(t.name, '(none)')"},
+	"key":        {"e.api_key_id::text", "coalesce(k2.name, " + deletedLabel("dk") + ", '(deleted key)')"},
+	"user":       {"e.user_id::text", "coalesce(u.email, " + deletedLabel("du") + ", '(none)')"},
+	"team":       {"e.team_id::text", "coalesce(t.name, " + deletedLabel("dt") + ", '(none)')"},
 	"status":     {"e.status_code::text", "e.status_code::text"},
 	"error_code": {"coalesce(e.error_code, '')", "coalesce(nullif(e.error_code, ''), '(none)')"},
 	"gateway":    {"e.gateway_id::text", "coalesce(gg.name || ' / ' || gi.name, e.gateway_id::text, '(control plane)')"},
@@ -227,6 +233,9 @@ func (m *Server) usageBreakdown(w http.ResponseWriter, r *http.Request) {
 		LEFT JOIN model_deployments d ON d.id = e.deployment_id
 		LEFT JOIN users u ON u.id = e.user_id
 		LEFT JOIN teams t ON t.id = e.team_id
+		LEFT JOIN deleted_entities dk ON dk.kind = 'key' AND dk.id = e.api_key_id
+		LEFT JOIN deleted_entities du ON du.kind = 'user' AND du.id = e.user_id
+		LEFT JOIN deleted_entities dt ON dt.kind = 'team' AND dt.id = e.team_id
 		LEFT JOIN gateway_instances gi ON gi.id = e.gateway_id
 		LEFT JOIN gateway_groups gg ON gg.id = gi.group_id
 		WHERE %s

@@ -31,6 +31,8 @@ import type {
   RequestRow,
   AuditEvent,
   AuditFilters,
+  DeletedUser,
+  EraseResult,
   RuleStats,
   SpendByTeam,
   SsoSettings,
@@ -106,8 +108,19 @@ export const useUpdateUser = () =>
 export const useDeleteUser = () =>
   useInvalidatingMutation(
     (id: string) => api.del(`/api/users/${id}`),
-    [["users"]],
+    [["users"], ["deleted-users"]],
   );
+export const useEraseUser = () =>
+  useInvalidatingMutation(
+    (id: string) => api.post<EraseResult>(`/api/users/${id}/erase`, {}),
+    [["users"], ["deleted-users"]],
+  );
+export function useDeletedUsers() {
+  return useQuery({
+    queryKey: ["deleted-users"],
+    queryFn: () => api.get<DeletedUser[]>("/api/deleted-users"),
+  });
+}
 export const useSetUserPassword = () =>
   useMutation({
     mutationFn: ({ id, password }: { id: string; password: string }) =>

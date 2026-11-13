@@ -203,6 +203,10 @@ Placeholder secrets such as `change-me` are refused. Generate them with `openssl
 - **Health checks**: `/readyz` is the readiness check (config loaded, not shutting down) and
   `/healthz` the liveness check. Neither depends on Postgres: with the database away llm-router
   keeps serving from memory and queues usage. The chart uses both.
+- **SSO client secret**: it is now stored encrypted with `LLMR_ENCRYPTION_KEY`; the first start
+  encrypts the one already there. Backups made before the upgrade still hold it in plaintext: if
+  those backups are not trusted, rotate the client secret at the identity provider and enter the
+  new one under **Settings → OIDC provider**.
 
 ### Upgrading to 0.3
 
@@ -268,7 +272,7 @@ Old months are dropped twice a day and at start, a partition at a time, without 
 
 - Managed Postgres (15 or later) with backups, and a [retention](#usage-data) that fits its disk.
 - `LLMR_ENCRYPTION_KEY` in a secret manager and backed up. Rotating it means re-entering provider
-  keys and telemetry destination secrets, and signing everyone out.
+  keys, telemetry destination secrets and the SSO client secret, and signing everyone out.
 - TLS in front of 8080.
 - `/metrics` off the public listener (`LLMR_METRICS_LISTEN`; the chart does it), and the
   [alerts](monitoring.md#alerts) wired to someone. Give gateways a memory limit.

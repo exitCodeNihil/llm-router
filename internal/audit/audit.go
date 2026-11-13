@@ -79,11 +79,17 @@ func nullable(s string) *string {
 // Maintain runs fn in a transaction allowed to update and delete audit rows.
 func Maintain(ctx context.Context, pool *pgxpool.Pool, fn func(pgx.Tx) error) error {
 	return pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `SET LOCAL llmr.audit_maintenance = 'on'`); err != nil {
+		if err := MaintainTx(ctx, tx); err != nil {
 			return err
 		}
 		return fn(tx)
 	})
+}
+
+// MaintainTx allows the rest of tx to update and delete audit rows.
+func MaintainTx(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `SET LOCAL llmr.audit_maintenance = 'on'`)
+	return err
 }
 
 const pruneBatch = 10_000

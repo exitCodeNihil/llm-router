@@ -86,11 +86,12 @@ func (m *Server) usageRequests(w http.ResponseWriter, r *http.Request) {
 	m.list(w, r, `
 		SELECT e.id, e.ts, e.request_id, e.model_name, e.api_key_id, e.user_id, e.team_id,
 		       e.deployment_id, e.provider_id,
-		       k.name AS key_name, p.name AS provider_name, d.upstream_name AS upstream_name,
+		       coalesce(k.name, `+deletedLabel("dk")+`) AS key_name, p.name AS provider_name, d.upstream_name AS upstream_name,
 		       e.prompt_tokens, e.completion_tokens, e.cost_usd, e.latency_ms, e.status_code, e.stream,
 		       e.attempts, e.error_code, e.ttft_ms, e.notional_cost_usd, e.trace_id
 		FROM usage_events e
 		LEFT JOIN api_keys k ON k.id = e.api_key_id
+		LEFT JOIN deleted_entities dk ON dk.kind = 'key' AND dk.id = e.api_key_id
 		LEFT JOIN providers p ON p.id = e.provider_id
 		LEFT JOIN model_deployments d ON d.id = e.deployment_id
 		WHERE `+where+`

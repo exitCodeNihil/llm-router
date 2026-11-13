@@ -135,6 +135,9 @@ func run() error {
 		return err
 	}
 	telemetry.Register(otlp.Kind{}, langfuse.Kind{})
+	if err := console.MigrateSSO(ctx, st.Pool, cfg.EncryptionKey); err != nil {
+		return fmt.Errorf("encrypt the SSO client secret: %w", err)
+	}
 
 	builder := &snapshot.Builder{Pool: st.Pool, EncryptionKey: cfg.EncryptionKey}
 	buildStart := time.Now()

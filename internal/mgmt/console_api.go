@@ -2,12 +2,14 @@ package mgmt
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/exitcodenihil/llm-router/internal/console"
 	"github.com/exitcodenihil/llm-router/internal/provider"
@@ -150,19 +152,6 @@ func (m *Server) patchKey(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (m *Server) deleteKey(w http.ResponseWriter, r *http.Request) {
-	id, _, ok := m.keyOwnership(w, r)
-	if !ok {
-		return
-	}
-	if _, err := m.Store.Pool.Exec(r.Context(), `DELETE FROM api_keys WHERE id=$1`, id); err != nil {
-		httpError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	m.bump(r.Context())
-	w.WriteHeader(http.StatusNoContent)
-}
-
 // --- provider patch (api_key needs encryption) ---
 
 func (m *Server) patchProvider(w http.ResponseWriter, r *http.Request) {
@@ -274,19 +263,23 @@ func (m *Server) vertexPatchValid(w http.ResponseWriter, r *http.Request, id uui
 // --- SSO settings ---
 
 func (m *Server) getSSO(w http.ResponseWriter, r *http.Request) {
-	var raw []byte
-	err := m.Store.Pool.QueryRow(r.Context(), `SELECT value FROM settings WHERE key='sso'`).Scan(&raw)
-	if err != nil {
+	cfg, err := console.LoadSSO(r.Context(), m.Store.Pool, m.EncryptionKey)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
 		writeJSON(w, http.StatusOK, map[string]any{"configured": false})
 		return
-	}
-	var cfg console.SSOConfig
-	if err := json.Unmarshal(raw, &cfg); err != nil {
+	case err != nil && !errors.Is(err, console.ErrSSOSecret):
 		httpError(w, http.StatusInternalServerError, "corrupt sso config")
 		return
 	}
+	out := map[string]any{"configured": true}
+	if err != nil {
+		// The settings page asks for the secret again.
+		out["secret_error"] = err.Error()
+	}
 	cfg.ClientSecret = "" // never round-trip the secret
-	writeJSON(w, http.StatusOK, map[string]any{"configured": true, "sso": cfg})
+	out["sso"] = cfg
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (m *Server) putSSO(w http.ResponseWriter, r *http.Request) {
@@ -298,20 +291,8 @@ func (m *Server) putSSO(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "issuer_url, client_id, redirect_url are required")
 		return
 	}
-	if cfg.ClientSecret == "" {
-		// keep the existing secret on update
-		var raw []byte
-		if err := m.Store.Pool.QueryRow(r.Context(), `SELECT value FROM settings WHERE key='sso'`).Scan(&raw); err == nil {
-			var old console.SSOConfig
-			if json.Unmarshal(raw, &old) == nil {
-				cfg.ClientSecret = old.ClientSecret
-			}
-		}
-	}
-	val, _ := json.Marshal(cfg)
-	if _, err := m.Store.Pool.Exec(r.Context(), `
-		INSERT INTO settings (key, value) VALUES ('sso', $1)
-		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, val); err != nil {
+	// An empty client_secret keeps the stored one.
+	if err := console.SaveSSO(r.Context(), m.Store.Pool, m.EncryptionKey, &cfg); err != nil {
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

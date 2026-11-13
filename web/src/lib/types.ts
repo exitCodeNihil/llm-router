@@ -193,6 +193,8 @@ export interface Price {
 
 export interface SsoSettings {
   configured: boolean;
+  /** Set when the stored client secret cannot be decrypted. */
+  secret_error?: string;
   sso?: {
     issuer_url: string;
     client_id: string;
@@ -393,6 +395,20 @@ export interface SpendByTeam {
   team_name: string;
   usd: number;
   tokens: number;
+}
+
+// ── Deleted users (GET /api/deleted-users) ───────────────────────
+export interface DeletedUser {
+  id: string;
+  /** The email the account had, or "erased". */
+  label: string;
+  deleted_at: string;
+  erased_at: string | null;
+}
+export interface EraseResult {
+  erased: boolean;
+  /** Where copies may remain that llm-router cannot remove. */
+  not_reached: string[];
 }
 
 // ── Audit log (GET /api/audit) ───────────────────────────────────

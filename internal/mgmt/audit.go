@@ -56,6 +56,7 @@ var auditPolicy = map[string]detailPolicy{
 
 	"POST /api/users":                      keep(with(spendFields, "role")...),
 	"PATCH /api/users/{id}":                keep(with(spendFields, "role", "disabled")...),
+	"POST /api/users/{id}/erase":           noDetail,
 	"DELETE /api/users/{id}":               noDetail,
 	"POST /api/teams":                      keep(with(spendFields, "name")...),
 	"PATCH /api/teams/{id}":                keep(with(spendFields, "name")...),

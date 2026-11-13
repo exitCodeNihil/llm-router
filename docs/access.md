@@ -41,6 +41,25 @@ Create the first admin on the setup screen, or sign in with `LLMR_ADMIN_TOKEN`. 
 (`https://<gateway>/auth/callback`). Any OIDC provider works (Entra ID, Google, Okta, Zitadel,
 Keycloak). **Auto-create users** provisions people on their first sign-in.
 
+The client secret is stored encrypted with `LLMR_ENCRYPTION_KEY` and never shown again. If that key
+changes, the secret can no longer be read: SSO sign-in stops, the error is logged, and the settings
+page asks for the secret again.
+
+## Deleting and erasing users
+
+Deleting a user removes the account, its keys, team memberships, chats and workspaces. Its email,
+and the names of its keys, are kept as labels, so the Dashboard, Analytics and Requests still say
+whose usage it was: "ana@example.com (deleted)". The same goes for deleted keys and teams. Deleted
+users are listed under **Users → Deleted users**. The email is free to use for a new account.
+
+Erasing removes the person's personal data as well (**Erase** on a deleted user, or **Also erase
+this person's data** when deleting; `POST /api/users/{id}/erase`). It replaces the kept email and
+key names with "erased", removes the email from the audit log (as actor, and from the recorded
+detail of any change made to that user), takes the user off the workspaces allow-list, and makes
+gateways drop the hash of their email. Usage rows keep the user's id, which then names no one.
+Erase cannot reach application logs, database backups, or traces already exported to telemetry
+destinations: the response lists these, and any workspace volume the runtime could not remove.
+
 ## Cloud identity tokens
 
 Callers on Azure or GCP can send their platform token instead of a key. The gateway verifies it
