@@ -25,7 +25,6 @@ import { DropdownMenu } from "@astryxdesign/core/DropdownMenu";
 import type { RequestFilters, RequestRow, TelemetryDestination } from "../lib/types";
 import {
   useMe,
-  useKeys,
   useRequests,
   useDestinations,
   useUsageByModel,
@@ -33,6 +32,7 @@ import {
 import { compact, dateTime, int, money } from "../lib/format";
 import { Empty, ErrorState, Loading, Page } from "../components/Page";
 import { TagsInput } from "../components/forms";
+import { EntityPicker } from "../components/EntityPicker";
 import { FormDialog } from "../components/dialogs";
 
 type StatusOpt = "all" | "ok" | "err";
@@ -165,7 +165,6 @@ export default function Requests() {
     [destinations.data],
   );
   const models = useUsageByModel(7);
-  const keys = useKeys();
 
   const allRows = useMemo(() => req.data?.pages.flat() ?? [], [req.data]);
   const rows = useMemo(() => {
@@ -333,13 +332,6 @@ export default function Requests() {
       .filter((m) => m.model_name)
       .map((m) => ({ value: m.model_name, label: m.model_name })),
   ];
-  const keyOptions = [
-    { value: "", label: "All keys" },
-    ...(keys.data ?? []).map((k) => ({
-      value: k.id,
-      label: k.name || k.key_prefix,
-    })),
-  ];
 
   const hasFilters =
     status !== "all" ||
@@ -404,14 +396,14 @@ export default function Requests() {
                   options={modelOptions}
                   hasSearch={modelOptions.length > 8}
                 />
-                <Selector
+                <EntityPicker
+                  kind="key"
                   label="Key"
                   isLabelHidden
+                  size="sm"
                   placeholder="All keys"
                   value={keyId}
                   onChange={setKeyId}
-                  options={keyOptions}
-                  hasSearch={keyOptions.length > 8}
                 />
               </HStack>
             }

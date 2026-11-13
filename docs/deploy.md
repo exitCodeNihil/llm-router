@@ -105,6 +105,11 @@ usage it held (up to 200,000 events) when it's back.
 A new join token stops further gateways joining with the old one; running ones carry on. Deleting a
 group stops its gateways getting config at once, and they stop serving within 15 minutes.
 
+A gateway that stops syncing turns red on the Gateways page and disappears from it after 10 minutes.
+Its row is deleted from the database after 7 days, when it joins, and in the twice-daily maintenance
+pass. An admin can remove a stopped one at once with **Remove**; if it is in fact still running, it
+is refused on its next sync and rejoins by itself as a new instance.
+
 Gateways trace requests as the control plane's own `/v1` does: they continue a caller's
 `traceparent`, return `X-Llmr-Trace-Id`, and capture prompts and responses only when the capture
 policy and a destination that takes the group's traffic with content both want them. Captured content

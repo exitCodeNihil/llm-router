@@ -148,6 +148,7 @@ scraped twice.
 | `LLMRouterHighErrorRate` | More than 5% of `/v1` requests end in 5xx | 10m |
 | `LLMRouterUsageDropped` | Usage events were dropped in the last 10 minutes | |
 | `LLMRouterUsageFlushFailing` | More than 3 writes of usage to Postgres failed in 10 minutes | |
+| `LLMRouterAuditWriteFailing` | Writes to the audit log failed in the last 10 minutes | |
 | `LLMRouterSnapshotStale` | The config in use is over 5 minutes old, for 5 minutes: Postgres is not answering | |
 | `LLMRouterDatabasePoolSaturated` | Every connection of a pool has been in use for 5 minutes | |
 | `LLMRouterTelemetryDestinationFailing` | A telemetry destination keeps failing (`llmr_telemetry_destination_failing{destination}`) | 10m |

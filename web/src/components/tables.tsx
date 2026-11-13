@@ -1,7 +1,10 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTableSortable, useTableSortableState } from "@astryxdesign/core/Table";
 import type { TablePlugin, TableSortState } from "@astryxdesign/core/Table";
 import { TextInput } from "@astryxdesign/core/TextInput";
+import { Button } from "@astryxdesign/core/Button";
+import { Center } from "@astryxdesign/core/Center";
+import { VStack } from "@astryxdesign/core/Stack";
 
 /**
  * Search + click-to-sort for every list page, so each table behaves the same
@@ -57,5 +60,41 @@ export function SearchBox({
       hasClear
       width={220}
     />
+  );
+}
+
+/** The search text typed so far, and the trimmed value to query the server with once typing pauses. */
+export function useServerSearch(delayMs = 300) {
+  const [query, setQuery] = useState("");
+  const [q, setQ] = useState("");
+  useEffect(() => {
+    const t = setTimeout(() => setQ(query.trim()), delayMs);
+    return () => clearTimeout(t);
+  }, [query, delayMs]);
+  return { query, setQuery, q };
+}
+
+/** Footer of a paged table. */
+export function LoadMore({
+  hasNextPage,
+  isFetchingNextPage,
+  fetchNextPage,
+}: {
+  hasNextPage: boolean;
+  isFetchingNextPage: boolean;
+  fetchNextPage: () => void;
+}) {
+  if (!hasNextPage) return null;
+  return (
+    <Center>
+      <VStack padding={4}>
+        <Button
+          label={isFetchingNextPage ? "Loading…" : "Load more"}
+          variant="secondary"
+          isLoading={isFetchingNextPage}
+          onClick={() => fetchNextPage()}
+        />
+      </VStack>
+    </Center>
   );
 }

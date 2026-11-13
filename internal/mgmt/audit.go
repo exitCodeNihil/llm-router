@@ -116,6 +116,7 @@ var auditPolicy = map[string]detailPolicy{
 var auditSkip = map[string]bool{
 	"POST /api/chat/completions": true,
 	"POST /api/chats":            true,
+	"POST /api/lookup":           true, // a read: POST only so the ids fit in the body
 	"PUT /api/chats/{id}":        true,
 	"DELETE /api/chats/{id}":     true,
 	"/api/workspaces/{id}/ide/":  true,

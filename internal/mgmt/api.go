@@ -106,6 +106,7 @@ func (m *Server) routes(handle func(string, http.Handler)) {
 	handle("DELETE /api/teams/{id}/members/{uid}", ha(m.removeTeamMember))
 
 	handle("GET /api/keys", ha(m.listKeys))
+	handle("POST /api/lookup", ha(m.lookup))
 	handle("POST /api/keys", ha(m.createKey))
 	handle("PATCH /api/keys/{id}", ha(m.patchKey))
 	handle("DELETE /api/keys/{id}", ha(m.deleteKey))
@@ -390,6 +391,26 @@ func (m *Server) deleteRow(table string) http.HandlerFunc {
 // --- users ---
 
 func (m *Server) listUsers(w http.ResponseWriter, r *http.Request) {
+	if p, paged, ok := readPage(w, r); !ok {
+		return
+	} else if paged {
+		l := pagedList{
+			sel: `SELECT u.id, u.email, u.name, u.role, u.budget_usd, u.budget_period, u.rpm_limit, u.tpm_limit, u.tags,
+				u.allowed_models, u.disabled, u.created_at FROM users u`,
+			cols: []string{"u.email", "u.id"}, casts: []string{"citext", "uuid"}, fields: []string{"email", "id"},
+			search: []string{"u.email", "u.name"},
+		}
+		if t := r.URL.Query().Get("not_in_team"); t != "" {
+			id, err := uuid.Parse(t)
+			if err != nil {
+				httpError(w, http.StatusBadRequest, "invalid not_in_team")
+				return
+			}
+			l.where = append(l.where, `NOT EXISTS (SELECT 1 FROM team_members tm WHERE tm.user_id = u.id AND tm.team_id = `+l.arg(id)+`)`)
+		}
+		m.servePage(w, r, p, l)
+		return
+	}
 	m.list(w, r, `SELECT id, email, name, role, budget_usd, budget_period, rpm_limit, tpm_limit, tags, allowed_models, disabled, created_at FROM users ORDER BY created_at`)
 }
 
@@ -451,6 +472,20 @@ func (m *Server) createUser(w http.ResponseWriter, r *http.Request) {
 // listTeamsScoped: admins see every team, members only their own.
 func (m *Server) listTeamsScoped(w http.ResponseWriter, r *http.Request) {
 	c := CallerFrom(r.Context())
+	if p, paged, ok := readPage(w, r); !ok {
+		return
+	} else if paged {
+		l := pagedList{
+			sel:  `SELECT t.id, t.name, t.budget_usd, t.budget_period, t.rpm_limit, t.tpm_limit, t.tags, t.allowed_models, t.created_at FROM teams t`,
+			cols: []string{"t.name", "t.id"}, casts: []string{"text", "uuid"}, fields: []string{"name", "id"},
+			search: []string{"t.name"},
+		}
+		if !c.IsAdmin {
+			l.where = append(l.where, `t.id IN (SELECT team_id FROM team_members WHERE user_id = `+l.arg(c.UserID)+`)`)
+		}
+		m.servePage(w, r, p, l)
+		return
+	}
 	if c.IsAdmin {
 		m.list(w, r, `SELECT id, name, budget_usd, budget_period, rpm_limit, tpm_limit, tags, allowed_models, created_at FROM teams ORDER BY created_at`)
 		return
@@ -464,6 +499,24 @@ func (m *Server) listTeamMembers(w http.ResponseWriter, r *http.Request) {
 	teamID := r.PathValue("id")
 	if !c.InTeam(teamID) {
 		httpError(w, http.StatusForbidden, "not a member of this team")
+		return
+	}
+	if p, paged, ok := readPage(w, r); !ok {
+		return
+	} else if paged {
+		id, err := uuid.Parse(teamID)
+		if err != nil {
+			httpError(w, http.StatusBadRequest, "invalid team id")
+			return
+		}
+		l := pagedList{
+			sel: `SELECT tm.user_id, u.email, u.name, tm.role, tm.budget_usd, tm.budget_period FROM team_members tm
+				JOIN users u ON u.id = tm.user_id`,
+			cols: []string{"u.email", "tm.user_id"}, casts: []string{"citext", "uuid"}, fields: []string{"email", "user_id"},
+			search: []string{"u.email", "u.name"},
+		}
+		l.where = append(l.where, "tm.team_id = "+l.arg(id))
+		m.servePage(w, r, p, l)
 		return
 	}
 	m.list(w, r, `SELECT tm.user_id, u.email, u.name, tm.role, tm.budget_usd, tm.budget_period FROM team_members tm
@@ -640,6 +693,12 @@ const keyCols = `id, key_prefix, name, user_id, team_id, allowed_models, budget_
 // listKeys: admins see all keys; others see their own keys and their teams' keys.
 func (m *Server) listKeys(w http.ResponseWriter, r *http.Request) {
 	c := CallerFrom(r.Context())
+	if p, paged, ok := readPage(w, r); !ok {
+		return
+	} else if paged {
+		m.pagedKeys(w, r, p, c)
+		return
+	}
 	if c.IsAdmin {
 		m.list(w, r, `SELECT `+keyCols+` FROM api_keys ORDER BY created_at`)
 		return
@@ -647,6 +706,28 @@ func (m *Server) listKeys(w http.ResponseWriter, r *http.Request) {
 	m.list(w, r, `SELECT `+keyCols+` FROM api_keys
 		WHERE user_id = $1 OR team_id = ANY(SELECT team_id FROM team_members WHERE user_id = $1)
 		ORDER BY created_at`, c.UserID)
+}
+
+// pagedKeys also names each key's owners. A non-admin sees an owner's email
+// only when it is themself or someone they share a team with, so a team key
+// created by an outsider does not reveal that address.
+func (m *Server) pagedKeys(w http.ResponseWriter, r *http.Request, p pageParams, c *Caller) {
+	l := pagedList{
+		cols: []string{"k.created_at", "k.id"}, casts: []string{"timestamptz", "uuid"}, fields: []string{"created_at", "id"},
+		desc: true,
+	}
+	ownerEmail := "u.email"
+	if !c.IsAdmin {
+		me := l.arg(c.UserID)
+		ownerEmail = `CASE WHEN u.id = ` + me + ` OR u.id IN (SELECT user_id FROM team_members WHERE team_id IN
+			(SELECT team_id FROM team_members WHERE user_id = ` + me + `)) THEN u.email END`
+		l.where = append(l.where, `(k.user_id = `+me+` OR k.team_id IN (SELECT team_id FROM team_members WHERE user_id = `+me+`))`)
+	}
+	l.sel = `SELECT k.id, k.key_prefix, k.name, k.user_id, k.team_id, k.allowed_models, k.budget_usd, k.budget_period,
+		k.rpm_limit, k.tpm_limit, k.expires_at, k.tags, k.disabled, k.created_at, ` + ownerEmail + ` AS user_email, t.name AS team_name
+		FROM api_keys k LEFT JOIN users u ON u.id = k.user_id LEFT JOIN teams t ON t.id = k.team_id`
+	l.search = []string{"k.name", "k.key_prefix", ownerEmail, "t.name"}
+	m.servePage(w, r, p, l)
 }
 
 // canManageKey: admins manage any key; team admins their team's keys; users their own.

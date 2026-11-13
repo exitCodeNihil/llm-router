@@ -69,6 +69,9 @@ export interface ApiKey {
   disabled: boolean;
   tags: string[] | null;
   created_at: string;
+  /** Owner labels, present on the paged list only. */
+  user_email?: string | null;
+  team_name?: string | null;
 }
 
 export type ProviderType = "anthropic" | "azure" | "openai_compatible" | "gcp_vertex" | "openrouter";

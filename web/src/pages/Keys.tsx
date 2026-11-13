@@ -25,11 +25,10 @@ import {
   useDeleteKey,
   useDeployments,
   useDestinations,
-  useKeys,
+  useKeysPage,
   useTeams,
   useTelemetry,
   useUpdateKey,
-  useUsers,
 } from "../lib/hooks";
 import { budgetLabel } from "../lib/format";
 import { Empty, ErrorState, Loading, Page } from "../components/Page";
@@ -52,14 +51,17 @@ import {
   IconTerminal,
   IconTrash,
 } from "../components/icons";
-import { SearchBox, useTableTools } from "../components/tables";
+import { LoadMore, SearchBox, useServerSearch } from "../components/tables";
+import { EntityPicker } from "../components/EntityPicker";
 
 type OwnerType = "self" | "team" | "user";
 
 /** What key creation hands back: the secret and the models it was scoped to. */
 type Created = { key: string; models: string[] | null };
 
-function ownerLabel(k: ApiKey, teamName?: string, userEmail?: string): string {
+function ownerLabel(k: ApiKey): string {
+  const teamName = k.team_name ?? undefined;
+  const userEmail = k.user_email ?? undefined;
   // A member's team key names both: the team pays, and so does the member.
   if (k.team_id && k.user_id)
     return `Team · ${teamName ?? "?"} · ${userEmail ?? "member"}`;
@@ -149,7 +151,6 @@ function KeyForm({
   const update = useUpdateKey();
   const showToast = useToast();
   const teams = useTeams();
-  const users = useUsers(me.is_admin);
   // Admins pick from the routing table; everyone else from the alias list
   // the playground uses, which is what a member's key can call anyway.
   const deployments = useDeployments(me.is_admin);
@@ -295,17 +296,13 @@ function KeyForm({
         )}
 
         {!editing && ownerType === "user" && (
-          <Selector
+          <EntityPicker
+            kind="user"
             label="User"
             value={userId}
             onChange={setUserId}
-            placeholder="Select a user…"
+            placeholder="Search users…"
             isRequired
-            hasSearch
-            options={(users.data ?? []).map((u) => ({
-              value: u.id,
-              label: u.email,
-            }))}
           />
         )}
 
@@ -386,9 +383,9 @@ function KeyForm({
 
 // ── Page ────────────────────────────────────────────────────────
 export default function Keys({ me }: { me: Me }) {
-  const keys = useKeys();
-  const teams = useTeams();
-  const users = useUsers(me.is_admin);
+  const search = useServerSearch();
+  const keys = useKeysPage({ q: search.q });
+  const rows = useMemo(() => keys.data?.pages.flatMap((p) => p.items) ?? [], [keys.data]);
   const del = useDeleteKey();
   const update = useUpdateKey();
   const showToast = useToast();
@@ -407,11 +404,6 @@ export default function Keys({ me }: { me: Me }) {
   const [secret, setSecret] = useState<Created | null>(null);
   const [connecting, setConnecting] = useState<ApiKey | null>(null);
   const [deleting, setDeleting] = useState<ApiKey | null>(null);
-
-  const teamName = (id: string | null) =>
-    teams.data?.find((t) => t.id === id)?.name;
-  const userEmail = (id: string | null) =>
-    users.data?.find((u) => u.id === id)?.email;
 
   const openCreate = () => {
     setEditing(null);
@@ -438,7 +430,6 @@ export default function Keys({ me }: { me: Me }) {
     {
       key: "name",
       header: "Name",
-      sortable: true,
       width: proportional(1.4),
       renderCell: (k) => (
         <VStack gap={0}>
@@ -453,8 +444,7 @@ export default function Keys({ me }: { me: Me }) {
       key: "owner",
       header: "Owner",
       width: proportional(2),
-      renderCell: (k) =>
-        ownerLabel(k, teamName(k.team_id), userEmail(k.user_id)),
+      renderCell: (k) => ownerLabel(k),
     },
     {
       key: "allowed_models",
@@ -476,14 +466,12 @@ export default function Keys({ me }: { me: Me }) {
     },
     {
       key: "budget_usd",
-      sortable: true,
       header: "Budget",
       width: pixel(120),
       renderCell: (k) => budgetLabel(k.budget_usd, k.budget_period),
     },
     {
       key: "expires_at",
-      sortable: true,
       header: "Expires",
       width: pixel(110),
       renderCell: (k) =>
@@ -559,15 +547,6 @@ export default function Keys({ me }: { me: Me }) {
     ? columns
     : columns.filter((c) => c.key !== "trace");
 
-  const tools = useTableTools(
-    keys.data as Array<ApiKey & Record<string, unknown>> | undefined,
-    {
-      search: (k) =>
-        `${k.name} ${k.key_prefix} ${ownerLabel(k, teamName(k.team_id), userEmail(k.user_id))} ${(k.tags ?? []).join(" ")}`,
-      defaultSort: [{ sortKey: "name", direction: "ascending" }],
-    },
-  );
-
   const newKeyButton = (
     <Button
       label="New key"
@@ -585,8 +564,8 @@ export default function Keys({ me }: { me: Me }) {
       action={
         <HStack gap={2} vAlign="center">
           <SearchBox
-            value={tools.query}
-            onChange={tools.setQuery}
+            value={search.query}
+            onChange={search.setQuery}
             placeholder="Search keys…"
           />
           {newKeyButton}
@@ -598,23 +577,29 @@ export default function Keys({ me }: { me: Me }) {
           <Loading />
         ) : keys.error ? (
           <ErrorState error={keys.error} onRetry={() => keys.refetch()} />
-        ) : (keys.data?.length ?? 0) === 0 ? (
-          <Empty
-            title="No API keys yet"
-            description="Create a key to let a client call the gateway with scoped budgets and limits."
-            action={newKeyButton}
-          />
+        ) : rows.length === 0 ? (
+          search.q ? (
+            <Empty title="No matching keys" description="Search looks at name, prefix and owner." />
+          ) : (
+            <Empty
+              title="No API keys yet"
+              description="Create a key to let a client call the gateway with scoped budgets and limits."
+              action={newKeyButton}
+            />
+          )
         ) : (
-          <Table
-            data={tools.rows}
-            plugins={tools.plugins}
-            columns={visibleColumns}
-            idKey="id"
-            density="balanced"
-            dividers="rows"
-            hasHover
-            textOverflow="truncate"
-          />
+          <VStack gap={0}>
+            <Table
+              data={rows as Array<ApiKey & Record<string, unknown>>}
+              columns={visibleColumns}
+              idKey="id"
+              density="balanced"
+              dividers="rows"
+              hasHover
+              textOverflow="truncate"
+            />
+            <LoadMore {...keys} />
+          </VStack>
         )}
       </Card>
 

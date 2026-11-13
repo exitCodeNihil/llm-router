@@ -82,14 +82,14 @@ await page.getByLabel(/^Name/).first().fill("pilot-test-key");
 await page.waitForTimeout(200);
 check("submit still gated without an owner", await submit.isDisabled());
 
-// With hasSearch enabled Astryx puts role="combobox" on the search input and
-// leaves the trigger as a button with aria-haspopup/-expanded/-controls,
-// which is the correct ARIA 1.2 combobox-with-textbox pattern.
-const userTrigger = page.locator("dialog button", { hasText: "Select a user" }).first();
-check("searchable selector trigger is announced", (await userTrigger.getAttribute("aria-haspopup")) === "listbox");
-await userTrigger.click();
-await page.waitForTimeout(350);
-check("search input owns the combobox role", await page.getByRole("combobox", { name: /search/i }).isVisible());
+// The owner is a server-searched Typeahead: the input is the combobox, the
+// options come from /api/users?q= after a 300 ms pause in typing.
+const userInput = page.locator("dialog").getByRole("combobox", { name: /User/ });
+check("owner picker is a combobox", await userInput.isVisible());
+await userInput.click();
+await userInput.fill("@");
+await page.getByRole("option").first().waitFor({ timeout: 5000 });
+check("typing lists matching users", (await page.getByRole("option").count()) > 0);
 await page.getByRole("option").first().click();
 await page.waitForTimeout(300);
 check("submit enabled once name + owner set", await submit.isEnabled());

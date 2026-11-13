@@ -26,6 +26,7 @@ import type { DataRule, GatewayGroup, Node, NodesHistoryResponse } from "../lib/
 import {
   useCreateGatewayGroup,
   useDeleteGatewayGroup,
+  useRemoveGatewayInstance,
   useGatewayGroups,
   useNodes,
   useNodesHistory,
@@ -66,6 +67,9 @@ function UnservedBadge({ node }: { node: Node }) {
 // ── Live cluster (self + peers) ─────────────────────────────────
 function ClusterTable() {
   const nodes = useNodes();
+  const remove = useRemoveGatewayInstance();
+  const showToast = useToast();
+  const [removing, setRemoving] = useState<Node | null>(null);
 
   const columns: TableColumn<Node & Record<string, unknown>>[] = [
     {
@@ -156,6 +160,17 @@ function ClusterTable() {
       align: "end",
       renderCell: (n) => uptime(n.uptime_s),
     },
+    {
+      key: "actions",
+      header: <VisuallyHidden>Actions</VisuallyHidden>,
+      width: pixel(96),
+      align: "end",
+      // Only a gateway that has stopped syncing can be removed from here.
+      renderCell: (n) =>
+        n.role === "gateway" && n.status === "err" ? (
+          <Button label="Remove" variant="ghost" size="sm" onClick={() => setRemoving(n)} />
+        ) : null,
+    },
   ];
 
   return (
@@ -186,6 +201,24 @@ function ClusterTable() {
           />
         )}
       </VStack>
+      <Confirm
+        target={removing}
+        title="Remove gateway"
+        description={`Remove "${removing?.name}" from the cluster? It has stopped syncing. If it is in fact still running, it is refused on its next sync and rejoins on its own as a new gateway, so its history starts over.`}
+        actionLabel="Remove"
+        isLoading={remove.isPending}
+        onCancel={() => setRemoving(null)}
+        onConfirm={async () => {
+          if (!removing) return;
+          try {
+            await remove.mutateAsync(removing.id);
+            showToast({ body: "Gateway removed" });
+          } catch (err) {
+            showToast({ body: err instanceof Error ? err.message : "Failed", type: "error" });
+          }
+          setRemoving(null);
+        }}
+      />
     </Card>
   );
 }

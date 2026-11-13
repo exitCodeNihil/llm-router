@@ -53,8 +53,10 @@ await page.getByRole("button", { name: "New key" }).first().click();
 await page.waitForTimeout(400);
 
 await page.getByLabel(/^Name/).first().fill(NAME);
-await page.locator("dialog button", { hasText: "Select a user" }).first().click();
-await page.waitForTimeout(300);
+const owner = page.locator("dialog").getByRole("combobox", { name: /User/ });
+await owner.click();
+await owner.fill("@");
+await page.getByRole("option").first().waitFor({ timeout: 5000 });
 await page.getByRole("option").first().click();
 await page.waitForTimeout(200);
 

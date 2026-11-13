@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Card } from "@astryxdesign/core/Card";
 import { VisuallyHidden } from "@astryxdesign/core/VisuallyHidden";
 import { HStack, VStack } from "@astryxdesign/core/Stack";
@@ -25,7 +25,7 @@ import {
   useEraseUser,
   useSetUserPassword,
   useUpdateUser,
-  useUsers,
+  useUsersPage,
 } from "../lib/hooks";
 import { budgetLabel } from "../lib/format";
 import { Empty, ErrorState, Loading, Page } from "../components/Page";
@@ -42,7 +42,7 @@ import {
   type LimitsState,
 } from "../components/forms";
 import { IconEdit, IconPlus, IconTrash } from "../components/icons";
-import { SearchBox, useTableTools } from "../components/tables";
+import { LoadMore, SearchBox, useServerSearch } from "../components/tables";
 
 function UserForm({
   editing,
@@ -278,7 +278,9 @@ function DeletedUsers() {
 }
 
 export default function Users() {
-  const users = useUsers();
+  const search = useServerSearch();
+  const users = useUsersPage({ q: search.q });
+  const rows = useMemo(() => users.data?.pages.flatMap((p) => p.items) ?? [], [users.data]);
   const update = useUpdateUser();
   const del = useDeleteUser();
   const erase = useEraseUser();
@@ -309,7 +311,6 @@ export default function Users() {
     {
       key: "email",
       header: "User",
-      sortable: true,
       width: proportional(1.5),
       renderCell: (u) => (
         <VStack gap={0}>
@@ -327,7 +328,6 @@ export default function Users() {
     {
       key: "role",
       header: "Role",
-      sortable: true,
       width: pixel(96),
       renderCell: (u) => (
         <Badge
@@ -357,7 +357,6 @@ export default function Users() {
     {
       key: "created_at",
       header: "Added",
-      sortable: true,
       width: pixel(110),
       renderCell: (u) => <Timestamp value={u.created_at} format="date" />,
     },
@@ -406,14 +405,6 @@ export default function Users() {
     },
   ];
 
-  const tools = useTableTools(
-    users.data as Array<User & Record<string, unknown>> | undefined,
-    {
-      search: (u) => `${u.email} ${u.role} ${(u.tags ?? []).join(" ")}`,
-      defaultSort: [{ sortKey: "email", direction: "ascending" }],
-    },
-  );
-
   const addButton = (
     <Button
       label="New user"
@@ -434,8 +425,8 @@ export default function Users() {
       action={
         <HStack gap={2} vAlign="center">
           <SearchBox
-            value={tools.query}
-            onChange={tools.setQuery}
+            value={search.query}
+            onChange={search.setQuery}
             placeholder="Search users…"
           />
           {addButton}
@@ -447,23 +438,29 @@ export default function Users() {
           <Loading />
         ) : users.error ? (
           <ErrorState error={users.error} onRetry={() => users.refetch()} />
-        ) : (users.data?.length ?? 0) === 0 ? (
-          <Empty
-            title="No users yet"
-            description="Add a user, or enable SSO auto-provisioning."
-            action={addButton}
-          />
+        ) : rows.length === 0 ? (
+          search.q ? (
+            <Empty title="No matching users" description="Search looks at email and name." />
+          ) : (
+            <Empty
+              title="No users yet"
+              description="Add a user, or enable SSO auto-provisioning."
+              action={addButton}
+            />
+          )
         ) : (
-          <Table
-            data={tools.rows}
-            plugins={tools.plugins}
-            columns={columns}
-            idKey="id"
-            density="balanced"
-            dividers="rows"
-            hasHover
-            textOverflow="truncate"
-          />
+          <VStack gap={0}>
+            <Table
+              data={rows as Array<User & Record<string, unknown>>}
+              columns={columns}
+              idKey="id"
+              density="balanced"
+              dividers="rows"
+              hasHover
+              textOverflow="truncate"
+            />
+            <LoadMore {...users} />
+          </VStack>
         )}
       </Card>
 

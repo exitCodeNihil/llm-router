@@ -23,11 +23,11 @@ import { Link } from "react-router-dom";
 
 import { Empty, ErrorState, Loading, Page } from "../components/Page";
 import { ChartCard, SpendArea, Stat } from "../components/charts";
+import { EntityPicker } from "../components/EntityPicker";
 import {
   useAvailableModels,
   useMe,
   useDeployments,
-  useKeys,
   useProviders,
   useTeams,
   useUsageBreakdown,
@@ -77,7 +77,6 @@ export default function Analytics() {
   const providers = useProviders(isAdmin);
   const deployments = useDeployments(isAdmin);
   const available = useAvailableModels(!isAdmin);
-  const keys = useKeys();
   const teams = useTeams();
 
   const set = <K extends keyof UsageQuery>(k: K, v: UsageQuery[K]) =>
@@ -292,18 +291,12 @@ export default function Analytics() {
                   })),
                 ]}
               />
-              <Selector
+              <EntityPicker
+                kind="key"
                 label="API key"
                 value={q.key_id ?? ""}
                 onChange={(v) => set("key_id", v)}
-                hasSearch={(keys.data ?? []).length > 8}
-                options={[
-                  { value: "", label: "All keys" },
-                  ...(keys.data ?? []).map((k) => ({
-                    value: k.id,
-                    label: k.name || k.key_prefix,
-                  })),
-                ]}
+                placeholder="All keys"
               />
               <Selector
                 label="Team"

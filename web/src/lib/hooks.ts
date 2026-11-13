@@ -81,19 +81,55 @@ function useInvalidatingMutation<V, R = unknown>(
 }
 
 // ── Users ───────────────────────────────────────────────────────
-export function useUsers(enabled = true) {
-  return useQuery({
-    queryKey: ["users"],
-    queryFn: async () =>
-      (await api.get<User[]>("/api/users")).map((u) => ({
-        ...u,
-        budget_usd: u.budget_usd == null ? null : num(u.budget_usd),
-        rpm_limit: u.rpm_limit == null ? null : num(u.rpm_limit),
-        tpm_limit: u.tpm_limit == null ? null : num(u.tpm_limit),
-      })),
+const coerceUser = (u: User): User => ({
+  ...u,
+  budget_usd: u.budget_usd == null ? null : num(u.budget_usd),
+  rpm_limit: u.rpm_limit == null ? null : num(u.rpm_limit),
+  tpm_limit: u.tpm_limit == null ? null : num(u.tpm_limit),
+});
+
+// ── Paged lists ─────────────────────────────────────────────────
+// The paged keys extend the unpaged ones (["users", "page", …]), so every
+// mutation that invalidates ["users"] refreshes the loaded pages too.
+const PAGE = 50;
+interface Paged<T> {
+  items: T[];
+  next: string;
+}
+
+function usePaged<T, R>(
+  key: QueryKey,
+  path: string,
+  params: Record<string, string | undefined>,
+  map: (row: T) => R,
+  enabled = true,
+) {
+  return useInfiniteQuery({
+    queryKey: key,
     enabled,
+    initialPageParam: "",
+    queryFn: async ({ pageParam }) => {
+      const p = new URLSearchParams({ limit: String(PAGE) });
+      for (const [k, v] of Object.entries(params)) if (v) p.set(k, v);
+      if (pageParam) p.set("after", pageParam);
+      const r = await api.get<Paged<T>>(`${path}?${p}`);
+      return { items: (r.items ?? []).map(map), next: r.next };
+    },
+    getNextPageParam: (last) => last.next || undefined,
   });
 }
+
+/** One page of users (admin), searched on the server. `notInTeam` leaves out that team's members. */
+export function useUsersPage(f: { q?: string; notInTeam?: string; enabled?: boolean } = {}) {
+  return usePaged(
+    ["users", "page", f.q ?? "", f.notInTeam ?? ""],
+    "/api/users",
+    { q: f.q, not_in_team: f.notInTeam },
+    coerceUser,
+    f.enabled ?? true,
+  );
+}
+
 export const useCreateUser = () =>
   useInvalidatingMutation(
     (b: Partial<User>) => api.post("/api/users", b),
@@ -103,17 +139,17 @@ export const useUpdateUser = () =>
   useInvalidatingMutation(
     ({ id, ...b }: { id: string } & Partial<User>) =>
       api.patch(`/api/users/${id}`, b),
-    [["users"]],
+    [["users"], ["lookup"]],
   );
 export const useDeleteUser = () =>
   useInvalidatingMutation(
     (id: string) => api.del(`/api/users/${id}`),
-    [["users"], ["deleted-users"]],
+    [["users"], ["deleted-users"], ["lookup"]],
   );
 export const useEraseUser = () =>
   useInvalidatingMutation(
     (id: string) => api.post<EraseResult>(`/api/users/${id}/erase`, {}),
-    [["users"], ["deleted-users"]],
+    [["users"], ["deleted-users"], ["lookup"]],
   );
 export function useDeletedUsers() {
   return useQuery({
@@ -128,16 +164,22 @@ export const useSetUserPassword = () =>
   });
 
 // ── Teams ───────────────────────────────────────────────────────
+const coerceTeam = (t: Team): Team => ({
+  ...t,
+  budget_usd: t.budget_usd == null ? null : num(t.budget_usd),
+  rpm_limit: t.rpm_limit == null ? null : num(t.rpm_limit),
+  tpm_limit: t.tpm_limit == null ? null : num(t.tpm_limit),
+});
+
+export function useTeamsPage(f: { q?: string } = {}) {
+  return usePaged(["teams", "page", f.q ?? ""], "/api/teams", { q: f.q }, coerceTeam);
+}
+
+/** Every team the caller can see: teams are few, so selectors load them all. */
 export function useTeams() {
   return useQuery({
     queryKey: ["teams"],
-    queryFn: async () =>
-      (await api.get<Team[]>("/api/teams")).map((t) => ({
-        ...t,
-        budget_usd: t.budget_usd == null ? null : num(t.budget_usd),
-        rpm_limit: t.rpm_limit == null ? null : num(t.rpm_limit),
-        tpm_limit: t.tpm_limit == null ? null : num(t.tpm_limit),
-      })),
+    queryFn: async () => (await api.get<Team[]>("/api/teams")).map(coerceTeam),
   });
 }
 export const useCreateTeam = () =>
@@ -149,31 +191,35 @@ export const useUpdateTeam = () =>
   useInvalidatingMutation(
     ({ id, ...b }: { id: string } & Partial<Team>) =>
       api.patch(`/api/teams/${id}`, b),
-    [["teams"]],
+    [["teams"], ["keys"], ["lookup"]],
   );
 export const useDeleteTeam = () =>
   useInvalidatingMutation(
     ({ id, revokeKeys }: { id: string; revokeKeys?: boolean }) =>
       api.del(`/api/teams/${id}${revokeKeys ? "?revoke_keys=true" : ""}`),
-    [["teams"], ["keys"]],
+    [["teams"], ["keys"], ["lookup"]],
   );
 
-export function useTeamMembers(teamId: string | null) {
-  return useQuery({
-    queryKey: ["team-members", teamId],
-    queryFn: async () =>
-      (await api.get<TeamMember[]>(`/api/teams/${teamId}/members`)).map((m) => ({
-        ...m,
-        budget_usd: m.budget_usd == null ? null : num(m.budget_usd),
-      })),
-    enabled: !!teamId,
-  });
+export function useTeamMembersPage(teamId: string | null, f: { q?: string } = {}) {
+  return usePaged(
+    ["team-members", teamId, "page", f.q ?? ""],
+    `/api/teams/${teamId}/members`,
+    { q: f.q },
+    coerceMember,
+    !!teamId,
+  );
 }
+
+const coerceMember = (m: TeamMember): TeamMember => ({
+  ...m,
+  budget_usd: m.budget_usd == null ? null : num(m.budget_usd),
+});
+
 export const useAddMember = (teamId: string) =>
   useInvalidatingMutation(
     (b: { user_id: string; role: string }) =>
       api.post(`/api/teams/${teamId}/members`, b),
-    [["team-members", teamId]],
+    [["team-members", teamId], ["users"], ["lookup"]],
   );
 export const useUpdateMember = (teamId: string) =>
   useInvalidatingMutation(
@@ -184,20 +230,43 @@ export const useUpdateMember = (teamId: string) =>
 export const useRemoveMember = (teamId: string) =>
   useInvalidatingMutation(
     (uid: string) => api.del(`/api/teams/${teamId}/members/${uid}`),
-    [["team-members", teamId]],
+    [["team-members", teamId], ["users"], ["lookup"]],
   );
 
 // ── API keys ────────────────────────────────────────────────────
-export function useKeys() {
+const coerceKey = (k: ApiKey): ApiKey => ({
+  ...k,
+  budget_usd: k.budget_usd == null ? null : num(k.budget_usd),
+  rpm_limit: k.rpm_limit == null ? null : num(k.rpm_limit),
+  tpm_limit: k.tpm_limit == null ? null : num(k.tpm_limit),
+});
+
+/** One page of keys with their owners' labels (user_email, team_name). */
+export function useKeysPage(f: { q?: string } = {}) {
+  return usePaged(["keys", "page", f.q ?? ""], "/api/keys", { q: f.q }, coerceKey);
+}
+
+/**
+ * Names for ids already on screen: users → email, keys → name, teams → name.
+ * Ids the caller may not see come back missing. At most 100 of each kind.
+ */
+export function useLookup(ids: { users?: string[]; keys?: string[]; teams?: string[] }) {
+  const norm = (a?: string[]) => [...new Set((a ?? []).filter(Boolean))].sort().slice(0, 100);
+  const users = norm(ids.users);
+  const keys = norm(ids.keys);
+  const teams = norm(ids.teams);
   return useQuery({
-    queryKey: ["keys"],
-    queryFn: async () =>
-      (await api.get<ApiKey[]>("/api/keys")).map((k) => ({
-        ...k,
-        budget_usd: k.budget_usd == null ? null : num(k.budget_usd),
-        rpm_limit: k.rpm_limit == null ? null : num(k.rpm_limit),
-        tpm_limit: k.tpm_limit == null ? null : num(k.tpm_limit),
-      })),
+    queryKey: ["lookup", users, keys, teams],
+    enabled: users.length + keys.length + teams.length > 0,
+    staleTime: 60_000,
+    queryFn: async () => {
+      const r = await api.post<{
+        users?: Record<string, string>;
+        keys?: Record<string, string>;
+        teams?: Record<string, string>;
+      }>("/api/lookup", { users, keys, teams });
+      return { users: r.users ?? {}, keys: r.keys ?? {}, teams: r.teams ?? {} };
+    },
   });
 }
 export const useCreateKey = () =>
@@ -210,12 +279,12 @@ export const useUpdateKey = () =>
   useInvalidatingMutation(
     ({ id, ...b }: { id: string } & Record<string, unknown>) =>
       api.patch(`/api/keys/${id}`, b),
-    [["keys"]],
+    [["keys"], ["lookup"]],
   );
 export const useDeleteKey = () =>
   useInvalidatingMutation(
     (id: string) => api.del(`/api/keys/${id}`),
-    [["keys"]],
+    [["keys"], ["lookup"]],
   );
 
 // ── Providers ───────────────────────────────────────────────────
@@ -586,6 +655,11 @@ export const useRotateGatewayToken = () =>
   useInvalidatingMutation(
     (id: string) => api.post<{ join_token: string }>(`/api/gateway-groups/${id}/rotate-token`, {}),
     [["gateway-groups"]],
+  );
+export const useRemoveGatewayInstance = () =>
+  useInvalidatingMutation(
+    (id: string) => api.del(`/api/gateway-instances/${id}`),
+    [["nodes"], ["nodes-history"], ["gateway-groups"]],
   );
 export const useDeleteGatewayGroup = () =>
   useInvalidatingMutation(

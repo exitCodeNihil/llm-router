@@ -129,6 +129,12 @@ spec:
           annotations:
             summary: "{{ "{{ $labels.pod }}" }} cannot write usage to Postgres"
             description: Writes are being retried and the queue is filling; once it is full, usage is dropped. Check Postgres.
+        - alert: LLMRouterAuditWriteFailing
+          expr: increase(llmr_audit_write_failures_total{ {{- $sel -}} }[10m]) > 0
+          labels: {severity: warning}
+          annotations:
+            summary: "{{ "{{ $labels.pod }}" }} cannot write the audit log"
+            description: Administrative actions are being done without being recorded; see the logs and check Postgres.
         - alert: LLMRouterSnapshotStale
           expr: llmr_snapshot_age_seconds{ {{- $sel -}} } > 300
           for: 5m

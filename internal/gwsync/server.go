@@ -9,6 +9,7 @@ package gwsync
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/exitcodenihil/llm-router/internal/auth"
 	"github.com/exitcodenihil/llm-router/internal/limits"
@@ -594,4 +596,10 @@ func trim(s string, n int) string {
 		return s[:n]
 	}
 	return s
+}
+
+// PruneStale deletes gateway instances not seen for a week, in every group.
+func PruneStale(ctx context.Context, pool *pgxpool.Pool) error {
+	_, err := pool.Exec(ctx, `DELETE FROM gateway_instances WHERE last_seen_at < $1`, time.Now().Add(-staleInstance))
+	return err
 }

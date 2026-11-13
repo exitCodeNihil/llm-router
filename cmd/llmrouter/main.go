@@ -163,6 +163,12 @@ func run() error {
 			return nil
 		})
 	}
+	writer.Maintenance = append(writer.Maintenance, func(ctx context.Context) error {
+		if err := gwsync.PruneStale(ctx, st.Pool); err != nil {
+			return fmt.Errorf("gateway instances: %w", err)
+		}
+		return nil
+	})
 	if err := writer.EnsurePartitions(ctx); err != nil {
 		return fmt.Errorf("usage_events partitions: %w (the database role needs CREATE on the schema)", err)
 	}

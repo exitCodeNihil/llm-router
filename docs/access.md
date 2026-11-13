@@ -7,6 +7,15 @@
 full key is shown once; only a hash is stored. Send it as `Authorization: Bearer llmr_…`,
 `x-api-key`, or `X-Llmr-Key` (the form the [subscription pass-through](clients.md) needs).
 
+The console pages for users, keys and teams (and a team's members) load 50 rows at a time and search
+on the server, so they stay fast with 100,000 of each. The same lists take `limit` (1 to 200), `after`
+and `q` on `GET /api/users`, `/api/keys`, `/api/teams` and `/api/teams/{id}/members`, and then answer
+`{"items": [...], "next": "<cursor>"}`: pass `next` as `after` for the following page, and an empty
+`next` ends the list. `q` is a case-insensitive substring match (email and name; key name, prefix and
+owner; team name). Without `limit` they answer the full array as before, and `q` or `after` without
+`limit` is a 400. Paged keys also carry `user_email` and `team_name`. `POST /api/lookup` turns ids into
+names: `{"users": [...], "keys": [...], "teams": [...]}`, at most 100 of each kind.
+
 ## Who may call which model
 
 **Allowed models** can be set on a team, a user and a key. Empty means everything.

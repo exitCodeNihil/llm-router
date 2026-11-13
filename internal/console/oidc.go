@@ -126,10 +126,11 @@ func (a *Auth) handleCallback(w http.ResponseWriter, r *http.Request) {
 	sw := &statusWriter{ResponseWriter: w}
 	w = sw
 	var signedIn, signedInEmail string
+	stateOK := false
 	defer func() {
 		if signedIn != "" {
 			a.audit(r, "auth.sso_signin", sw.status, signedIn, signedInEmail)
-		} else {
+		} else if stateOK { // an anonymous hit carries no state cookie: not worth a row
 			a.audit(r, "auth.sso_signin_failed", sw.status, "", "")
 		}
 	}()
@@ -138,6 +139,7 @@ func (a *Auth) handleCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "state mismatch", http.StatusBadRequest)
 		return
 	}
+	stateOK = true
 	cfg, err := a.loadSSO(r.Context())
 	if err != nil {
 		http.Error(w, "SSO is not configured", http.StatusNotFound)
