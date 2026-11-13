@@ -25,7 +25,7 @@ The control plane's listener also serves the console, so it is often public. To 
 it, set `LLMR_METRICS_LISTEN` to another address, e.g. `:9090`, which your ingress does not route;
 `/metrics` is then only served there. `LLMR_METRICS_LISTEN=off` turns it off. The Helm chart does
 this by default (`metrics.port: 9090`). If you expose 8080 directly, either set it or block
-`/metrics` at your proxy. A gateway's listener serves only `/v1`, `/healthz` and `/metrics`.
+`/metrics` at your proxy. A gateway's listener serves only `/v1`, `/healthz`, `/livez` and `/metrics`.
 
 ## Metrics
 
@@ -42,16 +42,26 @@ Both runtimes write these with the same names, so a sum over every scraped targe
 | `llmr_memory_limit_bytes` | gauge | | The cgroup's `memory.max`. Absent when there is no limit |
 | `llmr_usage_queued`, `llmr_usage_queue_capacity` | gauge | | Usage events waiting: for Postgres on the control plane, for the next sync on a gateway |
 | `llmr_usage_dropped_total` | counter | | Usage events dropped because the queue was full |
+| `llmr_usage_flush_failures_total` | counter | | Control plane: failed writes of usage events to Postgres. Each is retried, so this alone loses nothing |
+| `llmr_usage_partitions_dropped_total` | counter | | Control plane: monthly usage partitions dropped past their [retention](deploy.md#usage-data) |
+| `llmr_usage_lost_total` | counter | | Control plane: usage events still unwritten when it stopped |
+| `llmr_usage_partition_errors_total` | counter | | Control plane: monthly usage partitions that could not be created |
+| `llmr_audit_write_failures_total` | counter | | Control plane: [audit log](access.md#audit-log) rows that could not be written after a retry. The `audit` log line was still written |
+| `llmr_snapshot_age_seconds` | gauge | | Control plane: seconds since the config in use was read from Postgres. It is rebuilt every 30 seconds, so more than a minute or two means Postgres is not answering |
+| `llmr_snapshot_build_seconds` | gauge | | Control plane: how long the latest rebuild took |
+| `llmr_snapshot_build_failures_total` | counter | | Control plane: rebuilds that failed; the previous config stays in use |
+| `llmr_db_pool_acquired_conns`, `llmr_db_pool_idle_conns`, `llmr_db_pool_max_conns` | gauge | `pool` (`main`, `console`) | Control plane: Postgres connections in use, idle, and the most the pool opens |
+| `llmr_db_pool_acquire_wait_seconds_total` | counter | `pool` | Control plane: time spent waiting for a free connection |
 | `llmr_build_info` | gauge | `runtime` (`control_plane`, `gateway`), `version` | Always 1 |
 
 Gateways only:
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `llmr_ready` | gauge | | 1 once it has its config and has synced |
+| `llmr_ready` | gauge | | 1 once it has its config and has synced, or has started on a config [saved on disk](deploy.md#gateway-state-on-disk); 0 again once the control plane has refused it |
 | `llmr_shed_total` | counter | | Requests refused with 503 because more than `LLMR_MAX_IN_FLIGHT` were in flight |
 | `llmr_upstream_attempts_total` | counter | `result` (`ok`, `error`, `timeout`, `retryable_status`) | Upstream attempts |
-| `llmr_limit_denials_total` | counter | `reason` (`budget_exceeded`, `rate_limit_exceeded`) | Requests refused by a budget or rate limit |
+| `llmr_limit_denials_total` | counter | `reason` (`budget_exceeded`, `rate_limit_exceeded`, `budget_unknown`) | Requests refused by a budget or rate limit, or, after a start from saved state without spend, because spend was not known yet |
 | `llmr_sync_failures_total` | counter | | Failed syncs with the control plane |
 | `llmr_sync_refused_events_total` | counter | | Usage events dropped because the control plane refused their batch, or a proxy refused one even alone and without content as too large |
 | `llmr_usage_queued_content_bytes` | gauge | | Captured prompts and responses the queued usage events hold |
@@ -59,6 +69,15 @@ Gateways only:
 | `llmr_usage_inflight_content_bytes` | gauge | | Room for captured content that requests in flight have reserved: their prompt as captured, and their response up to the capture cap. With the queued content and the batch being sent, at most 64 MiB |
 | `llmr_usage_content_stripped_total` | counter | | Usage events sent without their captured content: that 64 MiB was full (not captured at all, or put back in the queue after a failed sync), or a proxy refused even the smallest batch (64 KiB) as too large |
 | `llmr_config_version`, `llmr_workers` | gauge | | Config version in use; worker threads |
+| `llmr_config_age_seconds` | gauge | | Seconds since the control plane last answered a config poll, with the config or with "unchanged". Normally under 30; it grows while the control plane is unreachable. 0 before the first answer |
+| `llmr_config_stale` | gauge | | 1 while the config is older than `LLMR_MAX_CONFIG_AGE` and the gateway answers `/v1` with 503 |
+| `llmr_refused` | gauge | | 1 while the gateway does not serve because the control plane has refused its join token for 15 minutes; 0 again once a join succeeds |
+| `llmr_spool_bytes` | gauge | | Usage events on disk (`LLMR_STATE_DIR`) that the control plane has not acknowledged. Near 0 while syncs succeed; it grows while the control plane is unreachable |
+| `llmr_spool_skipped_events_total` | counter | | Usage events not written to the spool because it was at `LLMR_SPOOL_MAX_BYTES` or the write failed. They are still sent; only a crash before that loses them |
+| `llmr_replayed_events_total` | counter | | Usage events sent again, after a restart or a new join, and accepted by the control plane |
+| `llmr_replay_duplicate_events_total` | counter | | Of those, the events the control plane already had |
+| `llmr_replay_refused_events_total` | counter | | Replayed usage events dropped because the control plane could not read them |
+| `llmr_state_dir_locked` | gauge | | With `LLMR_STATE_DIR` only: 1 while this gateway holds the directory, 0 when it could not take it (another process has it, or it is not writable) and runs without saved state |
 
 The control plane only:
 
@@ -133,10 +152,16 @@ scraped twice.
 | `LLMRouterGatewayNotSyncing` | A gateway's last sync is more than 30 s old | 1m |
 | `LLMRouterGatewaySyncFailing` | A gateway's syncs keep failing | 10m |
 | `LLMRouterGatewayNotReady` | A gateway has had no config or no sync since it started (`llmr_ready == 0`) | 5m |
+| `LLMRouterGatewayConfigStale` | A gateway has stopped serving because the control plane has not confirmed its config within `LLMR_MAX_CONFIG_AGE` (`llmr_config_stale == 1`). Critical. Never fires unless that is set | 1m |
+| `LLMRouterGatewayRefused` | A gateway has stopped serving because the control plane refused its join token for 15 minutes: its group was deleted or its token replaced (`llmr_refused == 1`). Critical | 1m |
 | `LLMRouterGatewayMemoryHigh` | A gateway uses more than 85% of its memory limit, from its own `/metrics`, so it fires while the control plane is down. Needs a memory limit on the gateway | 5m |
 | `LLMRouterRequestsShed` | A gateway sheds requests (`rate(llmr_shed_total[5m]) > 0`) | 2m |
 | `LLMRouterHighErrorRate` | More than 5% of `/v1` requests end in 5xx | 10m |
 | `LLMRouterUsageDropped` | Usage events were dropped in the last 10 minutes | |
+| `LLMRouterUsageFlushFailing` | More than 3 writes of usage to Postgres failed in 10 minutes | |
+| `LLMRouterAuditWriteFailing` | Writes to the audit log failed in the last 10 minutes | |
+| `LLMRouterSnapshotStale` | The config in use is over 5 minutes old, for 5 minutes: Postgres is not answering | |
+| `LLMRouterDatabasePoolSaturated` | Every connection of a pool has been in use for 5 minutes | |
 | `LLMRouterTelemetryDestinationFailing` | A telemetry destination keeps failing (`llmr_telemetry_destination_failing{destination}`) | 10m |
 | `LLMRouterTelemetrySpansDropped` | A telemetry destination dropped spans in the last 10 minutes, by reason (info) | |
 

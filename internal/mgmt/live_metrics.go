@@ -95,7 +95,7 @@ func (m *Server) metricsLive(w http.ResponseWriter, r *http.Request) {
 // gatewayNames maps gateway instance ids to "group / instance" (best-effort).
 func (m *Server) gatewayNames(r *http.Request) map[string]string {
 	out := map[string]string{}
-	rows, err := listRows(r.Context(), m.Store.Pool,
+	rows, err := listRows(r.Context(), m.reads(),
 		`SELECT i.id, g.name || ' / ' || i.name AS name FROM gateway_instances i JOIN gateway_groups g ON g.id = i.group_id`)
 	if err != nil {
 		return out
@@ -140,7 +140,7 @@ func (m *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now()
 	// Gateway instances sync every 2 s, so a few missed syncs already mean trouble.
-	rows, _ := listRows(r.Context(), m.Store.Pool,
+	rows, _ := listRows(r.Context(), m.reads(),
 		`SELECT i.id, i.name, i.group_id, g.name AS group_name, g.region, i.last_seen_at
 		FROM gateway_instances i JOIN gateway_groups g ON g.id = i.group_id
 		WHERE i.last_seen_at > now() - interval '10 minutes' ORDER BY g.name, i.joined_at`)

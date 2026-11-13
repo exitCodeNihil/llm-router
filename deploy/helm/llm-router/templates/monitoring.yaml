@@ -117,12 +117,52 @@ spec:
           annotations:
             summary: "Gateway {{ "{{ $labels.instance }}" }} has not been ready for 5 minutes"
             description: It has no config or has not synced with the control plane since it started; see its logs.
+        - alert: LLMRouterGatewayConfigStale
+          expr: llmr_config_stale{ {{- $sel -}} } == 1
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: "Gateway {{ "{{ $labels.instance }}" }} has stopped serving: its config is stale"
+            description: The control plane has not answered the gateway's config poll within LLMR_MAX_CONFIG_AGE, so it answers /v1 with 503 until one is answered. Check the control plane and the network between them.
+        - alert: LLMRouterGatewayRefused
+          expr: llmr_refused{ {{- $sel -}} } == 1
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: "Gateway {{ "{{ $labels.instance }}" }} has stopped serving: the control plane refuses it"
+            description: The control plane has refused the gateway's join token for 15 minutes, so it answers /v1 with 503. Its group was deleted or its join token replaced; give it a current token, or remove the gateway.
         - alert: LLMRouterUsageDropped
           expr: increase(llmr_usage_dropped_total{ {{- $sel -}} }[10m]) > 0
           labels: {severity: warning}
           annotations:
             summary: "{{ "{{ $labels.pod }}" }} dropped usage events"
             description: The usage queue was full, so some requests are missing from usage, spend and budgets.
+        - alert: LLMRouterUsageFlushFailing
+          expr: increase(llmr_usage_flush_failures_total{ {{- $sel -}} }[10m]) > 3
+          labels: {severity: warning}
+          annotations:
+            summary: "{{ "{{ $labels.pod }}" }} cannot write usage to Postgres"
+            description: Writes are being retried and the queue is filling; once it is full, usage is dropped. Check Postgres.
+        - alert: LLMRouterAuditWriteFailing
+          expr: increase(llmr_audit_write_failures_total{ {{- $sel -}} }[10m]) > 0
+          labels: {severity: warning}
+          annotations:
+            summary: "{{ "{{ $labels.pod }}" }} cannot write the audit log"
+            description: Administrative actions are being done without being recorded; see the logs and check Postgres.
+        - alert: LLMRouterSnapshotStale
+          expr: llmr_snapshot_age_seconds{ {{- $sel -}} } > 300
+          for: 5m
+          labels: {severity: critical}
+          annotations:
+            summary: "{{ "{{ $labels.pod }}" }} cannot read its config from Postgres"
+            description: The config in use is over 5 minutes old, so changes to keys, budgets and providers are not taking effect and budgets are checked against old spend. Check Postgres.
+        - alert: LLMRouterDatabasePoolSaturated
+          expr: llmr_db_pool_acquired_conns{ {{- $sel -}} } >= llmr_db_pool_max_conns{ {{- $sel -}} }
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "{{ "{{ $labels.pod }}" }} is using every {{ "{{ $labels.pool }}" }} Postgres connection"
+            description: Requests are waiting for a connection. Look for slow queries, or raise database.maxConns or database.consoleMaxConns.
         - alert: LLMRouterTelemetryDestinationFailing
           expr: max by (destination) (llmr_telemetry_destination_failing{ {{- $sel -}} }) > 0
           for: 10m

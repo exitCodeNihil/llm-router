@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/netip"
@@ -14,11 +14,13 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/oauth2"
 
+	"github.com/exitcodenihil/llm-router/internal/audit"
 	"github.com/exitcodenihil/llm-router/internal/store"
 )
 
 // SSOConfig is the single OIDC provider configuration, stored in settings
-// under key 'sso'. It covers Entra ID, Google, Okta, and any OIDC IdP.
+// under key 'sso' with the secret encrypted (sso.go). It covers Entra ID,
+// Google, Okta, and any OIDC IdP.
 type SSOConfig struct {
 	IssuerURL    string `json:"issuer_url"`
 	ClientID     string `json:"client_id"`
@@ -35,6 +37,8 @@ type Auth struct {
 	// TrustedProxies are the proxies whose X-Forwarded-For names the client
 	// for sign-in rate limits (LLMR_TRUSTED_PROXIES).
 	TrustedProxies []netip.Prefix
+	// Audit, when set, records sign-ins, failed sign-ins and sign-outs.
+	Audit func(context.Context, audit.Event)
 
 	limitsOnce sync.Once
 	limits     *signInLimits
@@ -49,6 +53,12 @@ func (a *Auth) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /auth/login", a.handleLogin)
 	mux.HandleFunc("GET /auth/callback", a.handleCallback)
 	mux.HandleFunc("GET /auth/logout", func(w http.ResponseWriter, r *http.Request) {
+		// Only a real session is recorded: a bare GET from anyone is not an event.
+		if id := SessionUserID(a.EncryptionKey, r); id != "" && a.Audit != nil {
+			var email string
+			a.Store.Pool.QueryRow(r.Context(), `SELECT email FROM users WHERE id=$1`, id).Scan(&email)
+			a.audit(r, "auth.signout", http.StatusFound, id, email)
+		}
 		http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, Domain: a.CookieDomain})
 		// The marker lets the console drop a bootstrap token it holds in
 		// local storage, which no server-side action can clear.
@@ -56,17 +66,14 @@ func (a *Auth) Register(mux *http.ServeMux) {
 	})
 }
 
+// loadSSO is LoadSSO for sign-in. A secret it cannot decrypt is logged for
+// the admin and fails like a missing configuration.
 func (a *Auth) loadSSO(ctx context.Context) (*SSOConfig, error) {
-	var raw []byte
-	err := a.Store.Pool.QueryRow(ctx, `SELECT value FROM settings WHERE key='sso'`).Scan(&raw)
-	if err != nil {
-		return nil, err
+	cfg, err := LoadSSO(ctx, a.Store.Pool, a.EncryptionKey)
+	if errors.Is(err, ErrSSOSecret) {
+		slog.Error("sso sign-in unavailable", "err", err)
 	}
-	var cfg SSOConfig
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return nil, err
-	}
-	return &cfg, nil
+	return cfg, err
 }
 
 func (a *Auth) oidcProvider(ctx context.Context, cfg *SSOConfig) (*oidc.Provider, error) {
@@ -116,11 +123,23 @@ func (a *Auth) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Auth) handleCallback(w http.ResponseWriter, r *http.Request) {
+	sw := &statusWriter{ResponseWriter: w}
+	w = sw
+	var signedIn, signedInEmail string
+	stateOK := false
+	defer func() {
+		if signedIn != "" {
+			a.audit(r, "auth.sso_signin", sw.status, signedIn, signedInEmail)
+		} else if stateOK { // an anonymous hit carries no state cookie: not worth a row
+			a.audit(r, "auth.sso_signin_failed", sw.status, "", "")
+		}
+	}()
 	stateCookie, err := r.Cookie("llmr_oauth_state")
 	if err != nil || r.URL.Query().Get("state") != stateCookie.Value {
 		http.Error(w, "state mismatch", http.StatusBadRequest)
 		return
 	}
+	stateOK = true
 	cfg, err := a.loadSSO(r.Context())
 	if err != nil {
 		http.Error(w, "SSO is not configured", http.StatusNotFound)
@@ -210,6 +229,7 @@ func (a *Auth) handleCallback(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	signedIn, signedInEmail = userID, email
 	setSessionCookie(w, r, a.EncryptionKey, a.CookieDomain, userID)
 	http.Redirect(w, r, "/", http.StatusFound)
 }

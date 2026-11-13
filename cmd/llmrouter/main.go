@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/exitcodenihil/llm-router/internal/audit"
 	"github.com/exitcodenihil/llm-router/internal/auth"
 	"github.com/exitcodenihil/llm-router/internal/config"
 	"github.com/exitcodenihil/llm-router/internal/console"
@@ -43,6 +44,30 @@ func main() {
 	}
 }
 
+// readyz answers 200 once a snapshot is loaded, until shutdown begins.
+func readyz(holder *snapshot.Holder, shutdown context.Context) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case shutdown.Err() != nil:
+			http.Error(w, "shutting down", http.StatusServiceUnavailable)
+		case holder.Get() == nil:
+			http.Error(w, "starting", http.StatusServiceUnavailable)
+		default:
+			w.Write([]byte("ok"))
+		}
+	}
+}
+
+// setLogging applies LLMR_LOG_LEVEL and LLMR_LOG_FORMAT to the default logger.
+func setLogging(cfg *config.Config) {
+	opts := &slog.HandlerOptions{Level: cfg.LogLevel}
+	var h slog.Handler = slog.NewTextHandler(os.Stderr, opts)
+	if cfg.LogJSON {
+		h = slog.NewJSONHandler(os.Stderr, opts)
+	}
+	slog.SetDefault(slog.New(h))
+}
+
 // watchConfigEpoch appends a cluster event each time the snapshot version bumps
 // (the NOTIFY/poll refresh path applied a new config epoch).
 func watchConfigEpoch(ctx context.Context, holder *snapshot.Holder, events *metrics.Events) {
@@ -69,6 +94,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	setLogging(cfg)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -79,7 +105,9 @@ func run() error {
 	lim := limits.New()
 	gw := &gateway.Server{Snapshots: holder, Limits: lim}
 
-	st, err := store.Open(ctx, cfg.DatabaseURL)
+	st, err := store.OpenWith(ctx, cfg.DatabaseURL, store.Options{
+		MaxConns: cfg.DBMaxConns, ConsoleMaxConns: cfg.DBConsoleMaxConns, ConsoleTimeout: cfg.DBConsoleTimeout,
+	})
 	if err != nil {
 		return err
 	}
@@ -107,20 +135,52 @@ func run() error {
 		return err
 	}
 	telemetry.Register(otlp.Kind{}, langfuse.Kind{})
+	if err := console.MigrateSSO(ctx, st.Pool, cfg.EncryptionKey); err != nil {
+		return fmt.Errorf("encrypt the SSO client secret: %w", err)
+	}
 
 	builder := &snapshot.Builder{Pool: st.Pool, EncryptionKey: cfg.EncryptionKey}
+	buildStart := time.Now()
 	first, err := builder.Build(ctx)
 	if err != nil {
 		return err
 	}
+	holder.Built(time.Since(buildStart))
 	holder.Set(first)
 	go snapshot.Refresher(ctx, st.Pool, builder, holder, 30*time.Second)
 
 	writer := usage.NewPGWriter(st.Pool)
+	writer.Retention = usage.Retention{RawMonths: cfg.UsageRetentionMonths, RollupMonths: cfg.RollupRetentionMonths}
+	if err := writer.Retention.Validate(); err != nil {
+		return fmt.Errorf("LLMR_USAGE_RETENTION_MONTHS / LLMR_ROLLUP_RETENTION_MONTHS: %w", err)
+	}
+	auditRec := &audit.Recorder{Pool: st.Pool}
+	if cfg.AuditRetentionMonths > 0 {
+		writer.Maintenance = append(writer.Maintenance, func(ctx context.Context) error {
+			if err := auditRec.Prune(ctx, cfg.AuditRetentionMonths); err != nil {
+				return fmt.Errorf("audit retention: %w", err)
+			}
+			return nil
+		})
+	}
+	writer.Maintenance = append(writer.Maintenance, func(ctx context.Context) error {
+		if err := gwsync.PruneStale(ctx, st.Pool); err != nil {
+			return fmt.Errorf("gateway instances: %w", err)
+		}
+		return nil
+	})
 	if err := writer.EnsurePartitions(ctx); err != nil {
 		return fmt.Errorf("usage_events partitions: %w (the database role needs CREATE on the schema)", err)
 	}
-	go writer.Run(ctx)
+	// Stopped only once the HTTP server has drained: the requests still
+	// finishing after the signal write their usage too.
+	writerCtx, stopWriter := context.WithCancel(context.Background())
+	defer stopWriter()
+	writerDone := make(chan struct{})
+	go func() {
+		writer.Run(writerCtx)
+		close(writerDone)
+	}()
 	recorder := telemetry.NewRecorder()
 	exporter := telemetry.NewManager(holder, st.Pool)
 	exporter.Recorder = recorder
@@ -136,7 +196,7 @@ func run() error {
 	live := metrics.NewLive()
 	nodeStore := metrics.NewNodeStore()
 	httpm := metrics.NewHTTP()
-	promReg := newMetrics(httpm, nodeStore, writer, exporter)
+	promReg := newMetrics(httpm, nodeStore, writer, exporter, holder, st, auditRec)
 	events := &metrics.Events{}
 	go watchConfigEpoch(ctx, holder, events)
 	gw.Usage = usage.MultiWriter{writer, exporter, live}
@@ -147,7 +207,8 @@ func run() error {
 	}
 	mg := &mgmt.Server{Store: st, AdminToken: cfg.AdminToken, EncryptionKey: cfg.EncryptionKey,
 		Snapshots: holder, Live: live, NodeStore: nodeStore, HTTP: httpm, Events: events, Recorder: recorder, Telemetry: exporter,
-		Gateway: gw, Version: version, Started: time.Now(), IDEOrigin: cfg.IDEOrigin}
+		Gateway: gw, Version: version, Started: time.Now(), IDEOrigin: cfg.IDEOrigin,
+		UsageRetentionMonths: cfg.UsageRetentionMonths, Audit: auditRec, TrustedProxies: cfg.TrustedProxies}
 	mg.Register(mux)
 	go mg.SyncWorkspaceModels(ctx)
 	if cfg.IDEListen != "" {
@@ -168,7 +229,7 @@ func run() error {
 		slog.Warn("LLMR_IDE_ORIGIN is not set: workspace IDEs share the console origin; set LLMR_IDE_LISTEN/LLMR_IDE_ORIGIN in production")
 	}
 	consoleAuth := &console.Auth{Store: st, EncryptionKey: cfg.EncryptionKey, CookieDomain: cfg.CookieDomain,
-		TrustedProxies: cfg.TrustedProxies}
+		TrustedProxies: cfg.TrustedProxies, Audit: auditRec.Record}
 	consoleAuth.Register(mux)
 	mg.TokenGuard = consoleAuth
 	gwSync := &gwsync.Server{Store: st, Snapshots: holder, Limits: lim, Export: usage.MultiWriter{exporter, live}, Nodes: nodeStore,
@@ -179,10 +240,14 @@ func run() error {
 
 	gw.Register(mux)
 	serveMetrics(ctx, cfg.MetricsListen, mux, promReg)
+	// /healthz: the process is up. /readyz: it has a config and is not
+	// shutting down. Neither asks Postgres: with it away the control plane
+	// still serves from memory and queues usage, and must stay in rotation.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
+	mux.HandleFunc("GET /readyz", readyz(holder, ctx))
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -204,6 +269,12 @@ func run() error {
 		return err
 	}
 	<-drained
+	stopWriter()
+	select {
+	case <-writerDone:
+	case <-time.After(6 * time.Second):
+		slog.Warn("usage writer did not finish flushing before exit")
+	}
 	stopExport()
 	select {
 	case <-exportDone:

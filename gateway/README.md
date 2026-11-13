@@ -12,9 +12,10 @@ The control plane's side is `internal/gwsync`. Every call after the join carries
 
 | Call | What it does |
 |---|---|
-| `POST /gw/v1/join` | With the group's `llmrg_…` token: registers an instance and returns a 15-minute session, the group, and the sync interval |
+| `POST /gw/v1/join` | With the group's `llmrg_…` token: registers an instance and returns a 15-minute session, the group, and the sync interval. A token that matches no group gets 401 with `X-Llmr-Refused: 1`; a gateway refused that way for 15 minutes stops serving |
 | `POST /gw/v1/renew` | Returns a fresh session while the instance still exists |
 | `GET /gw/v1/config?wait=25` | Long-poll with `If-None-Match: "v<version>"`. Returns 304, or the group's config, gzipped |
+| `POST /gw/v1/replay` | Gzipped `{events}` the gateway is not sure the control plane has: what an earlier run left in its spool, or a batch that was in flight when its session ended. Each request id is stored once. Returns `{stored, duplicates, dropped}` |
 | `POST /gw/v1/sync` | Gzipped `{batch, cursor, events, rates, stats}`. Returns the combined counters `{cursor, now_ms, minute, spend, rates}` |
 
 - **Config** holds only what the group serves: keys (as SHA-256 hashes), users, teams, providers
@@ -33,7 +34,10 @@ The control plane's side is `internal/gwsync`. Every call after the join carries
 | File | Contents |
 |---|---|
 | `main.rs` | Environment, runtime sized to the CPU allowance, listener, drain on SIGTERM |
-| `cp.rs` | Join, renew, config long-poll, sync loop |
+| `cp.rs` | Join, renew, config long-poll, sync loop; what happens when the control plane is away or refuses the gateway |
+| `state.rs` | The config, spend and any standing refusal kept on disk, sealed with the join token (`LLMR_STATE_DIR`) |
+| `spool.rs` | Unsent usage on disk, replayed after a crash |
+| `log.rs` | Leveled logging to stderr, as text or JSON |
 | `config.rs` | Wire format and the hot-path model: keys resolved to users and teams, deployments to URLs and auth headers |
 | `server.rs` | Routes, auth, limits, failover with timeouts, the OpenAI and Anthropic surfaces |
 | `body.rs` | Response bodies, and the event-stream wrapper that emits usage when a stream ends |

@@ -4,9 +4,12 @@ package config
 import (
 	"flag"
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -30,6 +33,27 @@ type Config struct {
 	// MetricsListen serves /metrics on its own listener instead of the main
 	// one ("off": not at all). Empty = on the main listener, like a gateway.
 	MetricsListen string
+
+	// DBMaxConns and DBConsoleMaxConns size the two Postgres pools: ingest
+	// and sync, and console reads. DBConsoleTimeout is the statement timeout
+	// on console reads. Zero = the store's default.
+	DBMaxConns        int
+	DBConsoleMaxConns int
+	DBConsoleTimeout  time.Duration
+
+	// UsageRetentionMonths and RollupRetentionMonths are how many whole months
+	// of per-request usage, and of daily rollups and per-day spend, are kept.
+	// Zero keeps them for ever.
+	UsageRetentionMonths  int
+	RollupRetentionMonths int
+	// AuditRetentionMonths is how many months of the audit log are kept.
+	// Zero keeps it for ever.
+	AuditRetentionMonths int
+
+	// LogLevel is the least severe level logged; LogJSON writes one JSON
+	// object per line instead of text.
+	LogLevel slog.Level
+	LogJSON  bool
 }
 
 func Load(args []string) (*Config, error) {
@@ -51,6 +75,45 @@ func Load(args []string) (*Config, error) {
 	}
 	c.TrustedProxies = trusted
 	c.EncryptionKey = os.Getenv("LLMR_ENCRYPTION_KEY")
+	if c.DBMaxConns, err = envInt("LLMR_DB_MAX_CONNS"); err != nil {
+		return nil, err
+	}
+	if c.DBConsoleMaxConns, err = envInt("LLMR_DB_CONSOLE_MAX_CONNS"); err != nil {
+		return nil, err
+	}
+	switch v := strings.ToLower(envOr("LLMR_LOG_LEVEL", "info")); v {
+	case "debug":
+		c.LogLevel = slog.LevelDebug
+	case "info":
+		c.LogLevel = slog.LevelInfo
+	case "warn":
+		c.LogLevel = slog.LevelWarn
+	case "error":
+		c.LogLevel = slog.LevelError
+	default:
+		return nil, fmt.Errorf("LLMR_LOG_LEVEL must be debug, info, warn or error")
+	}
+	switch v := strings.ToLower(envOr("LLMR_LOG_FORMAT", "text")); v {
+	case "text":
+	case "json":
+		c.LogJSON = true
+	default:
+		return nil, fmt.Errorf("LLMR_LOG_FORMAT must be text or json")
+	}
+	if c.UsageRetentionMonths, err = envInt("LLMR_USAGE_RETENTION_MONTHS"); err != nil {
+		return nil, err
+	}
+	if c.RollupRetentionMonths, err = envInt("LLMR_ROLLUP_RETENTION_MONTHS"); err != nil {
+		return nil, err
+	}
+	if c.AuditRetentionMonths, err = envInt("LLMR_AUDIT_RETENTION_MONTHS"); err != nil {
+		return nil, err
+	}
+	if v := os.Getenv("LLMR_DB_CONSOLE_TIMEOUT"); v != "" {
+		if c.DBConsoleTimeout, err = time.ParseDuration(v); err != nil || c.DBConsoleTimeout <= 0 {
+			return nil, fmt.Errorf("LLMR_DB_CONSOLE_TIMEOUT must be a duration like 30s")
+		}
+	}
 
 	if c.DatabaseURL == "" {
 		return nil, fmt.Errorf("LLMR_DATABASE_URL is required")
@@ -97,6 +160,19 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envInt reads a whole number, zero or more; unset is 0.
+func envInt(key string) (int, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("%s must be a whole number, 0 or more", key)
+	}
+	return n, nil
 }
 
 // parsePrefixes reads a comma-separated list of addresses or CIDR ranges.

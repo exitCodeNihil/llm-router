@@ -10,7 +10,7 @@
 //! before they hear about each other.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -101,6 +101,12 @@ fn dirty() -> &'static Mutex<Vec<Arc<Scope>>> {
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static CLOCK_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
+/// The control plane's spend figures are in place: from a sync, or restored
+/// from the state directory.
+static SPEND_KNOWN: AtomicBool = AtomicBool::new(false);
+/// Serving a config from the state directory that came without spend:
+/// budgeted scopes are refused until a sync brings the figures.
+static SPEND_REQUIRED: AtomicBool = AtomicBool::new(false);
 
 /// The scope for `name` if it has any limit, shared across config versions so
 /// a reload keeps its counts.
@@ -160,9 +166,17 @@ pub fn check(key: &Key) -> Result<(), Denial> {
     }
     let (minute, frac) = clock();
     let retry = Some((60.0 * (1.0 - frac)).ceil() as u64);
+    let unknown = SPEND_REQUIRED.load(Ordering::Relaxed) && !SPEND_KNOWN.load(Ordering::Relaxed);
     for s in key.scopes() {
         let i = s.inner.lock().unwrap();
         if let Some(budget) = i.budget {
+            if unknown {
+                return Err(Denial {
+                    code: "budget_unknown",
+                    message: format!("spend for {} is not known yet: waiting for the control plane", s.name),
+                    retry_after_s: Some(5),
+                });
+            }
             let spent = i.g_spend + i.spend_pending + i.spend_inflight;
             if spent >= budget {
                 return Err(Denial {
@@ -285,9 +299,44 @@ pub struct Counters {
     pub rates: HashMap<String, [i64; 4]>,
 }
 
+/// Take saved spend (scope name → USD) as the control plane's figures until
+/// the next sync replaces them.
+pub fn restore(spend: &HashMap<String, f64>) {
+    for s in registry().lock().unwrap().values() {
+        if let Some(usd) = spend.get(&s.name) {
+            s.inner.lock().unwrap().g_spend = *usd;
+        }
+    }
+    SPEND_KNOWN.store(true, Ordering::Relaxed);
+}
+
+/// Spend is not known: refuse budgeted scopes until a sync brings it.
+pub fn require_spend() {
+    SPEND_KNOWN.store(false, Ordering::Relaxed);
+    SPEND_REQUIRED.store(true, Ordering::Relaxed);
+}
+
+/// The control plane's spend per budgeted scope, to save; None before any is
+/// known.
+pub fn spend() -> Option<HashMap<String, f64>> {
+    if !SPEND_KNOWN.load(Ordering::Relaxed) {
+        return None;
+    }
+    let reg = registry().lock().unwrap();
+    Some(
+        reg.values()
+            .filter_map(|s| {
+                let i = s.inner.lock().unwrap();
+                i.budget.map(|_| (s.name.clone(), i.g_spend))
+            })
+            .collect(),
+    )
+}
+
 /// Settle an acknowledged batch: its counts are now in the control plane's
 /// figures, which replace ours.
 pub fn apply(batch: &[Arc<Scope>], c: &Counters) {
+    SPEND_KNOWN.store(true, Ordering::Relaxed);
     if c.now_ms > 0 {
         CLOCK_OFFSET_MS.store(c.now_ms - now_ms(), Ordering::Relaxed);
     }
@@ -372,6 +421,40 @@ pub(crate) mod tests {
         c.spend.insert("key:t-budget".into(), 0.2); // e.g. a refund the control plane knows of
         apply(&scopes, &c);
         assert!(check(&k).is_ok(), "after the ack the control plane's figure stands");
+    }
+
+    #[test]
+    fn restored_spend_counts_against_the_budget() {
+        let _serial = SERIAL.lock().unwrap();
+        let (spent, left) = (key("t-restore-spent", Some(1.0), None), key("t-restore-left", Some(1.0), None));
+        restore(&HashMap::from([("key:t-restore-spent".into(), 1.5), ("key:t-restore-left".into(), 0.5)]));
+        assert_eq!(check(&spent).unwrap_err().code, "budget_exceeded");
+        assert!(check(&left).is_ok());
+        let saved = spend().unwrap();
+        assert_eq!((saved["key:t-restore-spent"], saved["key:t-restore-left"]), (1.5, 0.5));
+        // the next sync's figures replace the restored ones
+        let mut c = Counters::default();
+        c.spend.insert("key:t-restore-spent".into(), 0.1);
+        apply(&[], &c);
+        assert!(check(&spent).is_ok());
+    }
+
+    #[test]
+    fn budgets_wait_for_spend_when_it_was_not_saved() {
+        let _serial = SERIAL.lock().unwrap();
+        let (budgeted, limited, free) = (
+            key("t-unknown", Some(1.0), None),
+            key("t-unknown-rpm", None, Some(100)),
+            key("t-unknown-free", None, None),
+        );
+        require_spend();
+        assert!(spend().is_none());
+        let d = check(&budgeted).unwrap_err();
+        assert_eq!((d.code, d.retry_after_s), ("budget_unknown", Some(5)));
+        assert!(check(&limited).is_ok() && check(&free).is_ok());
+        apply(&[], &Counters::default());
+        assert!(check(&budgeted).is_ok(), "the first sync brings the figures");
+        assert_eq!(spend().unwrap()["key:t-unknown"], 0.0);
     }
 
     #[test]

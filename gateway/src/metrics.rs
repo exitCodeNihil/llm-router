@@ -9,6 +9,22 @@ pub static SHED: AtomicU64 = AtomicU64::new(0);
 pub static SYNC_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub static SYNC_REFUSED_EVENTS: AtomicU64 = AtomicU64::new(0);
 pub static CONFIG_VERSION: AtomicI64 = AtomicI64::new(0);
+/// Seconds since the control plane last answered a config poll, and whether
+/// that is past LLMR_MAX_CONFIG_AGE; the /metrics handler sets both.
+pub static CONFIG_AGE_SECONDS: AtomicI64 = AtomicI64::new(0);
+pub static CONFIG_STALE: AtomicI64 = AtomicI64::new(0);
+/// 1 once the control plane has refused this gateway for long enough that it
+/// stopped serving; set by the /metrics handler too.
+pub static REFUSED: AtomicI64 = AtomicI64::new(0);
+/// 1 while this process holds the state directory, 0 when it could not take
+/// it, -1 without LLMR_STATE_DIR.
+pub static STATE_DIR_LOCKED: AtomicI64 = AtomicI64::new(-1);
+/// Bytes of usage events on disk waiting for the control plane.
+pub static SPOOL_BYTES: AtomicI64 = AtomicI64::new(0);
+pub static SPOOL_SKIPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
+pub static REPLAYED_EVENTS: AtomicU64 = AtomicU64::new(0);
+pub static REPLAY_DUPLICATE_EVENTS: AtomicU64 = AtomicU64::new(0);
+pub static REPLAY_REFUSED_EVENTS: AtomicU64 = AtomicU64::new(0);
 pub static WORKERS: AtomicI64 = AtomicI64::new(0);
 pub static OPEN_CONNECTIONS: AtomicI64 = AtomicI64::new(0);
 pub static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
@@ -67,8 +83,8 @@ pub fn attempt(a: Attempt) {
     ATTEMPT[a as usize].fetch_add(1, Relaxed);
 }
 
-const DENIALS: [&str; 2] = ["budget_exceeded", "rate_limit_exceeded"];
-static DENIAL: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+const DENIALS: [&str; 3] = ["budget_exceeded", "rate_limit_exceeded", "budget_unknown"];
+static DENIAL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 pub fn denial(code: &str) {
     if let Some(i) = DENIALS.iter().position(|d| *d == code) {
@@ -95,6 +111,34 @@ pub fn render(ready: bool, usage_queued: usize, usage_capacity: usize, usage_dro
     gauge("llmr_ready", "1 once the gateway has its config and has synced with the control plane", ready as i64);
     gauge("llmr_in_flight", "Requests being served", IN_FLIGHT.load(Relaxed));
     gauge("llmr_config_version", "Config version in use", CONFIG_VERSION.load(Relaxed));
+    gauge(
+        "llmr_config_age_seconds",
+        "Seconds since the control plane last answered a config poll (0 before the first)",
+        CONFIG_AGE_SECONDS.load(Relaxed),
+    );
+    gauge(
+        "llmr_config_stale",
+        "1 while the config is older than LLMR_MAX_CONFIG_AGE and /v1 is refused",
+        CONFIG_STALE.load(Relaxed),
+    );
+    gauge(
+        "llmr_refused",
+        "1 while the gateway does not serve because the control plane refused its join token for 15 minutes",
+        REFUSED.load(Relaxed),
+    );
+    let locked = STATE_DIR_LOCKED.load(Relaxed);
+    if locked >= 0 {
+        gauge(
+            "llmr_state_dir_locked",
+            "1 while this gateway holds LLMR_STATE_DIR, 0 when it could not take it and runs without saved state",
+            locked,
+        );
+    }
+    gauge(
+        "llmr_spool_bytes",
+        "Usage events on disk that the control plane has not acknowledged",
+        SPOOL_BYTES.load(Relaxed),
+    );
     gauge("llmr_workers", "Worker threads", WORKERS.load(Relaxed));
     gauge("llmr_usage_queued", "Usage events waiting for the next sync", usage_queued as i64);
     gauge("llmr_usage_queue_capacity", "Usage events the queue holds memory for", usage_capacity as i64);
@@ -158,6 +202,26 @@ pub fn render(ready: bool, usage_queued: usize, usage_capacity: usize, usage_dro
         "llmr_sync_refused_events_total",
         "Usage events dropped because the control plane refused their batch",
         SYNC_REFUSED_EVENTS.load(Relaxed),
+    );
+    counter(
+        "llmr_spool_skipped_events_total",
+        "Usage events not written to the spool because it was full or the write failed",
+        SPOOL_SKIPPED_EVENTS.load(Relaxed),
+    );
+    counter(
+        "llmr_replayed_events_total",
+        "Usage events sent again after a restart or a new join and accepted by the control plane",
+        REPLAYED_EVENTS.load(Relaxed),
+    );
+    counter(
+        "llmr_replay_duplicate_events_total",
+        "Replayed usage events the control plane already had",
+        REPLAY_DUPLICATE_EVENTS.load(Relaxed),
+    );
+    counter(
+        "llmr_replay_refused_events_total",
+        "Replayed usage events dropped because the control plane refused them",
+        REPLAY_REFUSED_EVENTS.load(Relaxed),
     );
     counter("llmr_usage_dropped_total", "Usage events dropped because the queue was full", usage_dropped);
     counter(

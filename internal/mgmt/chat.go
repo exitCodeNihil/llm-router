@@ -103,7 +103,7 @@ func (m *Server) getChat(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := listRows(r.Context(), m.Store.Pool, `
+	rows, err := listRows(r.Context(), m.reads(), `
 		SELECT id, title, model, system_prompt, settings, messages, created_at, updated_at
 		FROM chats WHERE id = $1 AND user_id = $2`, r.PathValue("id"), userID)
 	if err != nil {

@@ -98,12 +98,41 @@ Limits and budgets stay on keys, users and teams, and hold across every gateway.
 its usage and counts with the control plane every 2 seconds, so a key can exceed a limit by at most
 what all gateways admit in that time.
 
-Config changes reach gateways within about a second. A gateway needs the control plane to start.
-After that it keeps serving on its last config if the control plane goes away, and uploads the
-usage it held (up to 200,000 events) when it's back.
+Config changes reach gateways within about a second. A gateway needs the control plane to start,
+unless it [keeps state on disk](#gateway-state-on-disk). After that, if the control plane goes away,
+it keeps serving on its last config for as long as the outage lasts, holds budgets against the last
+spend it was told plus its own, and uploads the usage it held (up to 200,000 events) when the
+control plane is back. To bound that, set `LLMR_MAX_CONFIG_AGE`: a gateway whose config the control
+plane has not confirmed for that many seconds answers `/v1` with 503 `config_stale` and fails
+`/healthz` until the next config poll is answered. It polls about every 25 seconds.
 
-A new join token stops further gateways joining with the old one; running ones carry on. Deleting a
-group stops its gateways getting config at once, and they stop serving within 15 minutes.
+A gateway that has to join again while a batch of usage is unacknowledged, with or without state on
+disk, sends that batch's events to the control plane's replay, which stores each request once; the
+batch's rate-limit counts are not sent. Renewing a session is not joining again: an unacknowledged
+batch is then resent as the sync it was. A control plane before 0.4 has no replay. A gateway
+concludes that only of a control plane that has never answered a replay and answers 404 three times
+running; it then resends the batch as a sync, which counts it twice if the first attempt had been
+stored. Once a control plane has answered a replay, a 404 is retried until the replay goes through.
+
+Deleting a group ends its gateways' sessions: each notices at its next sync or config poll, within
+seconds, and tries to join again. The control plane refuses that join, and a gateway that has been
+refused for 15 minutes stops serving: `/v1` answers 503 `gateway_refused`, `/healthz` fails, and it
+deletes the config and spend it saved on disk. With state on disk the 15 minutes run across
+restarts, and a gateway that restarts while it is refused serves nothing until it can join. Until then it serves on its last config without syncing limits or usage.
+It keeps trying to join every 30 seconds and serves again if a join succeeds. Only the control
+plane's own refusal counts: a 401 from a proxy in between, an older control plane, or one that
+cannot reach its database never stops a gateway.
+
+A new join token stops gateways joining with the old one. Running gateways carry on with the session
+they have, which they renew without the token. They need the token again when they restart, or when
+the session lapses because the control plane was unreachable for longer than it had left (5 to 15
+minutes); they are then refused as above and stop serving 15 minutes later. Give running gateways
+the new token before that.
+
+A gateway that stops syncing turns red on the Gateways page and disappears from it after 10 minutes.
+Its row is deleted from the database after 7 days, when it joins, and in the twice-daily maintenance
+pass. An admin can remove a stopped one at once with **Remove**; if it is in fact still running, it
+is refused on its next sync and rejoins by itself as a new instance.
 
 Gateways trace requests as the control plane's own `/v1` does: they continue a caller's
 `traceparent`, return `X-Llmr-Trace-Id`, and capture prompts and responses only when the capture
@@ -136,9 +165,52 @@ A gateway logs why it refuses them, and requests to those providers fail with th
 | `LLMR_MAX_IN_FLIGHT` | Above this many requests in flight, answer 503 with `Retry-After` (default 10000) |
 | `LLMR_SHUTDOWN_TIMEOUT` | Seconds to finish requests on SIGTERM before exiting (default 30). Idle keep-alive connections close at once and the rest after their current request, so clients reconnect to another gateway |
 | `LLMR_GATEWAY_NAME` | Name on the Gateways page (default: the hostname) |
+| `LLMR_MAX_CONFIG_AGE` | Seconds a gateway serves after the control plane last confirmed its config; unset or 0: no limit. At least 120 |
+| `LLMR_STATE_DIR` | Directory for [state on disk](#gateway-state-on-disk); unset: nothing is written |
+| `LLMR_SPOOL_MAX_BYTES` | With `LLMR_STATE_DIR`: the most bytes of unsent usage kept on disk (default 268435456, 256 MiB); 0 keeps none |
+| `LLMR_LOG_LEVEL` | `debug`, `info` (default), `warn` or `error` |
+| `LLMR_LOG_FORMAT` | `text` (default) or `json`, one object per line with `ts`, `level` and `msg`. Logs go to stderr |
 
 `/healthz` answers 200 once the gateway has its config and has synced, and 503 while it starts or
-drains. `/metrics` is in Prometheus format; see [Monitoring](monitoring.md).
+drains, while its config is older than `LLMR_MAX_CONFIG_AGE`, and once the control plane has refused
+it. `/livez` answers 200 for as long as the process runs: use it for liveness and `/healthz` for
+readiness, as the chart does. `/metrics` is in Prometheus format; see [Monitoring](monitoring.md).
+
+### Gateway state on disk
+
+With `LLMR_STATE_DIR` (`gateway.state.enabled` in the chart) a gateway saves, at most every 30
+seconds, the config it last received and, beside it, when the control plane last confirmed that
+config and the spend of every budgeted key, user and team as of its last sync. While the control
+plane refuses the gateway, it also keeps since when. The files are encrypted with a key derived from
+the join token.
+
+A gateway that starts with these files serves at once, before it reaches the control plane, if the
+config was confirmed within the last 24 hours (or within `LLMR_MAX_CONFIG_AGE`, when that is
+shorter). Budgets continue from the saved spend; if none was saved, requests under a budget get 429
+`budget_unknown` until the first sync, and the rest are served. It then joins as usual and takes the
+control plane's config. Files it cannot read, for example after the join token changed, are deleted
+and it starts as it would without them.
+
+The directory also holds a spool of usage: before each sync, the events queued since the last one are
+written to `spool/`, without captured prompts or responses, and deleted once the control plane has
+acknowledged them. A gateway that starts and finds events there, left by a run that crashed or was
+killed, sends them to the control plane before its first sync, and the control plane stores each
+request once, however often it is sent. What a crash can still lose is the usage of requests that
+finished since the last sync, about two seconds' worth, and of requests in flight when the process
+died. Events replayed from the spool carry no prompts or responses. Replay needs a 0.4 control plane; against an
+older one (three 404s running, and no replay ever answered) the files wait for a later start.
+A gateway sends only events that are in the spool: one that finishes while the spool is being
+written goes with the next sync. Past `LLMR_SPOOL_MAX_BYTES` new events are not spooled
+(`llmr_spool_skipped_events_total`) until acknowledged ones make room, which only happens while the
+control plane is unreachable for a long time: 256 MiB holds several hundred thousand events.
+
+One gateway uses a directory at a time: a second one logs an error and runs without saved state
+(`llmr_state_dir_locked` is 0). The chart uses an `emptyDir`, which survives a container restart but
+not the pod, so a new or rescheduled pod still needs the control plane and a deleted pod's spool is
+gone. Its `gateway.state.sizeLimit` is 512Mi, twice the spool's cap: Kubernetes evicts a pod
+that goes over its `emptyDir` limit, so the config and files being written need room beside a full
+spool. If you raise `LLMR_SPOOL_MAX_BYTES`, raise it too. What is on disk is described
+in [SECURITY.md](../SECURITY.md#data-at-rest).
 
 ## Configuration
 
@@ -151,6 +223,13 @@ For llm-router itself (the gateways have [their own](#gateways)):
 | `LLMR_ADMIN_TOKEN` | Bootstrap admin token, 12+ characters (optional) |
 | `LLMR_LISTEN` | Listen address, default `:8080` |
 | `LLMR_TRUSTED_PROXIES` | Comma-separated addresses or CIDR ranges of proxies whose `X-Forwarded-For` names the client. Console sign-in is limited to 20 attempts a minute per client address (IPv6 per /64) and 5 failures per 15 minutes per email and address; wrong admin tokens on the API to 5 per 15 minutes per address. Each proxy must append to `X-Forwarded-For` |
+| `LLMR_DB_MAX_CONNS`, `LLMR_DB_CONSOLE_MAX_CONNS` | Postgres connections for usage writes, gateway sync and config (default 16), and for console reads (default 8). Their sum must fit under the database's `max_connections` |
+| `LLMR_DB_CONSOLE_TIMEOUT` | Cancels a console query that runs longer, default `30s`; the console then answers 504 |
+| `LLMR_LOG_LEVEL` | Least severe level logged: `debug`, `info` (default), `warn` or `error`. Health checks, metrics scrapes and gateway syncs are logged at `debug` |
+| `LLMR_LOG_FORMAT` | `text` (default) or `json`, one object per line |
+| `LLMR_USAGE_RETENTION_MONTHS` | Months of individual requests to keep, besides the current one; older months are deleted. `0` (default) keeps them for ever; otherwise at least 2. See [Usage data](#usage-data) |
+| `LLMR_ROLLUP_RETENTION_MONTHS` | Months of daily totals and per-day spend to keep. `0` (default) keeps them for ever; otherwise at least 3 |
+| `LLMR_AUDIT_RETENTION_MONTHS` | Months of the [audit log](access.md#audit-log) to keep; older rows are deleted twice a day. `0` (default) keeps it for ever. Chart: `retention.auditMonths` |
 | `LLMR_SEED_CLAUDE_SUBSCRIPTION` | `1` adds the [subscription pass-through](clients.md#on-your-claudeai-subscription) provider and models |
 | `LLMR_IDE_LISTEN`, `LLMR_IDE_ORIGIN`, `LLMR_COOKIE_DOMAIN` | [Workspace IDE](workspaces.md) listener, its public origin, and the session cookie domain when it is another hostname |
 | `LLMR_METRICS_LISTEN` | Serve `/metrics` on this address (e.g. `:9090`) instead of the main listener; `off` turns it off. See [Monitoring](monitoring.md) |
@@ -174,6 +253,32 @@ Placeholder secrets such as `change-me` are refused. Generate them with `openssl
   key those describe that key's quota, not the caller's.
 - **Upgrades**: pull the new tag and restart. Migrations apply on start and only go forward, so
   back up Postgres first. Upgrade the control plane before the gateways.
+
+### Upgrading to 0.4
+
+- **Stop the old control plane before starting 0.4.** The first start builds usage totals from the
+  requests already stored, and writes wait while it does; on a large database that takes a while.
+  Gateways keep serving meanwhile and upload their usage afterwards. The chart now replaces the
+  control-plane pod instead of rolling it, and gives its first start 10 minutes
+  (`startupFailureThreshold`); with Compose, `up -d` already replaces it.
+- **Postgres 15 or later** is required.
+- **Back up first**, as for any upgrade: there is no way back to 0.3 except the backup.
+- **Latency percentiles** on Analytics are now estimates read from histograms: right to the
+  histogram's range (1 to 1.5 s, say) and interpolated inside it. Days on the charts are UTC days.
+- **Connections**: llm-router now opens up to 24 connections by default (16 + 8), where 0.3 opened
+  about one per CPU. Check the database's `max_connections`.
+- **Connection poolers**: llm-router sets `statement_timeout` and
+  `idle_in_transaction_session_timeout` as it connects, and takes session advisory locks for
+  migrations and maintenance. Connect it to Postgres directly, or to a pooler in session mode. Behind
+  PgBouncer add both parameters to `ignore_startup_parameters`; in transaction mode the locks do
+  nothing, so run one control plane only.
+- **Health checks**: `/readyz` is the readiness check (config loaded, not shutting down) and
+  `/healthz` the liveness check. Neither depends on Postgres: with the database away llm-router
+  keeps serving from memory and queues usage. The chart uses both.
+- **SSO client secret**: it is now stored encrypted with `LLMR_ENCRYPTION_KEY`; the first start
+  encrypts the one already there. Backups made before the upgrade still hold it in plaintext: if
+  those backups are not trusted, rotate the client secret at the identity provider and enter the
+  new one under **Settings → OIDC provider**.
 
 ### Upgrading to 0.3
 
@@ -214,11 +319,32 @@ UI URL `http://localhost:3001`, public key `pk-lf-llm-router`, secret key `LANGF
 `admin@example.com` and `LANGFUSE_PASSWORD`. Sign-up is off.
 
 
+## Usage data
+
+Every request is one row in `usage_events`, about half a kilobyte with its indexes: roughly 40 GB a
+day at 1,000 requests a second. The table is partitioned by month.
+
+llm-router also keeps totals as it writes: `usage_hourly` and `usage_daily` hold one row per hour or
+day for each combination of key, user, team, model, deployment, gateway and status. The Dashboard
+and Analytics read these, so they stay fast and keep working after the individual requests are gone.
+The Requests page, and looking up one request by id, read the individual requests.
+
+By default nothing is deleted. Set a retention to bound the database:
+
+- `LLMR_USAGE_RETENTION_MONTHS` (chart: `retention.usageMonths`) drops whole months of individual
+  requests. With `3`, on any day in June the oldest requests kept are from 1 March.
+- `LLMR_ROLLUP_RETENTION_MONTHS` (chart: `retention.rollupMonths`) does the same for daily totals
+  and per-day spend. Budgets are unaffected: all-time spend is kept separately.
+- Hourly totals are always kept three months; charts older than that have daily points.
+
+Old months are dropped twice a day and at start, a partition at a time, without blocking writes.
+`llmr_usage_partitions_dropped_total` counts them. Deleted data is gone: only a backup has it.
+
 ## Production checklist
 
-- Managed Postgres with backups.
+- Managed Postgres (15 or later) with backups, and a [retention](#usage-data) that fits its disk.
 - `LLMR_ENCRYPTION_KEY` in a secret manager and backed up. Rotating it means re-entering provider
-  keys and telemetry destination secrets, and signing everyone out.
+  keys, telemetry destination secrets and the SSO client secret, and signing everyone out.
 - TLS in front of 8080.
 - `/metrics` off the public listener (`LLMR_METRICS_LISTEN`; the chart does it), and the
   [alerts](monitoring.md#alerts) wired to someone. Give gateways a memory limit.

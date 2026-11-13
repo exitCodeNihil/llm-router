@@ -45,6 +45,7 @@ func (m *Server) createTokenIssuer(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	auditTarget(r, "token_issuer", id.String())
 	m.bump(r.Context())
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id.String()})
 }

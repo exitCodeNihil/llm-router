@@ -1,5 +1,5 @@
 //! The /v1 data plane (internal/gateway): auth, limits, routing with failover,
-//! and the OpenAI and Anthropic surfaces, plus /healthz and /metrics.
+//! and the OpenAI and Anthropic surfaces, plus /healthz, /livez and /metrics.
 
 // Handlers return an error response as Err, which is a large value; it only
 // moves on the refusal paths.
@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
@@ -40,15 +40,100 @@ const MAX_BODY: usize = 10 << 20;
 
 pub struct State {
     pub config: ArcSwapOption<Config>,
-    /// Config loaded and the first sync done, so budgets are known.
-    pub ready: AtomicBool,
+    /// Ready once a config is loaded and budgets can be enforced: after the
+    /// first sync, or at once when the config came from the state directory
+    /// (budgets then run on the saved spend, or are refused until the first
+    /// sync when none was saved).
+    pub ready: Readiness,
     pub draining: AtomicBool,
     pub max_in_flight: i64,
 }
 
 impl State {
     pub fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Relaxed) && !self.draining.load(Ordering::Relaxed)
+        self.ready.get() && !self.draining.load(Ordering::Relaxed)
+    }
+}
+
+/// Whether the gateway may serve, as its dealings with the control plane
+/// leave it.
+pub struct Readiness {
+    ready: AtomicBool,
+    /// The control plane has refused this gateway's join for long enough that
+    /// it dropped its config; cleared by the next join that succeeds.
+    pub refused: AtomicBool,
+    epoch: Instant,
+    /// When the control plane last answered a config poll with 200 or 304,
+    /// in milliseconds after `epoch`: negative for a config from the state
+    /// directory, confirmed before this process started.
+    config_ok_ms: AtomicI64,
+    /// LLMR_MAX_CONFIG_AGE in milliseconds; 0 is off.
+    max_config_age_ms: AtomicU64,
+}
+
+const NEVER: i64 = i64::MIN;
+
+impl Default for Readiness {
+    fn default() -> Readiness {
+        Readiness {
+            ready: AtomicBool::new(false),
+            refused: AtomicBool::new(false),
+            epoch: Instant::now(),
+            config_ok_ms: AtomicI64::new(NEVER),
+            max_config_age_ms: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Readiness {
+    pub fn get(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
+    }
+
+    pub fn set(&self, ready: bool) {
+        self.ready.store(ready, Ordering::Relaxed);
+    }
+
+    fn now_ms(&self) -> i64 {
+        self.epoch.elapsed().as_millis() as i64
+    }
+
+    /// The control plane answered a config poll.
+    pub fn config_ok(&self) {
+        self.config_ok_ms.store(self.now_ms(), Ordering::Relaxed);
+    }
+
+    /// The config in use was last confirmed `age` ago.
+    pub fn config_ok_ago(&self, age: Duration) {
+        self.config_ok_ms.store(self.now_ms() - age.as_millis() as i64, Ordering::Relaxed);
+    }
+
+    /// Time since the control plane last answered a config poll; None before
+    /// the first.
+    pub fn config_age(&self) -> Option<Duration> {
+        match self.config_ok_ms.load(Ordering::Relaxed) {
+            NEVER => None,
+            at => Some(Duration::from_millis((self.now_ms() - at).max(0) as u64)),
+        }
+    }
+
+    pub fn max_config_age(&self) -> Option<Duration> {
+        match self.max_config_age_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(Duration::from_millis(ms)),
+        }
+    }
+
+    pub fn set_max_config_age(&self, max: Option<Duration>) {
+        self.max_config_age_ms.store(max.map_or(0, |d| d.as_millis() as u64), Ordering::Relaxed);
+    }
+
+    /// The config is older than LLMR_MAX_CONFIG_AGE allows.
+    pub fn stale(&self) -> bool {
+        match (self.max_config_age(), self.config_age()) {
+            (Some(max), Some(age)) => age > max,
+            _ => false,
+        }
     }
 }
 
@@ -175,13 +260,20 @@ async fn dispatch(st: &'static State, req: Request<Incoming>) -> Response<Body> 
     let path = req.uri().path();
     match (req.method(), path) {
         (&Method::GET, "/healthz") => {
-            if st.is_ready() {
-                text(StatusCode::OK, "ok")
-            } else {
+            if !st.is_ready() {
                 text(StatusCode::SERVICE_UNAVAILABLE, "starting")
+            } else if st.ready.stale() {
+                text(StatusCode::SERVICE_UNAVAILABLE, "config stale")
+            } else {
+                text(StatusCode::OK, "ok")
             }
         }
+        (&Method::GET, "/livez") => text(StatusCode::OK, "ok"),
         (&Method::GET, "/metrics") => {
+            let age = st.ready.config_age().map_or(0, |d| d.as_secs());
+            metrics::CONFIG_AGE_SECONDS.store(age as i64, Ordering::Relaxed);
+            metrics::CONFIG_STALE.store(st.ready.stale() as i64, Ordering::Relaxed);
+            metrics::REFUSED.store(st.ready.refused.load(Ordering::Relaxed) as i64, Ordering::Relaxed);
             let body = metrics::render(
                 st.is_ready(),
                 crate::usage::queued(),
@@ -201,6 +293,13 @@ async fn dispatch(st: &'static State, req: Request<Incoming>) -> Response<Body> 
             | "/v1/messages"
             | "/v1/messages/count_tokens",
         ) => {
+            if st.ready.refused.load(Ordering::Relaxed) {
+                return unavailable(
+                    "gateway_refused",
+                    "the control plane refused this gateway: its group was deleted or its join token replaced",
+                    30,
+                );
+            }
             let Some(cfg) = st.config.load_full() else {
                 return oai_error(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -209,6 +308,13 @@ async fn dispatch(st: &'static State, req: Request<Incoming>) -> Response<Body> 
                     "gateway has no config snapshot yet",
                 );
             };
+            if st.ready.stale() {
+                return unavailable(
+                    "config_stale",
+                    "the control plane has not confirmed this gateway's config for longer than it is allowed to serve",
+                    5,
+                );
+            }
             let (caller, inbound) = match authenticate(&cfg, req.headers()) {
                 Ok(v) => v,
                 Err(r) => return r,
@@ -925,6 +1031,13 @@ fn text(status: StatusCode, s: &'static str) -> Response<Body> {
 
 pub fn oai_error(status: StatusCode, kind: &str, code: &str, message: &str) -> Response<Body> {
     json(status, serde_json::json!({"error": {"message": message, "type": kind, "code": code}}))
+}
+
+/// A 503 the client may retry after `retry_after_s`.
+fn unavailable(code: &str, message: &str, retry_after_s: u64) -> Response<Body> {
+    let mut r = oai_error(StatusCode::SERVICE_UNAVAILABLE, "server_error", code, message);
+    r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(retry_after_s));
+    r
 }
 
 fn auth_error(message: &str) -> Response<Body> {

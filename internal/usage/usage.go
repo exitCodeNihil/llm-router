@@ -13,12 +13,15 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/exitcodenihil/llm-router/internal/store"
 )
 
 type Event struct {
@@ -110,6 +113,22 @@ type PGWriter struct {
 	pool    *pgxpool.Pool
 	ch      chan Event
 	Dropped atomic.Int64
+	// FlushFailures counts failed writes to Postgres; each is retried.
+	FlushFailures atomic.Int64
+	// Lost counts events given up on: those still unwritten at shutdown.
+	Lost atomic.Int64
+
+	// Retention is what Prune keeps. Set before Run.
+	Retention Retention
+	// PartitionsDropped counts monthly partitions dropped past their retention.
+	PartitionsDropped atomic.Int64
+	// PartitionErrors counts monthly partitions that could not be created.
+	PartitionErrors atomic.Int64
+	// Maintenance runs after Prune in each maintenance pass, under the same
+	// lock. Set before Run.
+	Maintenance []func(context.Context) error
+
+	indexing sync.Mutex // one EnsureIndexes pass at a time
 }
 
 func NewPGWriter(pool *pgxpool.Pool) *PGWriter {
@@ -146,6 +165,8 @@ func (w *PGWriter) Run(ctx context.Context) {
 	if err := w.EnsurePartitions(ctx); err != nil {
 		slog.Error("usage partitions", "err", err)
 	}
+	// In the background: on a large partition an index takes a while to build.
+	go w.maintain(ctx)
 	partTicker := time.NewTicker(12 * time.Hour)
 	defer partTicker.Stop()
 
@@ -153,17 +174,32 @@ func (w *PGWriter) Run(ctx context.Context) {
 	defer flushTicker.Stop()
 
 	batch := make([]Event, 0, flushBatchSize)
+	// A failed flush keeps its batch and tries again, backing off to 30 s.
+	// Meanwhile the queue takes new events, and drops the oldest once full.
+	var retryAt time.Time
+	backoff := time.Second
 	flush := func() {
-		if len(batch) == 0 {
+		if len(batch) == 0 || time.Now().Before(retryAt) {
 			return
 		}
-		if err := w.flush(ctx, batch); err != nil && ctx.Err() == nil {
-			slog.Error("usage flush failed", "events", len(batch), "err", err)
+		if err := w.flush(ctx, batch); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			w.FlushFailures.Add(1)
+			slog.Error("usage flush failed, will retry", "events", len(batch), "retry_in", backoff, "err", err)
+			retryAt = time.Now().Add(backoff)
+			backoff = min(2*backoff, 30*time.Second)
+			return
 		}
-		batch = batch[:0]
+		batch, backoff, retryAt = batch[:0], time.Second, time.Time{}
 	}
 
 	for {
+		in := w.ch
+		if len(batch) >= flushBatchSize {
+			in = nil // a full batch is waiting for its retry
+		}
 		select {
 		case <-ctx.Done():
 			// final flush with a fresh context so shutdown persists buffered events
@@ -179,12 +215,13 @@ func (w *PGWriter) Run(ctx context.Context) {
 			}
 			if len(batch) > 0 {
 				if err := w.flush(fctx, batch); err != nil {
-					slog.Error("final usage flush failed", "err", err)
+					w.Lost.Add(int64(len(batch)))
+					slog.Error("final usage flush failed", "lost", len(batch), "err", err)
 				}
 			}
 			cancel()
 			return
-		case e := <-w.ch:
+		case e := <-in:
 			batch = append(batch, e)
 			if len(batch) >= flushBatchSize {
 				flush()
@@ -193,6 +230,7 @@ func (w *PGWriter) Run(ctx context.Context) {
 			flush()
 		case <-partTicker.C:
 			w.ensurePartitions(ctx, time.Now().UTC())
+			go w.maintain(ctx)
 		}
 	}
 }
@@ -210,7 +248,25 @@ func (w *PGWriter) flush(ctx context.Context, events []Event) error {
 	if n := len(events) - len(kept); n > 0 {
 		slog.Warn("usage rows refused", "refused", n, "of", len(events))
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		// The connection can fail after Postgres committed. Writing the batch
+		// again would count its usage and spend twice, so look for it first.
+		if len(kept) > 0 && w.stored(kept[0]) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// stored reports whether e is in usage_events.
+func (w *PGWriter) stored(e Event) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var found bool
+	err := w.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM usage_events WHERE request_id = $1 AND ts = $2)`,
+		e.RequestID, e.TS).Scan(&found)
+	return err == nil && found
 }
 
 // ScopeKeys lists the spend scopes an event counts against: its key, user and
@@ -277,7 +333,10 @@ func InsertEvents(ctx context.Context, tx pgx.Tx, events []Event) ([]Event, erro
 	if len(refused) > 1 {
 		slog.Warn("usage rows refused", "refused", len(refused), "of", len(events))
 	}
-	return kept, writeCounters(ctx, tx, kept)
+	if err := writeCounters(ctx, tx, kept); err != nil {
+		return nil, err
+	}
+	return kept, writeRollups(ctx, tx, kept)
 }
 
 // savepoint runs fn in a nested transaction, so a failure rolls back only
@@ -323,11 +382,15 @@ func queueRow(b *pgx.Batch, e Event) {
 		nilIfEmpty(e.TraceID), nilIfEmpty(e.InferenceGeo), nilIfEmpty(e.Speed), zeroIfNil(e.CostBasis))
 }
 
-// writeCounters adds the events' spend: one upsert per (scope, day).
+// TotalStart is the period_start of a scope's all-time row in spend_totals.
+var TotalStart = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// writeCounters adds the events' spend: one upsert per (scope, day) in
+// spend_counters, and the scope's month and all-time rows in spend_totals.
 func writeCounters(ctx context.Context, tx pgx.Tx, events []Event) error {
 	type counter struct {
-		scopeType, scopeID string
-		day                time.Time
+		period, scopeType, scopeID string // period: "day", "month" or "total"
+		start                      time.Time
 	}
 	type total struct {
 		usd    float64
@@ -335,18 +398,23 @@ func writeCounters(ctx context.Context, tx pgx.Tx, events []Event) error {
 	}
 	agg := map[counter]*total{}
 	for _, e := range events {
-		day := e.TS.UTC().Truncate(24 * time.Hour)
+		ts := e.TS.UTC()
 		tokens := int64(e.PromptTokens + e.CompletionTokens)
 		for _, key := range ScopeKeys(e) {
 			scopeType, scopeID, _ := strings.Cut(key, ":")
-			k := counter{scopeType, scopeID, day}
-			c := agg[k]
-			if c == nil {
-				c = &total{}
-				agg[k] = c
+			for _, k := range []counter{
+				{"day", scopeType, scopeID, ts.Truncate(24 * time.Hour)},
+				{"month", scopeType, scopeID, time.Date(ts.Year(), ts.Month(), 1, 0, 0, 0, 0, time.UTC)},
+				{"total", scopeType, scopeID, TotalStart},
+			} {
+				c := agg[k]
+				if c == nil {
+					c = &total{}
+					agg[k] = c
+				}
+				c.usd += e.CostUSD
+				c.tokens += tokens
 			}
-			c.usd += e.CostUSD
-			c.tokens += tokens
 		}
 	}
 	if len(agg) == 0 {
@@ -356,17 +424,27 @@ func writeCounters(ctx context.Context, tx pgx.Tx, events []Event) error {
 	// user's, a team's) would otherwise lock them in opposite orders and
 	// deadlock.
 	keys := slices.SortedFunc(maps.Keys(agg), func(a, b counter) int {
-		return cmp.Or(strings.Compare(a.scopeType, b.scopeType), strings.Compare(a.scopeID, b.scopeID), a.day.Compare(b.day))
+		return cmp.Or(strings.Compare(a.period, b.period), strings.Compare(a.scopeType, b.scopeType),
+			strings.Compare(a.scopeID, b.scopeID), a.start.Compare(b.start))
 	})
 	b := &pgx.Batch{}
 	for _, k := range keys {
 		c := agg[k]
-		b.Queue(`INSERT INTO spend_counters (scope_type, scope_id, period_start, usd, tokens)
-			VALUES ($1,$2,$3,$4,$5)
-			ON CONFLICT (scope_type, scope_id, period_start)
-			DO UPDATE SET usd = spend_counters.usd + EXCLUDED.usd,
-			              tokens = spend_counters.tokens + EXCLUDED.tokens`,
-			k.scopeType, k.scopeID, k.day, c.usd, c.tokens)
+		if k.period == "day" {
+			b.Queue(`INSERT INTO spend_counters (scope_type, scope_id, period_start, usd, tokens)
+				VALUES ($1,$2,$3,$4,$5)
+				ON CONFLICT (scope_type, scope_id, period_start)
+				DO UPDATE SET usd = spend_counters.usd + EXCLUDED.usd,
+				              tokens = spend_counters.tokens + EXCLUDED.tokens`,
+				k.scopeType, k.scopeID, k.start, money(c.usd), c.tokens)
+			continue
+		}
+		b.Queue(`INSERT INTO spend_totals (period, period_start, scope_type, scope_id, usd, tokens)
+			VALUES ($1,$2,$3,$4,$5,$6)
+			ON CONFLICT (period, period_start, scope_type, scope_id)
+			DO UPDATE SET usd = spend_totals.usd + EXCLUDED.usd,
+			              tokens = spend_totals.tokens + EXCLUDED.tokens`,
+			k.period, k.start, k.scopeType, k.scopeID, money(c.usd), c.tokens)
 	}
 	return tx.SendBatch(ctx, b).Close()
 }
@@ -380,31 +458,148 @@ func (w *PGWriter) EnsurePartitions(ctx context.Context) error {
 }
 
 func (w *PGWriter) ensurePartitions(ctx context.Context, now time.Time) error {
+	// One connection, so the lock timeout stays with these statements. A new
+	// partition briefly locks its parent; behind a long query it gives up and
+	// tries again rather than hold every insert up behind it.
+	conn, err := w.pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SET lock_timeout = '5s'`); err != nil {
+		return err
+	}
+	defer conn.Exec(context.WithoutCancel(ctx), `RESET lock_timeout`)
+
 	lo, hi := Window(now)
 	var firstErr error
 	for start := lo; start.Before(hi); start = start.AddDate(0, 1, 0) {
 		end := start.AddDate(0, 1, 0)
-		name := "usage_events_" + start.Format("2006_01")
-		// DDL cannot take bind params; bounds are generated, not user input
-		_, err := w.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+name+
-			` PARTITION OF usage_events FOR VALUES FROM ('`+start.Format("2006-01-02")+
-			`') TO ('`+end.Format("2006-01-02")+`')`)
-		if err != nil {
-			slog.Error("create partition failed", "partition", name, "err", err)
-			if firstErr == nil {
-				firstErr = fmt.Errorf("create partition %s: %w", name, err)
-			}
-			continue
-		}
-		for _, idx := range []string{
-			`CREATE INDEX IF NOT EXISTS ` + name + `_team_ts ON ` + name + ` (team_id, ts)`,
-			`CREATE INDEX IF NOT EXISTS ` + name + `_key_ts ON ` + name + ` (api_key_id, ts)`,
-			// ts-only index powers the Requests feed / by-deployment scans.
-			// ponytail: applied to new partitions only; old dev partitions stay small.
-			`CREATE INDEX IF NOT EXISTS ` + name + `_ts ON ` + name + ` (ts DESC)`,
+		// usage_events' bounds are dates, read in the database's time zone, as
+		// its first partitions were made; the rollups' are UTC instants. The
+		// rollups' rows are updated in place: see migration 0028.
+		for _, t := range []struct{ table, layout, with string }{
+			{"usage_events", "2006-01-02", ""},
+			{"usage_hourly", "2006-01-02 15:04:05Z07", rollupStorage},
+			{"usage_daily", "2006-01-02 15:04:05Z07", rollupStorage},
 		} {
-			if _, err := w.pool.Exec(ctx, idx); err != nil {
-				slog.Error("create partition index failed", "partition", name, "err", err)
+			name := t.table + "_" + start.Format("2006_01")
+			// DDL cannot take bind params; bounds are generated, not user input
+			ddl := `CREATE TABLE IF NOT EXISTS ` + name + ` PARTITION OF ` + t.table +
+				` FOR VALUES FROM ('` + start.Format(t.layout) + `') TO ('` + end.Format(t.layout) + `')` + t.with
+			var err error
+			for try := 1; ; try++ {
+				if _, err = conn.Exec(ctx, ddl); err == nil || try == 3 || !store.LockTimedOut(err) {
+					break
+				}
+			}
+			if err != nil {
+				w.PartitionErrors.Add(1)
+				slog.Error("create partition failed", "partition", name, "err", err)
+				if firstErr == nil {
+					firstErr = fmt.Errorf("create partition %s: %w", name, err)
+				}
+			}
+		}
+	}
+	return firstErr
+}
+
+const rollupStorage = ` WITH (fillfactor = 90, autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.02)`
+
+// maintain builds missing indexes and drops what is past its retention. An
+// advisory lock keeps it to one control plane at a time.
+func (w *PGWriter) maintain(ctx context.Context) {
+	// The lock belongs to this connection's session; it stays idle, outside
+	// any transaction, while the work runs on others.
+	conn, err := w.pool.Acquire(ctx)
+	if err != nil {
+		return
+	}
+	defer conn.Release()
+	var locked bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, store.LockMaintain).Scan(&locked); err != nil || !locked {
+		return
+	}
+	defer func() {
+		uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if _, err := conn.Exec(uctx, `SELECT pg_advisory_unlock($1)`, store.LockMaintain); err != nil {
+			conn.Conn().Close(uctx)
+		}
+	}()
+
+	if err := w.EnsureIndexes(ctx); err != nil && ctx.Err() == nil {
+		slog.Error("usage indexes", "err", err)
+	}
+	if err := w.Prune(ctx, time.Now()); err != nil && ctx.Err() == nil {
+		slog.Error("usage retention", "err", err)
+	}
+	for _, fn := range w.Maintenance {
+		if err := fn(ctx); err != nil && ctx.Err() == nil {
+			slog.Error("maintenance", "err", err)
+		}
+	}
+	// Autovacuum analyses partitions, never the partitioned table itself, and
+	// the planner needs the latter's statistics for the dashboards' queries.
+	if _, err := w.pool.Exec(ctx, `ANALYZE usage_hourly, usage_daily`); err != nil && ctx.Err() == nil {
+		slog.Error("analyze usage rollups", "err", err)
+	}
+}
+
+// partitionIndexes are the indexes every usage_events partition carries, as
+// name suffix and columns.
+var partitionIndexes = [][2]string{
+	{"_team_ts", "(team_id, ts)"},
+	{"_key_ts", "(api_key_id, ts)"},
+	{"_user_ts", "(user_id, ts)"},
+	// the Requests feed and other scans bounded only by time
+	{"_ts", "(ts DESC)"},
+	// finding one request by its id
+	{"_request", "(request_id)"},
+}
+
+// EnsureIndexes builds the indexes missing from any partition, old ones
+// included. It builds them CONCURRENTLY, so writes carry on while a large
+// partition is indexed, and so it must not run inside a transaction.
+func (w *PGWriter) EnsureIndexes(ctx context.Context) error {
+	if !w.indexing.TryLock() {
+		return nil // a pass is already running
+	}
+	defer w.indexing.Unlock()
+	rows, err := w.pool.Query(ctx, `SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+		WHERE i.inhparent = 'usage_events'::regclass ORDER BY 1`)
+	if err != nil {
+		return err
+	}
+	parts, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, part := range parts {
+		for _, idx := range partitionIndexes {
+			name := part + idx[0]
+			var valid *bool
+			if err := w.pool.QueryRow(ctx,
+				`SELECT (SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1))`, name).Scan(&valid); err != nil {
+				return err
+			}
+			if valid != nil && *valid {
+				continue
+			}
+			// An interrupted concurrent build leaves an invalid index behind.
+			// names are generated, not user input
+			if valid != nil {
+				if _, err := w.pool.Exec(ctx, `DROP INDEX CONCURRENTLY IF EXISTS `+name); err != nil {
+					slog.Error("drop invalid partition index failed", "index", name, "err", err)
+				}
+			}
+			if _, err := w.pool.Exec(ctx, `CREATE INDEX CONCURRENTLY IF NOT EXISTS `+name+` ON `+part+` `+idx[1]); err != nil {
+				slog.Error("create partition index failed", "index", name, "err", err)
+				if firstErr == nil {
+					firstErr = fmt.Errorf("create index %s: %w", name, err)
+				}
 			}
 		}
 	}

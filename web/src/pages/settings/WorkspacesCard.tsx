@@ -17,15 +17,15 @@ import { TextInput } from "@astryxdesign/core/TextInput";
 import { useToast } from "@astryxdesign/core/Toast";
 
 import type { WorkspaceScope } from "../../lib/types";
-import { useSaveWorkspaceSettings, useTeams, useUsers, useWorkspaceSettings } from "../../lib/hooks";
+import { useLookup, useSaveWorkspaceSettings, useTeams, useWorkspaceSettings } from "../../lib/hooks";
 import { ErrorState, Loading } from "../../components/Page";
+import { EntityPicker } from "../../components/EntityPicker";
 import { IconPlus, IconTrash } from "../../components/icons";
 
 export default function WorkspacesCard() {
   const settings = useWorkspaceSettings();
   const save = useSaveWorkspaceSettings();
   const teams = useTeams();
-  const users = useUsers();
   const showToast = useToast();
 
   const [enabled, setEnabled] = useState(false);
@@ -42,6 +42,7 @@ export default function WorkspacesCard() {
   const [allow, setAllow] = useState<WorkspaceScope[]>([]);
   const [scopeType, setScopeType] = useState<"user" | "team">("user");
   const [scopeValue, setScopeValue] = useState("");
+  const names = useLookup({ users: allow.filter((a) => a.scope_type === "user").map((a) => a.scope_value) }).data;
 
   // Hydrate once: a background refetch must not wipe half-entered edits.
   const hydrated = useRef(false);
@@ -98,16 +99,13 @@ export default function WorkspacesCard() {
     if (s.scope_type === "team") {
       return teams.data?.find((t) => t.id === s.scope_value)?.name ?? s.scope_value;
     }
-    return users.data?.find((u) => u.id === s.scope_value)?.email ?? s.scope_value;
+    return names?.users[s.scope_value] ?? s.scope_value;
   }
 
   if (settings.isLoading) return <Loading />;
   if (settings.error) return <ErrorState error={settings.error} onRetry={() => settings.refetch()} />;
 
-  const options =
-    scopeType === "team"
-      ? (teams.data ?? []).map((t) => ({ value: t.id, label: t.name }))
-      : (users.data ?? []).map((u) => ({ value: u.id, label: u.email }));
+  const teamOptions = (teams.data ?? []).map((t) => ({ value: t.id, label: t.name }));
 
   return (
     <Card>
@@ -249,13 +247,23 @@ export default function WorkspacesCard() {
                   { value: "team", label: "Team" },
                 ]}
               />
-              <Selector
-                label={scopeType === "team" ? "Team" : "User"}
-                value={scopeValue}
-                onChange={setScopeValue}
-                placeholder="Select…"
-                options={options}
-              />
+              {scopeType === "team" ? (
+                <Selector
+                  label="Team"
+                  value={scopeValue}
+                  onChange={setScopeValue}
+                  placeholder="Select…"
+                  options={teamOptions}
+                />
+              ) : (
+                <EntityPicker
+                  kind="user"
+                  label="User"
+                  value={scopeValue}
+                  onChange={setScopeValue}
+                  placeholder="Search users…"
+                />
+              )}
               <Button
                 label="Add"
                 variant="secondary"

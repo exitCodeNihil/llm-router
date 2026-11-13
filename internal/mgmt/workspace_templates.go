@@ -43,6 +43,7 @@ func (m *Server) createWorkspaceTemplate(w http.ResponseWriter, r *http.Request)
 		httpError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	auditTarget(r, "workspace_template", id.String())
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id.String()})
 }
 

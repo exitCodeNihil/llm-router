@@ -23,6 +23,34 @@ encryptionKey: ""
 # name of an existing Secret with keys: database-url, admin-token, encryption-key
 existingSecret: ""
 
+# debug, info, warn or error; and text or json (one object per line).
+logLevel: info
+logFormat: text
+
+# How many 5-second checks the first start may take before Kubernetes restarts
+# the pod. Migrations run before llm-router listens; raise this for the first
+# start of a release on a very large database (120 = 10 minutes).
+startupFailureThreshold: 120
+
+# How long usage is kept, in whole months before the current one. 0 keeps it
+# for ever. usageMonths is for individual requests (the Requests page), at
+# least 2; rollupMonths is for the daily totals behind the dashboards and
+# per-day spend, at least 3. Hourly totals are always kept three months.
+# auditMonths is for the audit log of administrative actions.
+retention:
+  usageMonths: 0
+  rollupMonths: 0
+  auditMonths: 0
+
+# Postgres connections. llm-router keeps two pools: one for usage writes,
+# gateway sync and config, one for console reads. Their sum must fit under the
+# database's max_connections. consoleTimeout cancels a console query that runs
+# longer (the console then answers 504).
+database:
+  maxConns: 16
+  consoleMaxConns: 8
+  consoleTimeout: 30s
+
 # Workspaces (docs/workspaces.md). Adds RBAC for pods, exec, PVCs and secrets
 # in this release's namespace, plus the IDE listener on 8081 served from its own origin.
 workspaces:
@@ -63,6 +91,23 @@ gateway:
   joinToken: ""
   existingSecret: ""
   controlPlaneUrl: ""  # default: this release's llm-router service
+  logLevel: info     # debug, info, warn or error
+  logFormat: text    # text or json
+  # Seconds a gateway keeps serving after the control plane last confirmed its
+  # config (LLMR_MAX_CONFIG_AGE, at least 120). Empty: for as long as the
+  # control plane is away.
+  maxConfigAge: ""
+  # Keep the last config and spend, encrypted with a key derived from the join
+  # token, and usage the control plane has not acknowledged yet, in an emptyDir
+  # (LLMR_STATE_DIR), so a restarted container serves before it reaches the
+  # control plane and hands over the usage it held. A new pod starts without it.
+  # sizeLimit is twice the usage spool's cap (LLMR_SPOOL_MAX_BYTES, 256 MiB by
+  # default): a pod that goes over its emptyDir limit is evicted, so the config
+  # and files being written need room beside a full spool. Raise the cap
+  # through extraEnv, and this with it.
+  state:
+    enabled: false
+    sizeLimit: 512Mi
   serviceAccount:
     create: true
     name: ""         # default: <release>-llm-router-gateway

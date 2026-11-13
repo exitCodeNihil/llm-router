@@ -66,18 +66,26 @@ func (m *Server) resolveCaller(r *http.Request) *Caller {
 }
 
 // requireAuth admits any authenticated caller; requireAdmin only global admins.
+// Refused attempts on audited routes are recorded here, where the caller is
+// unknown; everything past it is recorded by audited.
 func (m *Server) requireAuth(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// A bearer token here can only be the admin token: guesses are
 		// limited like passwords.
 		bearer := strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if bearer && m.TokenGuard != nil && m.TokenGuard.AdminTokenBlocked(w, r) {
+			m.recordUnauthenticated(r, http.StatusTooManyRequests)
 			return
 		}
 		c := m.resolveCaller(r)
 		if c == nil {
 			if bearer && m.TokenGuard != nil {
 				m.TokenGuard.AdminTokenFailed(r)
+			}
+			// Only an attempt that presented something: a request with no
+			// credentials at all is a scanner, and would fill the audit log.
+			if bearer || console.HasSession(r) {
+				m.recordUnauthenticated(r, http.StatusUnauthorized)
 			}
 			httpError(w, http.StatusUnauthorized, "authentication required")
 			return

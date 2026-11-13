@@ -11,6 +11,8 @@ export interface Me {
   has_password: boolean;
   /** Origin the IDE iframe loads from; "" when it shares this origin. */
   ide_origin: string;
+  /** Months individual requests are kept before they are deleted; 0 = for ever. */
+  usage_retention_months: number;
 }
 
 export interface User {
@@ -67,6 +69,9 @@ export interface ApiKey {
   disabled: boolean;
   tags: string[] | null;
   created_at: string;
+  /** Owner labels, present on the paged list only. */
+  user_email?: string | null;
+  team_name?: string | null;
 }
 
 export type ProviderType = "anthropic" | "azure" | "openai_compatible" | "gcp_vertex" | "openrouter";
@@ -191,6 +196,8 @@ export interface Price {
 
 export interface SsoSettings {
   configured: boolean;
+  /** Set when the stored client secret cannot be decrypted. */
+  secret_error?: string;
   sso?: {
     issuer_url: string;
     client_id: string;
@@ -391,6 +398,43 @@ export interface SpendByTeam {
   team_name: string;
   usd: number;
   tokens: number;
+}
+
+// ── Deleted users (GET /api/deleted-users) ───────────────────────
+export interface DeletedUser {
+  id: string;
+  /** The email the account had, or "erased". */
+  label: string;
+  deleted_at: string;
+  erased_at: string | null;
+}
+export interface EraseResult {
+  erased: boolean;
+  /** Where copies may remain that llm-router cannot remove. */
+  not_reached: string[];
+}
+
+// ── Audit log (GET /api/audit) ───────────────────────────────────
+export interface AuditEvent {
+  id: number;
+  ts: string;
+  actor_kind: "user" | "admin_token" | "anonymous";
+  actor_user_id: string | null;
+  actor_email: string | null;
+  /** The route pattern, e.g. "DELETE /api/users/{id}", or "auth.signin". */
+  action: string;
+  target_type: string | null;
+  target_id: string | null;
+  status: number;
+  client_ip: string | null;
+  /** What the request changed, for non-secret fields only. */
+  detail: Record<string, unknown> | null;
+}
+export interface AuditFilters {
+  action?: string;
+  target_type?: string;
+  status?: "ok" | "err";
+  actor?: string;
 }
 
 // ── Enriched requests feed (GET /api/usage/requests) ─────────────

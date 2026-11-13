@@ -40,12 +40,17 @@ func (a *Auth) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "setup status unavailable", http.StatusInternalServerError)
 		return
 	}
-	_, ssoErr := a.loadSSO(r.Context())
+	// An undecryptable secret hides the SSO button: sign-in cannot work.
+	_, ssoErr := LoadSSO(r.Context(), a.Store.Pool, a.EncryptionKey)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"needed": needed, "sso": ssoErr == nil})
 }
 
 func (a *Auth) handleSetup(w http.ResponseWriter, r *http.Request) {
+	sw := &statusWriter{ResponseWriter: w}
+	w = sw
+	var adminID, adminEmail string
+	defer func() { a.audit(r, "auth.setup", sw.status, adminID, adminEmail) }()
 	lim := a.signInLimits()
 	if !lim.admit(w, lim.clientIP(r), "", time.Now()) {
 		return
@@ -84,11 +89,22 @@ func (a *Auth) handleSetup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "setup is already complete", http.StatusForbidden)
 		return
 	}
+	adminID, adminEmail = id.String(), req.Email
 	setSessionCookie(w, r, a.EncryptionKey, a.CookieDomain, id.String())
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *Auth) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
+	sw := &statusWriter{ResponseWriter: w}
+	w = sw
+	var signedIn, signedInEmail string
+	defer func() {
+		if signedIn != "" {
+			a.audit(r, "auth.signin", sw.status, signedIn, signedInEmail)
+		} else {
+			a.audit(r, "auth.signin_failed", sw.status, "", "")
+		}
+	}()
 	var req struct {
 		Email    string `json:"email"`
 		Password string `json:"password"`
@@ -120,6 +136,7 @@ func (a *Auth) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lim.succeeded(ip, email)
+	signedIn, signedInEmail = userID, req.Email
 	setSessionCookie(w, r, a.EncryptionKey, a.CookieDomain, userID)
 	w.WriteHeader(http.StatusNoContent)
 }

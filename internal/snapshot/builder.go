@@ -330,87 +330,85 @@ func (b *Builder) loadDestinations(ctx context.Context, s *Snapshot) error {
 	return rows.Err()
 }
 
-// loadSpend caches current-period spend per scope for O(1) budget checks.
-// Total-period budgets sum all rows; daily/monthly sum from the period start.
+// spendTotalStart is the period_start of a scope's all-time row in
+// spend_totals (usage.TotalStart).
+var spendTotalStart = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// loadSpend caches current-period spend for every scope that has a budget, for
+// O(1) budget checks. It reads one row per scope: today's from spend_counters,
+// this month's and the all-time one from spend_totals.
 func (b *Builder) loadSpend(ctx context.Context, s *Snapshot) error {
-	rows, err := b.Pool.Query(ctx,
-		`SELECT scope_type, scope_id, period_start, usd FROM spend_counters`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	type row struct {
-		scopeType, scopeID string
-		periodStart        time.Time
-		usd                float64
-	}
-	var all []row
-	for rows.Next() {
-		var r row
-		if err := rows.Scan(&r.scopeType, &r.scopeID, &r.periodStart, &r.usd); err != nil {
-			return err
+	// The budgeted scopes, by the period their budget runs over.
+	type scopes struct{ types, ids []string }
+	var daily, monthly, total scopes
+	add := func(scopeType, scopeID string, budget *float64, period string) {
+		if budget == nil {
+			return
 		}
-		all = append(all, r)
+		var to *scopes
+		switch period {
+		case "daily":
+			to = &daily
+		case "monthly":
+			to = &monthly
+		case "total", "":
+			// a budget_usd without a period behaves as a total budget
+			to = &total
+		default:
+			return
+		}
+		to.types, to.ids = append(to.types, scopeType), append(to.ids, scopeID)
 	}
-	if rows.Err() != nil {
-		return rows.Err()
+	for _, k := range s.KeysByHash {
+		add("key", k.ID, k.BudgetUSD, k.BudgetPeriod)
+	}
+	for _, u := range s.UsersByID {
+		add("user", u.ID, u.BudgetUSD, u.BudgetPeriod)
+		for teamID, m := range u.Memberships {
+			add("member", u.ID+":"+teamID, m.BudgetUSD, m.BudgetPeriod)
+		}
+	}
+	for _, t := range s.TeamsByID {
+		add("team", t.ID, t.BudgetUSD, t.BudgetPeriod)
 	}
 
 	now := time.Now().UTC()
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
 
-	keysByID := make(map[string]*Key, len(s.KeysByHash))
-	for _, k := range s.KeysByHash {
-		keysByID[k.ID] = k
-	}
-	period := func(scopeType, scopeID string) string {
-		switch scopeType {
-		case "key":
-			if k := keysByID[scopeID]; k != nil {
-				return k.BudgetPeriod
-			}
-		case "user":
-			if u := s.UsersByID[scopeID]; u != nil {
-				return u.BudgetPeriod
-			}
-		case "team":
-			if t := s.TeamsByID[scopeID]; t != nil {
-				return t.BudgetPeriod
-			}
-		case "member":
-			if userID, teamID, ok := strings.Cut(scopeID, ":"); ok {
-				if u := s.UsersByID[userID]; u != nil {
-					if mem := u.Memberships[teamID]; mem != nil {
-						return mem.BudgetPeriod
-					}
-				}
-			}
+	load := func(w scopes, sql string, args ...any) error {
+		if len(w.ids) == 0 {
+			return nil
 		}
-		return ""
-	}
-
-	for _, r := range all {
-		p := period(r.scopeType, r.scopeID)
-		include := false
-		switch p {
-		case "daily":
-			include = !r.periodStart.Before(today)
-		case "monthly":
-			include = !r.periodStart.Before(monthStart)
-		case "total", "":
-			// "" = scope with no period set (or deleted scope): count everything,
-			// so a budget_usd without a period behaves as a total budget
-			include = true
+		rows, err := b.Pool.Query(ctx, sql, append([]any{w.types, w.ids}, args...)...)
+		if err != nil {
+			return err
 		}
-		if include {
-			key := r.scopeType + ":" + r.scopeID
-			sp := s.Spend[key]
-			sp.USD += r.usd
-			s.Spend[key] = sp
+		defer rows.Close()
+		for rows.Next() {
+			var scopeType, scopeID string
+			var usd float64
+			if err := rows.Scan(&scopeType, &scopeID, &usd); err != nil {
+				return err
+			}
+			s.Spend[scopeType+":"+scopeID] = Spend{USD: usd}
 		}
+		return rows.Err()
 	}
-	return nil
+	const fromTotals = `SELECT c.scope_type, c.scope_id, c.usd
+		FROM unnest($1::text[], $2::text[]) AS w(scope_type, scope_id)
+		JOIN spend_totals c ON c.period = $3 AND c.period_start = $4
+		 AND c.scope_type = w.scope_type AND c.scope_id = w.scope_id`
+	if err := load(daily, `SELECT c.scope_type, c.scope_id, c.usd
+		FROM unnest($1::text[], $2::text[]) AS w(scope_type, scope_id)
+		JOIN spend_counters c ON c.scope_type = w.scope_type AND c.scope_id = w.scope_id
+		 AND c.period_start = $3`, today); err != nil {
+		return err
+	}
+	if err := load(monthly, fromTotals, "month", monthStart); err != nil {
+		return err
+	}
+	return load(total, fromTotals, "total", spendTotalStart)
 }
 
 func applyClaimMapping(iss *Issuer, m map[string]any) {
@@ -495,13 +493,16 @@ func Refresher(ctx context.Context, pool *pgxpool.Pool, b *Builder, h *Holder, p
 		case <-notify:
 		case <-ticker.C:
 		}
+		start := time.Now()
 		s, err := b.Build(ctx)
 		if err != nil {
 			if ctx.Err() == nil {
+				h.Failed()
 				slog.Error("snapshot rebuild failed", "err", err)
 			}
 			continue
 		}
+		h.Built(time.Since(start))
 		// always swap: spend counters change without config version bumps
 		h.Set(s)
 	}
