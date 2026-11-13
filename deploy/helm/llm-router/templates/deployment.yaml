@@ -30,6 +30,9 @@ spec:
     spec:
       {{- $ws := .Values.workspaces.enabled }}
       serviceAccountName: {{ include "llm-router.serviceAccountName" . }}
+      # Longer than a shutdown takes: 10 s to finish requests, then the usage
+      # and telemetry queues flush.
+      terminationGracePeriodSeconds: 40
       containers:
         - name: llm-router
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
@@ -71,6 +74,10 @@ spec:
             - name: LLMR_TRUSTED_PROXIES
               value: {{ join "," . | quote }}
             {{- end }}
+            - name: LLMR_LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+            - name: LLMR_LOG_FORMAT
+              value: {{ .Values.logFormat | quote }}
             - name: LLMR_USAGE_RETENTION_MONTHS
               value: {{ .Values.retention.usageMonths | quote }}
             - name: LLMR_ROLLUP_RETENTION_MONTHS
@@ -96,10 +103,19 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           {{- end }}
+          # Migrations run before the listener starts, and on a large
+          # database the first start of a release can take minutes.
+          startupProbe:
+            httpGet: {path: /healthz, port: 8080}
+            periodSeconds: 5
+            failureThreshold: {{ .Values.startupFailureThreshold }}
+            timeoutSeconds: 3
           livenessProbe:
             httpGet: {path: /healthz, port: 8080}
+            timeoutSeconds: 3
           readinessProbe:
-            httpGet: {path: /healthz, port: 8080}
+            httpGet: {path: /readyz, port: 8080}
+            timeoutSeconds: 3
           resources: {{- toYaml .Values.resources | nindent 12 }}
       {{- if or .Values.anthropicIdentity.enabled .Values.extraVolumes }}
       volumes:

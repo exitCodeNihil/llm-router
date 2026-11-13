@@ -129,6 +129,20 @@ spec:
           annotations:
             summary: "{{ "{{ $labels.pod }}" }} cannot write usage to Postgres"
             description: Writes are being retried and the queue is filling; once it is full, usage is dropped. Check Postgres.
+        - alert: LLMRouterSnapshotStale
+          expr: llmr_snapshot_age_seconds{ {{- $sel -}} } > 300
+          for: 5m
+          labels: {severity: critical}
+          annotations:
+            summary: "{{ "{{ $labels.pod }}" }} cannot read its config from Postgres"
+            description: The config in use is over 5 minutes old, so changes to keys, budgets and providers are not taking effect and budgets are checked against old spend. Check Postgres.
+        - alert: LLMRouterDatabasePoolSaturated
+          expr: llmr_db_pool_acquired_conns{ {{- $sel -}} } >= llmr_db_pool_max_conns{ {{- $sel -}} }
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "{{ "{{ $labels.pod }}" }} is using every {{ "{{ $labels.pool }}" }} Postgres connection"
+            description: Requests are waiting for a connection. Look for slow queries, or raise database.maxConns or database.consoleMaxConns.
         - alert: LLMRouterTelemetryDestinationFailing
           expr: max by (destination) (llmr_telemetry_destination_failing{ {{- $sel -}} }) > 0
           for: 10m

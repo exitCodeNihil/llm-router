@@ -493,13 +493,16 @@ func Refresher(ctx context.Context, pool *pgxpool.Pool, b *Builder, h *Holder, p
 		case <-notify:
 		case <-ticker.C:
 		}
+		start := time.Now()
 		s, err := b.Build(ctx)
 		if err != nil {
 			if ctx.Err() == nil {
+				h.Failed()
 				slog.Error("snapshot rebuild failed", "err", err)
 			}
 			continue
 		}
+		h.Built(time.Since(start))
 		// always swap: spend counters change without config version bumps
 		h.Set(s)
 	}

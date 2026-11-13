@@ -198,7 +198,13 @@ func Logging(next http.Handler) http.Handler {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(sw, r)
-		slog.Info("http", "method", r.Method, "path", r.URL.Path, "status", sw.status,
+		// Probes, scrapes and each gateway's sync every two seconds would
+		// drown the rest: they are logged at debug.
+		level := slog.LevelInfo
+		if p := r.URL.Path; strings.HasPrefix(p, "/gw/v1/") || p == "/healthz" || p == "/readyz" || p == "/metrics" {
+			level = slog.LevelDebug
+		}
+		slog.Log(r.Context(), level, "http", "method", r.Method, "path", r.URL.Path, "status", sw.status,
 			"dur_ms", time.Since(start).Milliseconds())
 	})
 }

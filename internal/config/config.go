@@ -4,6 +4,7 @@ package config
 import (
 	"flag"
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"os"
 	"strconv"
@@ -45,6 +46,11 @@ type Config struct {
 	// Zero keeps them for ever.
 	UsageRetentionMonths  int
 	RollupRetentionMonths int
+
+	// LogLevel is the least severe level logged; LogJSON writes one JSON
+	// object per line instead of text.
+	LogLevel slog.Level
+	LogJSON  bool
 }
 
 func Load(args []string) (*Config, error) {
@@ -71,6 +77,25 @@ func Load(args []string) (*Config, error) {
 	}
 	if c.DBConsoleMaxConns, err = envInt("LLMR_DB_CONSOLE_MAX_CONNS"); err != nil {
 		return nil, err
+	}
+	switch v := strings.ToLower(envOr("LLMR_LOG_LEVEL", "info")); v {
+	case "debug":
+		c.LogLevel = slog.LevelDebug
+	case "info":
+		c.LogLevel = slog.LevelInfo
+	case "warn":
+		c.LogLevel = slog.LevelWarn
+	case "error":
+		c.LogLevel = slog.LevelError
+	default:
+		return nil, fmt.Errorf("LLMR_LOG_LEVEL must be debug, info, warn or error")
+	}
+	switch v := strings.ToLower(envOr("LLMR_LOG_FORMAT", "text")); v {
+	case "text":
+	case "json":
+		c.LogJSON = true
+	default:
+		return nil, fmt.Errorf("LLMR_LOG_FORMAT must be text or json")
 	}
 	if c.UsageRetentionMonths, err = envInt("LLMR_USAGE_RETENTION_MONTHS"); err != nil {
 		return nil, err

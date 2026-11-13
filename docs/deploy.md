@@ -153,6 +153,8 @@ For llm-router itself (the gateways have [their own](#gateways)):
 | `LLMR_TRUSTED_PROXIES` | Comma-separated addresses or CIDR ranges of proxies whose `X-Forwarded-For` names the client. Console sign-in is limited to 20 attempts a minute per client address (IPv6 per /64) and 5 failures per 15 minutes per email and address; wrong admin tokens on the API to 5 per 15 minutes per address. Each proxy must append to `X-Forwarded-For` |
 | `LLMR_DB_MAX_CONNS`, `LLMR_DB_CONSOLE_MAX_CONNS` | Postgres connections for usage writes, gateway sync and config (default 16), and for console reads (default 8). Their sum must fit under the database's `max_connections` |
 | `LLMR_DB_CONSOLE_TIMEOUT` | Cancels a console query that runs longer, default `30s`; the console then answers 504 |
+| `LLMR_LOG_LEVEL` | Least severe level logged: `debug`, `info` (default), `warn` or `error`. Health checks, metrics scrapes and gateway syncs are logged at `debug` |
+| `LLMR_LOG_FORMAT` | `text` (default) or `json`, one object per line |
 | `LLMR_USAGE_RETENTION_MONTHS` | Months of individual requests to keep, besides the current one; older months are deleted. `0` (default) keeps them for ever; otherwise at least 2. See [Usage data](#usage-data) |
 | `LLMR_ROLLUP_RETENTION_MONTHS` | Months of daily totals and per-day spend to keep. `0` (default) keeps them for ever; otherwise at least 3 |
 | `LLMR_SEED_CLAUDE_SUBSCRIPTION` | `1` adds the [subscription pass-through](clients.md#on-your-claudeai-subscription) provider and models |
@@ -183,14 +185,23 @@ Placeholder secrets such as `change-me` are refused. Generate them with `openssl
 
 - **Stop the old control plane before starting 0.4.** The first start builds usage totals from the
   requests already stored, and writes wait while it does; on a large database that takes a while.
-  Gateways keep serving meanwhile and upload their usage afterwards. The chart now replaces the control-plane pod instead of rolling it; with Compose,
-  `up -d` already does.
+  Gateways keep serving meanwhile and upload their usage afterwards. The chart now replaces the
+  control-plane pod instead of rolling it, and gives its first start 10 minutes
+  (`startupFailureThreshold`); with Compose, `up -d` already replaces it.
 - **Postgres 15 or later** is required.
 - **Back up first**, as for any upgrade: there is no way back to 0.3 except the backup.
 - **Latency percentiles** on Analytics are now estimates read from histograms: right to the
   histogram's range (1 to 1.5 s, say) and interpolated inside it. Days on the charts are UTC days.
 - **Connections**: llm-router now opens up to 24 connections by default (16 + 8), where 0.3 opened
   about one per CPU. Check the database's `max_connections`.
+- **Connection poolers**: llm-router sets `statement_timeout` and
+  `idle_in_transaction_session_timeout` as it connects, and takes session advisory locks for
+  migrations and maintenance. Connect it to Postgres directly, or to a pooler in session mode. Behind
+  PgBouncer add both parameters to `ignore_startup_parameters`; in transaction mode the locks do
+  nothing, so run one control plane only.
+- **Health checks**: `/readyz` is the readiness check (config loaded, not shutting down) and
+  `/healthz` the liveness check. Neither depends on Postgres: with the database away llm-router
+  keeps serving from memory and queues usage. The chart uses both.
 
 ### Upgrading to 0.3
 

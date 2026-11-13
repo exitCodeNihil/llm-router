@@ -23,6 +23,15 @@ encryptionKey: ""
 # name of an existing Secret with keys: database-url, admin-token, encryption-key
 existingSecret: ""
 
+# debug, info, warn or error; and text or json (one object per line).
+logLevel: info
+logFormat: text
+
+# How many 5-second checks the first start may take before Kubernetes restarts
+# the pod. Migrations run before llm-router listens; raise this for the first
+# start of a release on a very large database (120 = 10 minutes).
+startupFailureThreshold: 120
+
 # How long usage is kept, in whole months before the current one. 0 keeps it
 # for ever. usageMonths is for individual requests (the Requests page), at
 # least 2; rollupMonths is for the daily totals behind the dashboards and

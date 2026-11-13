@@ -171,10 +171,35 @@ type Snapshot struct {
 }
 
 // Holder is the atomic snapshot pointer the hot path reads through.
-type Holder struct{ p atomic.Pointer[Snapshot] }
+type Holder struct {
+	p atomic.Pointer[Snapshot]
+	// For /metrics: when the snapshot in use was built, how long that took,
+	// and how many rebuilds have failed.
+	builtAt, buildNanos, failures atomic.Int64
+}
 
-func (h *Holder) Get() *Snapshot  { return h.p.Load() }
-func (h *Holder) Set(s *Snapshot) { h.p.Store(s) }
+func (h *Holder) Get() *Snapshot { return h.p.Load() }
+
+func (h *Holder) Set(s *Snapshot) {
+	h.p.Store(s)
+	h.builtAt.Store(time.Now().UnixNano())
+}
+
+// Built records how long the latest rebuild took; Failed counts one that failed.
+func (h *Holder) Built(took time.Duration) { h.buildNanos.Store(int64(took)) }
+func (h *Holder) Failed()                  { h.failures.Add(1) }
+
+// Age is how long ago the snapshot in use was built; LastBuild how long that
+// took. Both are zero before the first Set.
+func (h *Holder) Age() time.Duration {
+	at := h.builtAt.Load()
+	if at == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, at))
+}
+func (h *Holder) LastBuild() time.Duration { return time.Duration(h.buildNanos.Load()) }
+func (h *Holder) Failures() int64          { return h.failures.Load() }
 
 // Rate is a deployment's list price per 1M tokens (input + output), used to
 // order backends that share a priority so the cheaper one is tried first.

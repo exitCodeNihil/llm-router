@@ -43,6 +43,30 @@ func main() {
 	}
 }
 
+// readyz answers 200 once a snapshot is loaded, until shutdown begins.
+func readyz(holder *snapshot.Holder, shutdown context.Context) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case shutdown.Err() != nil:
+			http.Error(w, "shutting down", http.StatusServiceUnavailable)
+		case holder.Get() == nil:
+			http.Error(w, "starting", http.StatusServiceUnavailable)
+		default:
+			w.Write([]byte("ok"))
+		}
+	}
+}
+
+// setLogging applies LLMR_LOG_LEVEL and LLMR_LOG_FORMAT to the default logger.
+func setLogging(cfg *config.Config) {
+	opts := &slog.HandlerOptions{Level: cfg.LogLevel}
+	var h slog.Handler = slog.NewTextHandler(os.Stderr, opts)
+	if cfg.LogJSON {
+		h = slog.NewJSONHandler(os.Stderr, opts)
+	}
+	slog.SetDefault(slog.New(h))
+}
+
 // watchConfigEpoch appends a cluster event each time the snapshot version bumps
 // (the NOTIFY/poll refresh path applied a new config epoch).
 func watchConfigEpoch(ctx context.Context, holder *snapshot.Holder, events *metrics.Events) {
@@ -69,6 +93,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	setLogging(cfg)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -111,10 +136,12 @@ func run() error {
 	telemetry.Register(otlp.Kind{}, langfuse.Kind{})
 
 	builder := &snapshot.Builder{Pool: st.Pool, EncryptionKey: cfg.EncryptionKey}
+	buildStart := time.Now()
 	first, err := builder.Build(ctx)
 	if err != nil {
 		return err
 	}
+	holder.Built(time.Since(buildStart))
 	holder.Set(first)
 	go snapshot.Refresher(ctx, st.Pool, builder, holder, 30*time.Second)
 
@@ -126,7 +153,15 @@ func run() error {
 	if err := writer.EnsurePartitions(ctx); err != nil {
 		return fmt.Errorf("usage_events partitions: %w (the database role needs CREATE on the schema)", err)
 	}
-	go writer.Run(ctx)
+	// Stopped only once the HTTP server has drained: the requests still
+	// finishing after the signal write their usage too.
+	writerCtx, stopWriter := context.WithCancel(context.Background())
+	defer stopWriter()
+	writerDone := make(chan struct{})
+	go func() {
+		writer.Run(writerCtx)
+		close(writerDone)
+	}()
 	recorder := telemetry.NewRecorder()
 	exporter := telemetry.NewManager(holder, st.Pool)
 	exporter.Recorder = recorder
@@ -142,7 +177,7 @@ func run() error {
 	live := metrics.NewLive()
 	nodeStore := metrics.NewNodeStore()
 	httpm := metrics.NewHTTP()
-	promReg := newMetrics(httpm, nodeStore, writer, exporter)
+	promReg := newMetrics(httpm, nodeStore, writer, exporter, holder, st)
 	events := &metrics.Events{}
 	go watchConfigEpoch(ctx, holder, events)
 	gw.Usage = usage.MultiWriter{writer, exporter, live}
@@ -186,10 +221,14 @@ func run() error {
 
 	gw.Register(mux)
 	serveMetrics(ctx, cfg.MetricsListen, mux, promReg)
+	// /healthz: the process is up. /readyz: it has a config and is not
+	// shutting down. Neither asks Postgres: with it away the control plane
+	// still serves from memory and queues usage, and must stay in rotation.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
+	mux.HandleFunc("GET /readyz", readyz(holder, ctx))
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -211,6 +250,12 @@ func run() error {
 		return err
 	}
 	<-drained
+	stopWriter()
+	select {
+	case <-writerDone:
+	case <-time.After(6 * time.Second):
+		slog.Warn("usage writer did not finish flushing before exit")
+	}
 	stopExport()
 	select {
 	case <-exportDone:

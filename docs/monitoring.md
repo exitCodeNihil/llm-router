@@ -45,6 +45,12 @@ Both runtimes write these with the same names, so a sum over every scraped targe
 | `llmr_usage_flush_failures_total` | counter | | Control plane: failed writes of usage events to Postgres. Each is retried, so this alone loses nothing |
 | `llmr_usage_partitions_dropped_total` | counter | | Control plane: monthly usage partitions dropped past their [retention](deploy.md#usage-data) |
 | `llmr_usage_lost_total` | counter | | Control plane: usage events still unwritten when it stopped |
+| `llmr_usage_partition_errors_total` | counter | | Control plane: monthly usage partitions that could not be created |
+| `llmr_snapshot_age_seconds` | gauge | | Control plane: seconds since the config in use was read from Postgres. It is rebuilt every 30 seconds, so more than a minute or two means Postgres is not answering |
+| `llmr_snapshot_build_seconds` | gauge | | Control plane: how long the latest rebuild took |
+| `llmr_snapshot_build_failures_total` | counter | | Control plane: rebuilds that failed; the previous config stays in use |
+| `llmr_db_pool_acquired_conns`, `llmr_db_pool_idle_conns`, `llmr_db_pool_max_conns` | gauge | `pool` (`main`, `console`) | Control plane: Postgres connections in use, idle, and the most the pool opens |
+| `llmr_db_pool_acquire_wait_seconds_total` | counter | `pool` | Control plane: time spent waiting for a free connection |
 | `llmr_build_info` | gauge | `runtime` (`control_plane`, `gateway`), `version` | Always 1 |
 
 Gateways only:
@@ -141,6 +147,8 @@ scraped twice.
 | `LLMRouterHighErrorRate` | More than 5% of `/v1` requests end in 5xx | 10m |
 | `LLMRouterUsageDropped` | Usage events were dropped in the last 10 minutes | |
 | `LLMRouterUsageFlushFailing` | More than 3 writes of usage to Postgres failed in 10 minutes | |
+| `LLMRouterSnapshotStale` | The config in use is over 5 minutes old, for 5 minutes: Postgres is not answering | |
+| `LLMRouterDatabasePoolSaturated` | Every connection of a pool has been in use for 5 minutes | |
 | `LLMRouterTelemetryDestinationFailing` | A telemetry destination keeps failing (`llmr_telemetry_destination_failing{destination}`) | 10m |
 | `LLMRouterTelemetrySpansDropped` | A telemetry destination dropped spans in the last 10 minutes, by reason (info) | |
 

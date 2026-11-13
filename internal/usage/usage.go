@@ -20,6 +20,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/exitcodenihil/llm-router/internal/store"
 )
 
 type Event struct {
@@ -120,6 +122,8 @@ type PGWriter struct {
 	Retention Retention
 	// PartitionsDropped counts monthly partitions dropped past their retention.
 	PartitionsDropped atomic.Int64
+	// PartitionErrors counts monthly partitions that could not be created.
+	PartitionErrors atomic.Int64
 
 	indexing sync.Mutex // one EnsureIndexes pass at a time
 }
@@ -433,23 +437,43 @@ func (w *PGWriter) EnsurePartitions(ctx context.Context) error {
 }
 
 func (w *PGWriter) ensurePartitions(ctx context.Context, now time.Time) error {
+	// One connection, so the lock timeout stays with these statements. A new
+	// partition briefly locks its parent; behind a long query it gives up and
+	// tries again rather than hold every insert up behind it.
+	conn, err := w.pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SET lock_timeout = '5s'`); err != nil {
+		return err
+	}
+	defer conn.Exec(context.WithoutCancel(ctx), `RESET lock_timeout`)
+
 	lo, hi := Window(now)
 	var firstErr error
 	for start := lo; start.Before(hi); start = start.AddDate(0, 1, 0) {
 		end := start.AddDate(0, 1, 0)
 		// usage_events' bounds are dates, read in the database's time zone, as
-		// its first partitions were made; the rollups' are UTC instants.
-		for _, t := range []struct{ table, layout string }{
-			{"usage_events", "2006-01-02"},
-			{"usage_hourly", "2006-01-02 15:04:05Z07"},
-			{"usage_daily", "2006-01-02 15:04:05Z07"},
+		// its first partitions were made; the rollups' are UTC instants. The
+		// rollups' rows are updated in place: see migration 0028.
+		for _, t := range []struct{ table, layout, with string }{
+			{"usage_events", "2006-01-02", ""},
+			{"usage_hourly", "2006-01-02 15:04:05Z07", rollupStorage},
+			{"usage_daily", "2006-01-02 15:04:05Z07", rollupStorage},
 		} {
 			name := t.table + "_" + start.Format("2006_01")
 			// DDL cannot take bind params; bounds are generated, not user input
-			_, err := w.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+name+
-				` PARTITION OF `+t.table+` FOR VALUES FROM ('`+start.Format(t.layout)+
-				`') TO ('`+end.Format(t.layout)+`')`)
+			ddl := `CREATE TABLE IF NOT EXISTS ` + name + ` PARTITION OF ` + t.table +
+				` FOR VALUES FROM ('` + start.Format(t.layout) + `') TO ('` + end.Format(t.layout) + `')` + t.with
+			var err error
+			for try := 1; ; try++ {
+				if _, err = conn.Exec(ctx, ddl); err == nil || try == 3 || !store.LockTimedOut(err) {
+					break
+				}
+			}
 			if err != nil {
+				w.PartitionErrors.Add(1)
 				slog.Error("create partition failed", "partition", name, "err", err)
 				if firstErr == nil {
 					firstErr = fmt.Errorf("create partition %s: %w", name, err)
@@ -460,13 +484,40 @@ func (w *PGWriter) ensurePartitions(ctx context.Context, now time.Time) error {
 	return firstErr
 }
 
-// maintain builds missing indexes and drops what is past its retention.
+const rollupStorage = ` WITH (fillfactor = 90, autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.02)`
+
+// maintain builds missing indexes and drops what is past its retention. An
+// advisory lock keeps it to one control plane at a time.
 func (w *PGWriter) maintain(ctx context.Context) {
+	// The lock belongs to this connection's session; it stays idle, outside
+	// any transaction, while the work runs on others.
+	conn, err := w.pool.Acquire(ctx)
+	if err != nil {
+		return
+	}
+	defer conn.Release()
+	var locked bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, store.LockMaintain).Scan(&locked); err != nil || !locked {
+		return
+	}
+	defer func() {
+		uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if _, err := conn.Exec(uctx, `SELECT pg_advisory_unlock($1)`, store.LockMaintain); err != nil {
+			conn.Conn().Close(uctx)
+		}
+	}()
+
 	if err := w.EnsureIndexes(ctx); err != nil && ctx.Err() == nil {
 		slog.Error("usage indexes", "err", err)
 	}
 	if err := w.Prune(ctx, time.Now()); err != nil && ctx.Err() == nil {
 		slog.Error("usage retention", "err", err)
+	}
+	// Autovacuum analyses partitions, never the partitioned table itself, and
+	// the planner needs the latter's statistics for the dashboards' queries.
+	if _, err := w.pool.Exec(ctx, `ANALYZE usage_hourly, usage_daily`); err != nil && ctx.Err() == nil {
+		slog.Error("analyze usage rollups", "err", err)
 	}
 }
 
