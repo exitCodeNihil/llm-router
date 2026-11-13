@@ -38,6 +38,9 @@ type Server struct {
 	// IDEOrigin is the public origin of the separate IDE listener ("" = the
 	// IDE is served from this mux, which shares the console's origin).
 	IDEOrigin string
+	// UsageRetentionMonths is how many months of individual requests are
+	// kept (usage.Retention.RawMonths), for the console to say so. 0 = for ever.
+	UsageRetentionMonths int
 
 	rtMu  sync.Mutex
 	rt    workspace.Runtime
@@ -225,6 +228,8 @@ func (m *Server) me(w http.ResponseWriter, r *http.Request) {
 		"workspaces": m.workspaceConfig(r.Context()).Allows(c.IsAdmin, c.UserID, teams),
 		// Where the IDE iframe loads from; "" means this origin.
 		"ide_origin": m.IDEOrigin,
+		// How long individual requests are kept; 0 = for ever.
+		"usage_retention_months": m.UsageRetentionMonths,
 	})
 }
 

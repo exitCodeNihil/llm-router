@@ -119,6 +119,10 @@ func run() error {
 	go snapshot.Refresher(ctx, st.Pool, builder, holder, 30*time.Second)
 
 	writer := usage.NewPGWriter(st.Pool)
+	writer.Retention = usage.Retention{RawMonths: cfg.UsageRetentionMonths, RollupMonths: cfg.RollupRetentionMonths}
+	if err := writer.Retention.Validate(); err != nil {
+		return fmt.Errorf("LLMR_USAGE_RETENTION_MONTHS / LLMR_ROLLUP_RETENTION_MONTHS: %w", err)
+	}
 	if err := writer.EnsurePartitions(ctx); err != nil {
 		return fmt.Errorf("usage_events partitions: %w (the database role needs CREATE on the schema)", err)
 	}
@@ -149,7 +153,8 @@ func run() error {
 	}
 	mg := &mgmt.Server{Store: st, AdminToken: cfg.AdminToken, EncryptionKey: cfg.EncryptionKey,
 		Snapshots: holder, Live: live, NodeStore: nodeStore, HTTP: httpm, Events: events, Recorder: recorder, Telemetry: exporter,
-		Gateway: gw, Version: version, Started: time.Now(), IDEOrigin: cfg.IDEOrigin}
+		Gateway: gw, Version: version, Started: time.Now(), IDEOrigin: cfg.IDEOrigin,
+		UsageRetentionMonths: cfg.UsageRetentionMonths}
 	mg.Register(mux)
 	go mg.SyncWorkspaceModels(ctx)
 	if cfg.IDEListen != "" {

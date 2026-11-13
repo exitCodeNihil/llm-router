@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -46,15 +45,16 @@ func (m *Server) usageByTeam(w http.ResponseWriter, r *http.Request) {
 // dashboard pivots into a stacked chart. Mirrors usageDaily + a provider join.
 func (m *Server) usageByProviderDaily(w http.ResponseWriter, r *http.Request) {
 	c := CallerFrom(r.Context())
-	args := []any{daysParam(r)}
+	var args []any
+	source := daysSource(&args, daysParam(r))
 	scope := usageScope(c, &args)
 	m.list(w, r, fmt.Sprintf(`
-		SELECT date_trunc('day', e.ts)::date AS day,
+		SELECT (e.bucket AT TIME ZONE 'UTC')::date AS day,
 		       coalesce(p.name, 'other') AS provider,
 		       coalesce(sum(e.cost_usd), 0) AS cost_usd
-		FROM usage_events e LEFT JOIN providers p ON p.id = e.provider_id
-		WHERE e.ts >= now() - make_interval(days => $1) AND %s
-		GROUP BY 1, 2 ORDER BY 1`, scope), args...)
+		FROM %s e LEFT JOIN providers p ON p.id = e.provider_id
+		WHERE %s
+		GROUP BY 1, 2 ORDER BY 1`, source, scope), args...)
 }
 
 // usageRequests is the enriched, filterable, cursor-paginated request feed.
@@ -68,7 +68,7 @@ func (m *Server) usageRequests(w http.ResponseWriter, r *http.Request) {
 
 	// Same filter the aggregates use, so a row list and a headline number always
 	// describe the same set.
-	f := newUsageFilter(r, c)
+	f := newUsageFilter(r, c, false)
 	if f.Err != nil {
 		httpError(w, http.StatusBadRequest, f.Err.Error())
 		return
@@ -113,42 +113,17 @@ func parseCursor(s string) (time.Time, int64, bool) {
 	return ts, id, true
 }
 
-// usageByDeployment: request counts per deployment over ?days=N (default 1),
-// behind a ~60s cache. ponytail: no deployment_id index → short cache in front
-// of a time-bounded partition scan; add an index only if it shows up hot.
-var deployCache struct {
-	mu   sync.Mutex
-	at   time.Time
-	days int
-	rows []map[string]any
-}
-
+// usageByDeployment: request counts per deployment over ?days=N (default 1).
 func (m *Server) usageByDeployment(w http.ResponseWriter, r *http.Request) {
 	days := 1
 	if d, err := strconv.Atoi(r.URL.Query().Get("days")); err == nil && d >= 1 && d <= 365 {
 		days = d
 	}
-
-	deployCache.mu.Lock()
-	if deployCache.rows != nil && deployCache.days == days && time.Since(deployCache.at) < 60*time.Second {
-		rows := deployCache.rows
-		deployCache.mu.Unlock()
-		writeJSON(w, http.StatusOK, rows)
-		return
-	}
-	deployCache.mu.Unlock()
-
-	rows, err := listRows(r.Context(), m.reads(), `
-		SELECT deployment_id, count(*) AS requests
-		FROM usage_events
-		WHERE ts >= now() - make_interval(days => $1) AND deployment_id IS NOT NULL
-		GROUP BY 1`, days)
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	deployCache.mu.Lock()
-	deployCache.at, deployCache.days, deployCache.rows = time.Now(), days, rows
-	deployCache.mu.Unlock()
-	writeJSON(w, http.StatusOK, rows)
+	var args []any
+	source := daysSource(&args, days)
+	m.list(w, r, fmt.Sprintf(`
+		SELECT deployment_id, sum(requests)::bigint AS requests
+		FROM %s e
+		WHERE deployment_id IS NOT NULL
+		GROUP BY 1`, source), args...)
 }

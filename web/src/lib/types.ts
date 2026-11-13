@@ -11,6 +11,8 @@ export interface Me {
   has_password: boolean;
   /** Origin the IDE iframe loads from; "" when it shares this origin. */
   ide_origin: string;
+  /** Months individual requests are kept before they are deleted; 0 = for ever. */
+  usage_retention_months: number;
 }
 
 export interface User {

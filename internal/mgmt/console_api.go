@@ -414,48 +414,50 @@ func daysParam(r *http.Request) int {
 
 func (m *Server) usageSummary(w http.ResponseWriter, r *http.Request) {
 	c := CallerFrom(r.Context())
-	f := newUsageFilter(r, c)
+	f := newUsageFilter(r, c, true)
 	if f.Err != nil {
 		httpError(w, http.StatusBadRequest, f.Err.Error())
 		return
 	}
 	m.listOne(w, r, fmt.Sprintf(`
-		SELECT count(*) AS requests,
-		       coalesce(sum(prompt_tokens + completion_tokens), 0) AS tokens,
-		       coalesce(sum(prompt_tokens), 0) AS prompt_tokens,
-		       coalesce(sum(cached_tokens), 0) AS cached_tokens,
-		       coalesce(sum(cost_usd), 0) AS cost_usd,
-		       count(*) FILTER (WHERE unpriced) AS unpriced_requests,
-		       count(*) FILTER (WHERE status_code >= 400) AS errors
+		SELECT coalesce(sum(e.requests), 0)::bigint AS requests,
+		       coalesce(sum(e.prompt_tokens + e.completion_tokens), 0)::bigint AS tokens,
+		       coalesce(sum(e.prompt_tokens), 0)::bigint AS prompt_tokens,
+		       coalesce(sum(e.cached_tokens), 0)::bigint AS cached_tokens,
+		       coalesce(sum(e.cost_usd), 0) AS cost_usd,
+		       coalesce(sum(e.requests) FILTER (WHERE e.unpriced), 0)::bigint AS unpriced_requests,
+		       coalesce(sum(e.requests) FILTER (WHERE e.status_code >= 400), 0)::bigint AS errors
 		FROM %s WHERE %s`, f.from(), f.where()), f.args...)
 }
 
+// usageDaily is usage per UTC day over the last ?days.
 func (m *Server) usageDaily(w http.ResponseWriter, r *http.Request) {
 	c := CallerFrom(r.Context())
-	args := []any{daysParam(r)}
+	var args []any
+	source := daysSource(&args, daysParam(r))
 	scope := usageScope(c, &args)
 	m.list(w, r, fmt.Sprintf(`
-		SELECT date_trunc('day', ts)::date AS day,
-		       count(*) AS requests,
-		       coalesce(sum(prompt_tokens + completion_tokens), 0) AS tokens,
+		SELECT (bucket AT TIME ZONE 'UTC')::date AS day,
+		       coalesce(sum(requests), 0)::bigint AS requests,
+		       coalesce(sum(prompt_tokens + completion_tokens), 0)::bigint AS tokens,
 		       coalesce(sum(cost_usd), 0) AS cost_usd
-		FROM usage_events WHERE ts >= now() - make_interval(days => $1) AND %s
-		GROUP BY 1 ORDER BY 1`, scope), args...)
+		FROM %s e WHERE %s
+		GROUP BY 1 ORDER BY 1`, source, scope), args...)
 }
 
 func (m *Server) usageByModel(w http.ResponseWriter, r *http.Request) {
 	c := CallerFrom(r.Context())
-	f := newUsageFilter(r, c)
+	f := newUsageFilter(r, c, true)
 	if f.Err != nil {
 		httpError(w, http.StatusBadRequest, f.Err.Error())
 		return
 	}
 	m.list(w, r, fmt.Sprintf(`
-		SELECT model_name,
-		       count(*) AS requests,
-		       coalesce(sum(prompt_tokens), 0) AS prompt_tokens,
-		       coalesce(sum(completion_tokens), 0) AS completion_tokens,
-		       coalesce(sum(cost_usd), 0) AS cost_usd
+		SELECT e.model_name,
+		       coalesce(sum(e.requests), 0)::bigint AS requests,
+		       coalesce(sum(e.prompt_tokens), 0)::bigint AS prompt_tokens,
+		       coalesce(sum(e.completion_tokens), 0)::bigint AS completion_tokens,
+		       coalesce(sum(e.cost_usd), 0) AS cost_usd
 		FROM %s WHERE %s
 		GROUP BY 1 ORDER BY cost_usd DESC`, f.from(), f.where()), f.args...)
 }
@@ -466,16 +468,16 @@ func (m *Server) usageByModel(w http.ResponseWriter, r *http.Request) {
 // page headed "last 90 days".
 func (m *Server) usageFlow(w http.ResponseWriter, r *http.Request) {
 	c := CallerFrom(r.Context())
-	args := []any{daysParam(r)}
+	var args []any
+	source := daysSource(&args, daysParam(r))
 	scope := usageScope(c, &args)
 	// Aggregate before joining: the scope fragment references bare user_id and
 	// team_id, which api_keys would make ambiguous.
 	m.list(w, r, fmt.Sprintf(`
 		WITH f AS (
-			SELECT api_key_id, model_name, provider_id, count(*) AS volume
-			FROM usage_events
-			WHERE ts >= now() - make_interval(days => $1)
-			  AND provider_id IS NOT NULL AND %s
+			SELECT api_key_id, model_name, provider_id, sum(requests)::bigint AS volume
+			FROM %s e
+			WHERE provider_id IS NOT NULL AND %s
 			GROUP BY 1, 2, 3
 			ORDER BY volume DESC
 			LIMIT 200
@@ -489,7 +491,7 @@ func (m *Server) usageFlow(w http.ResponseWriter, r *http.Request) {
 		FROM f
 		LEFT JOIN api_keys  k ON k.id = f.api_key_id
 		LEFT JOIN providers p ON p.id = f.provider_id
-		ORDER BY f.volume DESC`, scope), args...)
+		ORDER BY f.volume DESC`, source, scope), args...)
 }
 
 func (m *Server) usageRecent(w http.ResponseWriter, r *http.Request) {

@@ -52,20 +52,25 @@ func TestFlushRetriesUntilWritten(t *testing.T) {
 	go func() { w.Run(ctx); close(done) }()
 
 	month := time.Date(1000+rand.IntN(900), 3, 1, 0, 0, 0, 0, time.UTC)
-	part := "usage_events_" + month.Format("2006_01")
+	suffix := "_" + month.Format("2006_01")
+	tables := []string{"usage_events", "usage_hourly", "usage_daily"}
 	t.Cleanup(func() {
 		cancel()
 		<-done
-		st.Pool.Exec(context.Background(), `DROP TABLE IF EXISTS `+part)
+		for _, table := range tables {
+			st.Pool.Exec(context.Background(), `DROP TABLE IF EXISTS `+table+suffix)
+		}
 	})
 
 	id := uuid.NewString()
 	w.Write(Event{TS: month.AddDate(0, 0, 9), RequestID: id, ModelName: "m", StatusCode: 200})
 	eventually(t, "a failed flush", func() bool { return w.FlushFailures.Load() > 0 })
 
-	if _, err := st.Pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s PARTITION OF usage_events FOR VALUES FROM ('%s') TO ('%s')`,
-		part, month.Format("2006-01-02"), month.AddDate(0, 1, 0).Format("2006-01-02"))); err != nil {
-		t.Fatal(err)
+	for _, table := range tables {
+		if _, err := st.Pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s PARTITION OF %s FOR VALUES FROM ('%s') TO ('%s')`,
+			table+suffix, table, month.Format("2006-01-02Z07"), month.AddDate(0, 1, 0).Format("2006-01-02Z07"))); err != nil {
+			t.Fatal(err)
+		}
 	}
 	eventually(t, "the event to be written", func() bool {
 		var n int
@@ -100,5 +105,98 @@ func TestEnsureIndexesCoversEveryPartition(t *testing.T) {
 	}
 	if missing != 0 {
 		t.Fatalf("%d partition indexes missing or invalid", missing)
+	}
+}
+
+// Prune drops the months past the retention and nothing newer: not last
+// month, which late gateway batches still write to.
+func TestPruneDropsOnlyOldMonths(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	w := NewPGWriter(st.Pool)
+	if err := w.EnsurePartitions(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	cur := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	old := cur.AddDate(0, -7, 0)
+	tables := []string{"usage_events", "usage_hourly", "usage_daily"}
+	exists := func(name string) bool {
+		var ok bool
+		if err := st.Pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, name).Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	makeOld := func() {
+		for _, table := range tables {
+			if _, err := st.Pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s PARTITION OF %s FOR VALUES FROM ('%s') TO ('%s')`,
+				table+"_"+old.Format("2006_01"), table, old.Format("2006-01-02Z07"), old.AddDate(0, 1, 0).Format("2006-01-02Z07"))); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	scope := uuid.NewString()
+	for _, day := range []time.Time{old, cur} {
+		if _, err := st.Pool.Exec(ctx, `INSERT INTO spend_counters (scope_type, scope_id, period_start, usd) VALUES ('key',$1,$2,1)`, scope, day); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.Pool.Exec(ctx, `INSERT INTO spend_totals (period, period_start, scope_type, scope_id, usd)
+		VALUES ('month',$2,'key',$1,1), ('total',$3,'key',$1,2)`, scope, old, TotalStart); err != nil {
+		t.Fatal(err)
+	}
+
+	// With no retention set only the hourly rollups age out.
+	makeOld()
+	if err := w.Prune(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	suffix := "_" + old.Format("2006_01")
+	if exists("usage_hourly"+suffix) || !exists("usage_events"+suffix) || !exists("usage_daily"+suffix) {
+		t.Fatal("without a retention, only the old hourly partition should go")
+	}
+
+	makeOld()
+	w.Retention = Retention{RawMonths: 2, RollupMonths: 3}
+	if err := w.Prune(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range tables {
+		if exists(table + suffix) {
+			t.Errorf("%s%s is past its retention and still there", table, suffix)
+		}
+		for _, month := range []time.Time{cur.AddDate(0, -1, 0), cur} {
+			if name := table + "_" + month.Format("2006_01"); !exists(name) {
+				t.Errorf("%s was dropped", name)
+			}
+		}
+	}
+	var days, months int
+	var total float64
+	if err := st.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM spend_counters WHERE scope_id=$1),
+		(SELECT count(*) FROM spend_totals WHERE scope_id=$1 AND period='month'),
+		(SELECT usd::float8 FROM spend_totals WHERE scope_id=$1 AND period='total')`, scope).Scan(&days, &months, &total); err != nil {
+		t.Fatal(err)
+	}
+	if days != 1 || months != 0 || total != 2 {
+		t.Fatalf("spend left: %d days, %d months, total %v; want 1, 0, 2", days, months, total)
+	}
+	if w.PartitionsDropped.Load() != 4 {
+		t.Fatalf("dropped %d partitions, want 4", w.PartitionsDropped.Load())
+	}
+}
+
+// The histogram ranges in Go and in llmr_hist are the same.
+func TestHistogramMatchesSQL(t *testing.T) {
+	st := testStore(t)
+	for _, ms := range []int{0, 9, 10, 24, 25, 999, 1000, 1001, 74999, 75000, 499999, 500000, 9000000} {
+		var hist []int64
+		if err := st.Pool.QueryRow(context.Background(), `SELECT llmr_hist($1)`, ms).Scan(&hist); err != nil {
+			t.Fatal(err)
+		}
+		if len(hist) != len(histBounds)+1 || hist[histBucket(ms)] != 1 {
+			t.Errorf("llmr_hist(%d) = %v, want a 1 at %d of %d", ms, hist, histBucket(ms), len(histBounds)+1)
+		}
 	}
 }

@@ -25,7 +25,7 @@ func TestUsageFilterAlwaysBoundsTime(t *testing.T) {
 		{"too long", "since=" + now.AddDate(-2, 0, 0).Format(time.RFC3339), true, time.Time{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newUsageFilter(httptest.NewRequest("GET", "/api/usage/stats?"+tc.query, nil), admin)
+			f := newUsageFilter(httptest.NewRequest("GET", "/api/usage/stats?"+tc.query, nil), admin, false)
 			if (f.Err != nil) != tc.wantErr {
 				t.Fatalf("Err = %v, want error %v", f.Err, tc.wantErr)
 			}

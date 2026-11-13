@@ -43,6 +43,7 @@ Both runtimes write these with the same names, so a sum over every scraped targe
 | `llmr_usage_queued`, `llmr_usage_queue_capacity` | gauge | | Usage events waiting: for Postgres on the control plane, for the next sync on a gateway |
 | `llmr_usage_dropped_total` | counter | | Usage events dropped because the queue was full |
 | `llmr_usage_flush_failures_total` | counter | | Control plane: failed writes of usage events to Postgres. Each is retried, so this alone loses nothing |
+| `llmr_usage_partitions_dropped_total` | counter | | Control plane: monthly usage partitions dropped past their [retention](deploy.md#usage-data) |
 | `llmr_usage_lost_total` | counter | | Control plane: usage events still unwritten when it stopped |
 | `llmr_build_info` | gauge | `runtime` (`control_plane`, `gateway`), `version` | Always 1 |
 

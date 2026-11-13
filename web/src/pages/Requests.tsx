@@ -353,7 +353,11 @@ export default function Requests() {
     <Page
       eyebrow="Overview"
       title="Requests"
-      description="Every request through the gateway, newest first."
+      description={
+        me?.usage_retention_months
+          ? `Every request through the gateway, newest first. Requests are kept for ${me.usage_retention_months} months; totals on the dashboard go back further.`
+          : "Every request through the gateway, newest first."
+      }
       action={
         hasFilters ? (
           <Button

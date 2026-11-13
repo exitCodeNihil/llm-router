@@ -19,6 +19,13 @@ func Window(now time.Time) (lo, hi time.Time) {
 	return cur.AddDate(0, -1, 0), cur.AddDate(0, 2, 0)
 }
 
+// HourlyFrom is the start of the oldest month whose hourly rollups are kept:
+// three months before the current one.
+func HourlyFrom(now time.Time) time.Time {
+	now = now.UTC()
+	return time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, -3, 0)
+}
+
 // maxFuture is how far ahead of the control plane's clock an event may be
 // stamped before it is treated as clock skew.
 const maxFuture = 2 * time.Minute

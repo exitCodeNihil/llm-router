@@ -153,6 +153,8 @@ For llm-router itself (the gateways have [their own](#gateways)):
 | `LLMR_TRUSTED_PROXIES` | Comma-separated addresses or CIDR ranges of proxies whose `X-Forwarded-For` names the client. Console sign-in is limited to 20 attempts a minute per client address (IPv6 per /64) and 5 failures per 15 minutes per email and address; wrong admin tokens on the API to 5 per 15 minutes per address. Each proxy must append to `X-Forwarded-For` |
 | `LLMR_DB_MAX_CONNS`, `LLMR_DB_CONSOLE_MAX_CONNS` | Postgres connections for usage writes, gateway sync and config (default 16), and for console reads (default 8). Their sum must fit under the database's `max_connections` |
 | `LLMR_DB_CONSOLE_TIMEOUT` | Cancels a console query that runs longer, default `30s`; the console then answers 504 |
+| `LLMR_USAGE_RETENTION_MONTHS` | Months of individual requests to keep, besides the current one; older months are deleted. `0` (default) keeps them for ever; otherwise at least 2. See [Usage data](#usage-data) |
+| `LLMR_ROLLUP_RETENTION_MONTHS` | Months of daily totals and per-day spend to keep. `0` (default) keeps them for ever; otherwise at least 3 |
 | `LLMR_SEED_CLAUDE_SUBSCRIPTION` | `1` adds the [subscription pass-through](clients.md#on-your-claudeai-subscription) provider and models |
 | `LLMR_IDE_LISTEN`, `LLMR_IDE_ORIGIN`, `LLMR_COOKIE_DOMAIN` | [Workspace IDE](workspaces.md) listener, its public origin, and the session cookie domain when it is another hostname |
 | `LLMR_METRICS_LISTEN` | Serve `/metrics` on this address (e.g. `:9090`) instead of the main listener; `off` turns it off. See [Monitoring](monitoring.md) |
@@ -176,6 +178,19 @@ Placeholder secrets such as `change-me` are refused. Generate them with `openssl
   key those describe that key's quota, not the caller's.
 - **Upgrades**: pull the new tag and restart. Migrations apply on start and only go forward, so
   back up Postgres first. Upgrade the control plane before the gateways.
+
+### Upgrading to 0.4
+
+- **Stop the old control plane before starting 0.4.** The first start builds usage totals from the
+  requests already stored, and writes wait while it does; on a large database that takes a while.
+  Gateways keep serving meanwhile and upload their usage afterwards. The chart now replaces the control-plane pod instead of rolling it; with Compose,
+  `up -d` already does.
+- **Postgres 15 or later** is required.
+- **Back up first**, as for any upgrade: there is no way back to 0.3 except the backup.
+- **Latency percentiles** on Analytics are now estimates read from histograms: right to the
+  histogram's range (1 to 1.5 s, say) and interpolated inside it. Days on the charts are UTC days.
+- **Connections**: llm-router now opens up to 24 connections by default (16 + 8), where 0.3 opened
+  about one per CPU. Check the database's `max_connections`.
 
 ### Upgrading to 0.3
 
@@ -216,9 +231,30 @@ UI URL `http://localhost:3001`, public key `pk-lf-llm-router`, secret key `LANGF
 `admin@example.com` and `LANGFUSE_PASSWORD`. Sign-up is off.
 
 
+## Usage data
+
+Every request is one row in `usage_events`, about half a kilobyte with its indexes: roughly 40 GB a
+day at 1,000 requests a second. The table is partitioned by month.
+
+llm-router also keeps totals as it writes: `usage_hourly` and `usage_daily` hold one row per hour or
+day for each combination of key, user, team, model, deployment, gateway and status. The Dashboard
+and Analytics read these, so they stay fast and keep working after the individual requests are gone.
+The Requests page, and looking up one request by id, read the individual requests.
+
+By default nothing is deleted. Set a retention to bound the database:
+
+- `LLMR_USAGE_RETENTION_MONTHS` (chart: `retention.usageMonths`) drops whole months of individual
+  requests. With `3`, on any day in June the oldest requests kept are from 1 March.
+- `LLMR_ROLLUP_RETENTION_MONTHS` (chart: `retention.rollupMonths`) does the same for daily totals
+  and per-day spend. Budgets are unaffected: all-time spend is kept separately.
+- Hourly totals are always kept three months; charts older than that have daily points.
+
+Old months are dropped twice a day and at start, a partition at a time, without blocking writes.
+`llmr_usage_partitions_dropped_total` counts them. Deleted data is gone: only a backup has it.
+
 ## Production checklist
 
-- Managed Postgres with backups.
+- Managed Postgres (15 or later) with backups, and a [retention](#usage-data) that fits its disk.
 - `LLMR_ENCRYPTION_KEY` in a secret manager and backed up. Rotating it means re-entering provider
   keys and telemetry destination secrets, and signing everyone out.
 - TLS in front of 8080.

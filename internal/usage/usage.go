@@ -116,6 +116,11 @@ type PGWriter struct {
 	// Lost counts events given up on: those still unwritten at shutdown.
 	Lost atomic.Int64
 
+	// Retention is what Prune keeps. Set before Run.
+	Retention Retention
+	// PartitionsDropped counts monthly partitions dropped past their retention.
+	PartitionsDropped atomic.Int64
+
 	indexing sync.Mutex // one EnsureIndexes pass at a time
 }
 
@@ -154,7 +159,7 @@ func (w *PGWriter) Run(ctx context.Context) {
 		slog.Error("usage partitions", "err", err)
 	}
 	// In the background: on a large partition an index takes a while to build.
-	go w.EnsureIndexes(ctx)
+	go w.maintain(ctx)
 	partTicker := time.NewTicker(12 * time.Hour)
 	defer partTicker.Stop()
 
@@ -218,7 +223,7 @@ func (w *PGWriter) Run(ctx context.Context) {
 			flush()
 		case <-partTicker.C:
 			w.ensurePartitions(ctx, time.Now().UTC())
-			go w.EnsureIndexes(ctx)
+			go w.maintain(ctx)
 		}
 	}
 }
@@ -303,7 +308,10 @@ func InsertEvents(ctx context.Context, tx pgx.Tx, events []Event) ([]Event, erro
 	if len(refused) > 1 {
 		slog.Warn("usage rows refused", "refused", len(refused), "of", len(events))
 	}
-	return kept, writeCounters(ctx, tx, kept)
+	if err := writeCounters(ctx, tx, kept); err != nil {
+		return nil, err
+	}
+	return kept, writeRollups(ctx, tx, kept)
 }
 
 // savepoint runs fn in a nested transaction, so a failure rolls back only
@@ -429,19 +437,37 @@ func (w *PGWriter) ensurePartitions(ctx context.Context, now time.Time) error {
 	var firstErr error
 	for start := lo; start.Before(hi); start = start.AddDate(0, 1, 0) {
 		end := start.AddDate(0, 1, 0)
-		name := "usage_events_" + start.Format("2006_01")
-		// DDL cannot take bind params; bounds are generated, not user input
-		_, err := w.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+name+
-			` PARTITION OF usage_events FOR VALUES FROM ('`+start.Format("2006-01-02")+
-			`') TO ('`+end.Format("2006-01-02")+`')`)
-		if err != nil {
-			slog.Error("create partition failed", "partition", name, "err", err)
-			if firstErr == nil {
-				firstErr = fmt.Errorf("create partition %s: %w", name, err)
+		// usage_events' bounds are dates, read in the database's time zone, as
+		// its first partitions were made; the rollups' are UTC instants.
+		for _, t := range []struct{ table, layout string }{
+			{"usage_events", "2006-01-02"},
+			{"usage_hourly", "2006-01-02 15:04:05Z07"},
+			{"usage_daily", "2006-01-02 15:04:05Z07"},
+		} {
+			name := t.table + "_" + start.Format("2006_01")
+			// DDL cannot take bind params; bounds are generated, not user input
+			_, err := w.pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+name+
+				` PARTITION OF `+t.table+` FOR VALUES FROM ('`+start.Format(t.layout)+
+				`') TO ('`+end.Format(t.layout)+`')`)
+			if err != nil {
+				slog.Error("create partition failed", "partition", name, "err", err)
+				if firstErr == nil {
+					firstErr = fmt.Errorf("create partition %s: %w", name, err)
+				}
 			}
 		}
 	}
 	return firstErr
+}
+
+// maintain builds missing indexes and drops what is past its retention.
+func (w *PGWriter) maintain(ctx context.Context) {
+	if err := w.EnsureIndexes(ctx); err != nil && ctx.Err() == nil {
+		slog.Error("usage indexes", "err", err)
+	}
+	if err := w.Prune(ctx, time.Now()); err != nil && ctx.Err() == nil {
+		slog.Error("usage retention", "err", err)
+	}
 }
 
 // partitionIndexes are the indexes every usage_events partition carries, as

@@ -23,6 +23,14 @@ encryptionKey: ""
 # name of an existing Secret with keys: database-url, admin-token, encryption-key
 existingSecret: ""
 
+# How long usage is kept, in whole months before the current one. 0 keeps it
+# for ever. usageMonths is for individual requests (the Requests page), at
+# least 2; rollupMonths is for the daily totals behind the dashboards and
+# per-day spend, at least 3. Hourly totals are always kept three months.
+retention:
+  usageMonths: 0
+  rollupMonths: 0
+
 # Postgres connections. llm-router keeps two pools: one for usage writes,
 # gateway sync and config, one for console reads. Their sum must fit under the
 # database's max_connections. consoleTimeout cancels a console query that runs

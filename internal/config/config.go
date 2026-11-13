@@ -39,6 +39,12 @@ type Config struct {
 	DBMaxConns        int
 	DBConsoleMaxConns int
 	DBConsoleTimeout  time.Duration
+
+	// UsageRetentionMonths and RollupRetentionMonths are how many whole months
+	// of per-request usage, and of daily rollups and per-day spend, are kept.
+	// Zero keeps them for ever.
+	UsageRetentionMonths  int
+	RollupRetentionMonths int
 }
 
 func Load(args []string) (*Config, error) {
@@ -64,6 +70,12 @@ func Load(args []string) (*Config, error) {
 		return nil, err
 	}
 	if c.DBConsoleMaxConns, err = envInt("LLMR_DB_CONSOLE_MAX_CONNS"); err != nil {
+		return nil, err
+	}
+	if c.UsageRetentionMonths, err = envInt("LLMR_USAGE_RETENTION_MONTHS"); err != nil {
+		return nil, err
+	}
+	if c.RollupRetentionMonths, err = envInt("LLMR_ROLLUP_RETENTION_MONTHS"); err != nil {
 		return nil, err
 	}
 	if v := os.Getenv("LLMR_DB_CONSOLE_TIMEOUT"); v != "" {
@@ -119,15 +131,15 @@ func envOr(key, def string) string {
 	return def
 }
 
-// envInt reads a positive whole number; unset is 0.
+// envInt reads a whole number, zero or more; unset is 0.
 func envInt(key string) (int, error) {
 	v := os.Getenv(key)
 	if v == "" {
 		return 0, nil
 	}
 	n, err := strconv.Atoi(v)
-	if err != nil || n < 1 {
-		return 0, fmt.Errorf("%s must be a positive whole number", key)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("%s must be a whole number, 0 or more", key)
 	}
 	return n, nil
 }

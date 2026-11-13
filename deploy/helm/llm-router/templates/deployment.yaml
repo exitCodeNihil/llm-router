@@ -10,6 +10,12 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
   replicas: {{ .Values.replicas }}
+  {{- if not .Values.allowMultipleReplicas }}
+  # The old pod stops before the new one starts: two at once would each hold
+  # half the limits, and a migration must not run under a pod still writing.
+  strategy:
+    type: Recreate
+  {{- end }}
   selector:
     matchLabels: *labels
   template:
@@ -65,6 +71,10 @@ spec:
             - name: LLMR_TRUSTED_PROXIES
               value: {{ join "," . | quote }}
             {{- end }}
+            - name: LLMR_USAGE_RETENTION_MONTHS
+              value: {{ .Values.retention.usageMonths | quote }}
+            - name: LLMR_ROLLUP_RETENTION_MONTHS
+              value: {{ .Values.retention.rollupMonths | quote }}
             - name: LLMR_DB_MAX_CONNS
               value: {{ .Values.database.maxConns | quote }}
             - name: LLMR_DB_CONSOLE_MAX_CONNS
