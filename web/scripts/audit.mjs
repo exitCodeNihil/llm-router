@@ -30,6 +30,7 @@ const ROUTES = [
   ["/pricing", "pricing"],
   ["/gateways", "gateways"],
   ["/observability", "observability"],
+  ["/audit", "audit"],
   ["/settings", "settings"],
   ["/account", "account"],
 ];

@@ -395,6 +395,29 @@ export interface SpendByTeam {
   tokens: number;
 }
 
+// ── Audit log (GET /api/audit) ───────────────────────────────────
+export interface AuditEvent {
+  id: number;
+  ts: string;
+  actor_kind: "user" | "admin_token" | "anonymous";
+  actor_user_id: string | null;
+  actor_email: string | null;
+  /** The route pattern, e.g. "DELETE /api/users/{id}", or "auth.signin". */
+  action: string;
+  target_type: string | null;
+  target_id: string | null;
+  status: number;
+  client_ip: string | null;
+  /** What the request changed, for non-secret fields only. */
+  detail: Record<string, unknown> | null;
+}
+export interface AuditFilters {
+  action?: string;
+  target_type?: string;
+  status?: "ok" | "err";
+  actor?: string;
+}
+
 // ── Enriched requests feed (GET /api/usage/requests) ─────────────
 export interface RequestRow {
   id: number;

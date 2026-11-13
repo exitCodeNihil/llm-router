@@ -29,6 +29,8 @@ import type {
   Provider,
   RequestFilters,
   RequestRow,
+  AuditEvent,
+  AuditFilters,
   RuleStats,
   SpendByTeam,
   SsoSettings,
@@ -805,6 +807,24 @@ export function useRequests(filters: RequestFilters = {}) {
       return `${row.ts},${row.id}`;
     },
     refetchInterval: 15_000,
+  });
+}
+
+// ── Audit log (admin) ────────────────────────────────────────────
+const AUDIT_PAGE = 50;
+export function useAudit(filters: AuditFilters = {}) {
+  return useInfiniteQuery({
+    queryKey: ["audit", filters],
+    initialPageParam: 0,
+    queryFn: async ({ pageParam }) => {
+      const p = new URLSearchParams({ limit: String(AUDIT_PAGE) });
+      for (const [k, v] of Object.entries(filters)) if (v) p.set(k, v);
+      if (pageParam) p.set("before", String(pageParam));
+      return api.get<AuditEvent[]>(`/api/audit?${p}`);
+    },
+    getNextPageParam: (last) =>
+      last.length < AUDIT_PAGE ? undefined : last[last.length - 1].id,
+    refetchInterval: 30_000,
   });
 }
 

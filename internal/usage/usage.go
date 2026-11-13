@@ -124,6 +124,9 @@ type PGWriter struct {
 	PartitionsDropped atomic.Int64
 	// PartitionErrors counts monthly partitions that could not be created.
 	PartitionErrors atomic.Int64
+	// Maintenance runs after Prune in each maintenance pass, under the same
+	// lock. Set before Run.
+	Maintenance []func(context.Context) error
 
 	indexing sync.Mutex // one EnsureIndexes pass at a time
 }
@@ -513,6 +516,11 @@ func (w *PGWriter) maintain(ctx context.Context) {
 	}
 	if err := w.Prune(ctx, time.Now()); err != nil && ctx.Err() == nil {
 		slog.Error("usage retention", "err", err)
+	}
+	for _, fn := range w.Maintenance {
+		if err := fn(ctx); err != nil && ctx.Err() == nil {
+			slog.Error("maintenance", "err", err)
+		}
 	}
 	// Autovacuum analyses partitions, never the partitioned table itself, and
 	// the planner needs the latter's statistics for the dashboards' queries.

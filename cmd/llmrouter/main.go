@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/exitcodenihil/llm-router/internal/audit"
 	"github.com/exitcodenihil/llm-router/internal/auth"
 	"github.com/exitcodenihil/llm-router/internal/config"
 	"github.com/exitcodenihil/llm-router/internal/console"
@@ -150,6 +151,15 @@ func run() error {
 	if err := writer.Retention.Validate(); err != nil {
 		return fmt.Errorf("LLMR_USAGE_RETENTION_MONTHS / LLMR_ROLLUP_RETENTION_MONTHS: %w", err)
 	}
+	auditRec := &audit.Recorder{Pool: st.Pool}
+	if cfg.AuditRetentionMonths > 0 {
+		writer.Maintenance = append(writer.Maintenance, func(ctx context.Context) error {
+			if err := auditRec.Prune(ctx, cfg.AuditRetentionMonths); err != nil {
+				return fmt.Errorf("audit retention: %w", err)
+			}
+			return nil
+		})
+	}
 	if err := writer.EnsurePartitions(ctx); err != nil {
 		return fmt.Errorf("usage_events partitions: %w (the database role needs CREATE on the schema)", err)
 	}
@@ -177,7 +187,7 @@ func run() error {
 	live := metrics.NewLive()
 	nodeStore := metrics.NewNodeStore()
 	httpm := metrics.NewHTTP()
-	promReg := newMetrics(httpm, nodeStore, writer, exporter, holder, st)
+	promReg := newMetrics(httpm, nodeStore, writer, exporter, holder, st, auditRec)
 	events := &metrics.Events{}
 	go watchConfigEpoch(ctx, holder, events)
 	gw.Usage = usage.MultiWriter{writer, exporter, live}
@@ -189,7 +199,7 @@ func run() error {
 	mg := &mgmt.Server{Store: st, AdminToken: cfg.AdminToken, EncryptionKey: cfg.EncryptionKey,
 		Snapshots: holder, Live: live, NodeStore: nodeStore, HTTP: httpm, Events: events, Recorder: recorder, Telemetry: exporter,
 		Gateway: gw, Version: version, Started: time.Now(), IDEOrigin: cfg.IDEOrigin,
-		UsageRetentionMonths: cfg.UsageRetentionMonths}
+		UsageRetentionMonths: cfg.UsageRetentionMonths, Audit: auditRec, TrustedProxies: cfg.TrustedProxies}
 	mg.Register(mux)
 	go mg.SyncWorkspaceModels(ctx)
 	if cfg.IDEListen != "" {
@@ -210,7 +220,7 @@ func run() error {
 		slog.Warn("LLMR_IDE_ORIGIN is not set: workspace IDEs share the console origin; set LLMR_IDE_LISTEN/LLMR_IDE_ORIGIN in production")
 	}
 	consoleAuth := &console.Auth{Store: st, EncryptionKey: cfg.EncryptionKey, CookieDomain: cfg.CookieDomain,
-		TrustedProxies: cfg.TrustedProxies}
+		TrustedProxies: cfg.TrustedProxies, Audit: auditRec.Record}
 	consoleAuth.Register(mux)
 	mg.TokenGuard = consoleAuth
 	gwSync := &gwsync.Server{Store: st, Snapshots: holder, Limits: lim, Export: usage.MultiWriter{exporter, live}, Nodes: nodeStore,

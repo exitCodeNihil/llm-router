@@ -24,6 +24,7 @@ import Settings from "./pages/Settings";
 const Analytics = lazy(() => import("./pages/Analytics"));
 const Requests = lazy(() => import("./pages/Requests"));
 const Gateways = lazy(() => import("./pages/Gateways"));
+const Audit = lazy(() => import("./pages/Audit"));
 import Account from "./pages/Account";
 import Chat from "./pages/chat";
 import Workspaces from "./pages/Workspaces";
@@ -72,6 +73,7 @@ export default function App() {
           {isAdmin && <Route path="/pricing" element={<Pricing />} />}
           {isAdmin && <Route path="/gateways" element={<Gateways />} />}
           {isAdmin && <Route path="/observability" element={<Observability />} />}
+          {isAdmin && <Route path="/audit" element={<Audit />} />}
           {isAdmin && <Route path="/settings" element={<Settings />} />}
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

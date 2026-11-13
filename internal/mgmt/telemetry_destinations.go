@@ -230,6 +230,7 @@ func (m *Server) createDestination(w http.ResponseWriter, r *http.Request) {
 		destinationWriteError(w, err)
 		return
 	}
+	auditTarget(r, "telemetry_destination", id.String())
 	m.bump(r.Context())
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id.String()})
 }

@@ -108,19 +108,39 @@ func newSignInLimits(trusted []netip.Prefix) *signInLimits {
 		trusted: trusted}
 }
 
-// clientIP is the connecting address, or the address a trusted proxy says it
-// forwarded for: X-Forwarded-For is read right to left, skipping trusted hops.
+// clientIP is the address limits count against: the client's (ClientIP), with
+// IPv6 clients counted per /64.
 func (l *signInLimits) clientIP(r *http.Request) string {
+	addr, host := clientAddr(r, l.trusted)
+	if !addr.IsValid() {
+		return host
+	}
+	return clientKey(addr)
+}
+
+// ClientIP is the connecting address, or the address a proxy in trusted says
+// it forwarded for.
+func ClientIP(r *http.Request, trusted []netip.Prefix) string {
+	addr, host := clientAddr(r, trusted)
+	if !addr.IsValid() {
+		return host
+	}
+	return addr.Unmap().String()
+}
+
+// clientAddr reads X-Forwarded-For right to left, skipping trusted hops. When
+// RemoteAddr is not an address it returns that text instead.
+func clientAddr(r *http.Request, trusted []netip.Prefix) (netip.Addr, string) {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
 	addr, err := netip.ParseAddr(host)
 	if err != nil {
-		return host
+		return netip.Addr{}, host
 	}
-	if !l.isTrusted(addr) {
-		return clientKey(addr)
+	if !isTrusted(trusted, addr) {
+		return addr, host
 	}
 	hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
 	for i := len(hops) - 1; i >= 0; i-- {
@@ -129,11 +149,11 @@ func (l *signInLimits) clientIP(r *http.Request) string {
 			break
 		}
 		addr = hop
-		if !l.isTrusted(hop) {
+		if !isTrusted(trusted, hop) {
 			break
 		}
 	}
-	return clientKey(addr)
+	return addr, host
 }
 
 // parseHop reads one X-Forwarded-For entry: an address, optionally with a
@@ -159,9 +179,9 @@ func clientKey(a netip.Addr) string {
 	return a.String()
 }
 
-func (l *signInLimits) isTrusted(a netip.Addr) bool {
+func isTrusted(trusted []netip.Prefix, a netip.Addr) bool {
 	a = a.Unmap()
-	for _, p := range l.trusted {
+	for _, p := range trusted {
 		if p.Contains(a) {
 			return true
 		}

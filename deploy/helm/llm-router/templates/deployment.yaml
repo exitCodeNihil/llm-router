@@ -82,6 +82,8 @@ spec:
               value: {{ .Values.retention.usageMonths | quote }}
             - name: LLMR_ROLLUP_RETENTION_MONTHS
               value: {{ .Values.retention.rollupMonths | quote }}
+            - name: LLMR_AUDIT_RETENTION_MONTHS
+              value: {{ .Values.retention.auditMonths | quote }}
             - name: LLMR_DB_MAX_CONNS
               value: {{ .Values.database.maxConns | quote }}
             - name: LLMR_DB_CONSOLE_MAX_CONNS

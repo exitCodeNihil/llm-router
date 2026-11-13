@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/exitcodenihil/llm-router/internal/audit"
 	"github.com/exitcodenihil/llm-router/internal/metrics"
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
 	"github.com/exitcodenihil/llm-router/internal/store"
@@ -18,7 +19,7 @@ import (
 
 // newMetrics builds the control plane's /metrics.
 func newMetrics(httpm *metrics.HTTP, nodes *metrics.NodeStore, writer *usage.PGWriter, exporter *telemetry.Manager,
-	holder *snapshot.Holder, st *store.Store) *metrics.Registry {
+	holder *snapshot.Holder, st *store.Store, auditRec *audit.Recorder) *metrics.Registry {
 	reg := metrics.NewRegistry()
 	reg.Register(httpm)
 	reg.Register(metrics.ProcessCollector(version))
@@ -32,6 +33,7 @@ func newMetrics(httpm *metrics.HTTP, nodes *metrics.NodeStore, writer *usage.PGW
 	}))
 	reg.Register(metrics.CollectorFunc(func(w *metrics.PromWriter) {
 		w.Counter("llmr_usage_partition_errors_total", "Monthly usage partitions that could not be created", float64(writer.PartitionErrors.Load()))
+		w.Counter("llmr_audit_write_failures_total", "Audit events that could not be written to Postgres after a retry", float64(auditRec.WriteFailures.Load()))
 		w.Gauge("llmr_snapshot_age_seconds", "Seconds since the config snapshot in use was built from Postgres", holder.Age().Seconds())
 		w.Gauge("llmr_snapshot_build_seconds", "How long the latest snapshot build took", holder.LastBuild().Seconds())
 		w.Counter("llmr_snapshot_build_failures_total", "Snapshot builds that failed; the previous snapshot stays in use", float64(holder.Failures()))

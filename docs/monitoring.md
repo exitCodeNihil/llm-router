@@ -46,6 +46,7 @@ Both runtimes write these with the same names, so a sum over every scraped targe
 | `llmr_usage_partitions_dropped_total` | counter | | Control plane: monthly usage partitions dropped past their [retention](deploy.md#usage-data) |
 | `llmr_usage_lost_total` | counter | | Control plane: usage events still unwritten when it stopped |
 | `llmr_usage_partition_errors_total` | counter | | Control plane: monthly usage partitions that could not be created |
+| `llmr_audit_write_failures_total` | counter | | Control plane: [audit log](access.md#audit-log) rows that could not be written after a retry. The `audit` log line was still written |
 | `llmr_snapshot_age_seconds` | gauge | | Control plane: seconds since the config in use was read from Postgres. It is rebuilt every 30 seconds, so more than a minute or two means Postgres is not answering |
 | `llmr_snapshot_build_seconds` | gauge | | Control plane: how long the latest rebuild took |
 | `llmr_snapshot_build_failures_total` | counter | | Control plane: rebuilds that failed; the previous config stays in use |

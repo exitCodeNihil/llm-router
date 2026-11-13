@@ -46,6 +46,9 @@ type Config struct {
 	// Zero keeps them for ever.
 	UsageRetentionMonths  int
 	RollupRetentionMonths int
+	// AuditRetentionMonths is how many months of the audit log are kept.
+	// Zero keeps it for ever.
+	AuditRetentionMonths int
 
 	// LogLevel is the least severe level logged; LogJSON writes one JSON
 	// object per line instead of text.
@@ -101,6 +104,9 @@ func Load(args []string) (*Config, error) {
 		return nil, err
 	}
 	if c.RollupRetentionMonths, err = envInt("LLMR_ROLLUP_RETENTION_MONTHS"); err != nil {
+		return nil, err
+	}
+	if c.AuditRetentionMonths, err = envInt("LLMR_AUDIT_RETENTION_MONTHS"); err != nil {
 		return nil, err
 	}
 	if v := os.Getenv("LLMR_DB_CONSOLE_TIMEOUT"); v != "" {

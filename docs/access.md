@@ -76,3 +76,28 @@ gateway can't create users on its own. The control plane must therefore reach th
 `/.well-known/openid-configuration` and `jwks_uri`): while it can't, new people's first requests
 fail, the gateway asks again a few seconds later, and nobody is refused for it. To map tokens to
 users, gateways get every user they serve and a hash of each email address, not the address.
+
+## Audit log
+
+Every change made through the console or the management API is recorded: who made it (the user,
+or the admin token), the action, the record it acted on, the outcome (the HTTP status), the client
+address, and which settings changed. Sign-ins, failed sign-ins, SSO sign-ins, sign-outs and the
+first-admin setup are recorded too. Refused attempts are recorded as well as successful ones: a
+member calling an admin route, a wrong admin token, a request with no credentials.
+
+For settings that are not secret, such as budgets, rate limits, roles, allowed models, names of
+teams, keys and deployments, the new values are kept. For everything else only the names of the
+fields sent are kept, or nothing. Never recorded: passwords, API keys, client secrets, telemetry
+headers and secrets, join tokens, uploaded files, URLs (they can carry credentials), tags, and any
+email address other than the acting user's own. A failed sign-in keeps no email at all, since the
+address tried is often a typo of someone else's. Reads, chats and the playground are not recorded.
+
+Admins read it on the **Audit log** page, or with `GET /api/audit` (filters: `actor`, `action`,
+`target_type`, `target_id`, `status=ok|err`, `since`, `until`; page with `before=<id>` and
+`limit`). Each event is also written as an `audit` log line, without the detail or any email, for
+shipping to a SIEM.
+
+Rows cannot be updated or deleted: a trigger refuses it. The only exception is retention:
+`LLMR_AUDIT_RETENTION_MONTHS` (chart: `retention.auditMonths`) deletes rows older than that many
+months. `0`, the default, keeps them for ever. The trigger stops the application and mistakes, not
+someone who owns the database: ship the log lines elsewhere if that matters.

@@ -53,6 +53,7 @@ func (m *Server) createGatewayGroup(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	auditTarget(r, "gateway_group", id.String())
 	m.bump(r.Context())
 	// the join token is returned exactly once
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id.String(), "join_token": token})

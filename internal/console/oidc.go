@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/oauth2"
 
+	"github.com/exitcodenihil/llm-router/internal/audit"
 	"github.com/exitcodenihil/llm-router/internal/store"
 )
 
@@ -35,6 +36,8 @@ type Auth struct {
 	// TrustedProxies are the proxies whose X-Forwarded-For names the client
 	// for sign-in rate limits (LLMR_TRUSTED_PROXIES).
 	TrustedProxies []netip.Prefix
+	// Audit, when set, records sign-ins, failed sign-ins and sign-outs.
+	Audit func(context.Context, audit.Event)
 
 	limitsOnce sync.Once
 	limits     *signInLimits
@@ -49,6 +52,12 @@ func (a *Auth) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /auth/login", a.handleLogin)
 	mux.HandleFunc("GET /auth/callback", a.handleCallback)
 	mux.HandleFunc("GET /auth/logout", func(w http.ResponseWriter, r *http.Request) {
+		// Only a real session is recorded: a bare GET from anyone is not an event.
+		if id := SessionUserID(a.EncryptionKey, r); id != "" && a.Audit != nil {
+			var email string
+			a.Store.Pool.QueryRow(r.Context(), `SELECT email FROM users WHERE id=$1`, id).Scan(&email)
+			a.audit(r, "auth.signout", http.StatusFound, id, email)
+		}
 		http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, Domain: a.CookieDomain})
 		// The marker lets the console drop a bootstrap token it holds in
 		// local storage, which no server-side action can clear.
@@ -116,6 +125,16 @@ func (a *Auth) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Auth) handleCallback(w http.ResponseWriter, r *http.Request) {
+	sw := &statusWriter{ResponseWriter: w}
+	w = sw
+	var signedIn, signedInEmail string
+	defer func() {
+		if signedIn != "" {
+			a.audit(r, "auth.sso_signin", sw.status, signedIn, signedInEmail)
+		} else {
+			a.audit(r, "auth.sso_signin_failed", sw.status, "", "")
+		}
+	}()
 	stateCookie, err := r.Cookie("llmr_oauth_state")
 	if err != nil || r.URL.Query().Get("state") != stateCookie.Value {
 		http.Error(w, "state mismatch", http.StatusBadRequest)
@@ -210,6 +229,7 @@ func (a *Auth) handleCallback(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	signedIn, signedInEmail = userID, email
 	setSessionCookie(w, r, a.EncryptionKey, a.CookieDomain, userID)
 	http.Redirect(w, r, "/", http.StatusFound)
 }

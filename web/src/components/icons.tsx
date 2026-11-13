@@ -127,6 +127,12 @@ export const IconRequests = (p: SVGProps<SVGSVGElement>) => (
     <circle cx="19" cy="18" r="1.5" fill="currentColor" stroke="none" />
   </svg>
 );
+export const IconAudit = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...base(p)}>
+    <path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6z" />
+    <path d="M9 12l2 2 4-4" />
+  </svg>
+);
 export const IconObservability = (p: SVGProps<SVGSVGElement>) => (
   <svg {...base(p)}>
     <path d="M3 12h4l2-5 4 10 2-5h6" />
