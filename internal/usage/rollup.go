@@ -2,6 +2,7 @@ package usage
 
 import (
 	"context"
+	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -50,6 +51,11 @@ func Percentile(counts []int64, p float64) int {
 	}
 	return histBounds[len(histBounds)-1]
 }
+
+// money rounds a sum of costs to ten decimal places, the precision prices are
+// kept at. Adding floats leaves noise in the last digits, and Postgres would
+// store it: 44.601999999999968 for 44.602.
+func money(usd float64) float64 { return math.Round(usd*1e10) / 1e10 }
 
 // rollupKey is the dimensions one rollup row is for, less its time bucket.
 type rollupKey struct {
@@ -148,7 +154,7 @@ func writeRollups(ctx context.Context, tx pgx.Tx, events []Event) error {
 			r.bucket, nilIfEmpty(k.teamID), nilIfEmpty(k.userID), nilIfEmpty(k.apiKeyID), k.model,
 			nilIfEmpty(k.providerID), nilIfEmpty(k.deploymentID), nilIfEmpty(k.gatewayID),
 			k.status, nilIfEmpty(k.errorCode), k.stream, k.unpriced, k.failover,
-			r.requests, r.prompt, r.completion, r.cached, r.cost, r.notional, r.latency, r.ttft)
+			r.requests, r.prompt, r.completion, r.cached, money(r.cost), money(r.notional), r.latency, r.ttft)
 	}
 	return tx.SendBatch(ctx, b).Close()
 }

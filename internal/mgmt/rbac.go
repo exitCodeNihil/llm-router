@@ -82,7 +82,11 @@ func (m *Server) requireAuth(next http.HandlerFunc) http.Handler {
 			if bearer && m.TokenGuard != nil {
 				m.TokenGuard.AdminTokenFailed(r)
 			}
-			m.recordUnauthenticated(r, http.StatusUnauthorized)
+			// Only an attempt that presented something: a request with no
+			// credentials at all is a scanner, and would fill the audit log.
+			if bearer || console.HasSession(r) {
+				m.recordUnauthenticated(r, http.StatusUnauthorized)
+			}
 			httpError(w, http.StatusUnauthorized, "authentication required")
 			return
 		}

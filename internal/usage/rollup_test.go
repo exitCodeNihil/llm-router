@@ -28,3 +28,16 @@ func TestPercentile(t *testing.T) {
 		t.Errorf("p99 in the open range = %d, want 500000", got)
 	}
 }
+
+func TestMoneyDropsFloatNoise(t *testing.T) {
+	var sum float64
+	for range 800 {
+		sum += 0.0557525
+	}
+	if sum == 44.602 {
+		t.Skip("this sum has no noise on this platform")
+	}
+	if got := money(sum); got != 44.602 {
+		t.Fatalf("money(%v) = %v, want 44.602", sum, got)
+	}
+}

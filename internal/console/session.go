@@ -52,3 +52,9 @@ func SessionUserID(encryptionKey string, r *http.Request) string {
 	}
 	return userID
 }
+
+// HasSession reports whether the request carries a session cookie, valid or not.
+func HasSession(r *http.Request) bool {
+	_, err := r.Cookie(sessionCookie)
+	return err == nil
+}

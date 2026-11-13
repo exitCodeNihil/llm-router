@@ -131,6 +131,12 @@ impl Spool {
         }
     }
 
+    /// Every event numbered up to this has been through `seal`: it is on
+    /// disk, or was counted as skipped.
+    pub fn sealed(&self) -> u64 {
+        self.inner.lock().unwrap().sealed
+    }
+
     fn path(&self, first: u64, last: u64) -> PathBuf {
         // padded, so names sort in the order of their events
         self.dir.join(format!("{first:020}-{last:020}.bin"))

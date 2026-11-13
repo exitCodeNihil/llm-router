@@ -52,6 +52,9 @@ const REPLAY_BYTES: usize = 8 << 20;
 /// How long the first sync waits for the replay of what an earlier process
 /// left; past that the replay goes on beside the syncs.
 const REPLAY_FIRST: Duration = Duration::from_secs(30);
+/// This many 404s in a row, and no replay ever answered, mean the control
+/// plane has none.
+const REPLAY_MISSING: u32 = 3;
 /// The wait after a failed replay of leftovers; it doubles, up to 30 s.
 const REPLAY_RETRY: Duration = Duration::from_secs(1);
 /// The oldest confirmation a config from the state directory is served on.
@@ -67,6 +70,12 @@ pub struct ControlPlane {
     client: HttpsClient,
     session: ArcSwap<String>,
     generation: AtomicU64,
+    /// Successful joins: each makes the gateway a new instance to the control
+    /// plane. A renewed session does not.
+    joins: AtomicU64,
+    /// The control plane has answered a replay with 200: a 404 from then on
+    /// is a proxy's, not a control plane without replay.
+    replay_seen: AtomicBool,
     expires_at_ms: AtomicI64,
     sync_interval_ms: AtomicU64,
     join_lock: tokio::sync::Mutex<()>,
@@ -121,6 +130,8 @@ impl ControlPlane {
             client: https_client(8),
             session: ArcSwap::from_pointee(String::new()),
             generation: AtomicU64::new(0),
+            joins: AtomicU64::new(0),
+            replay_seen: AtomicBool::new(false),
             expires_at_ms: AtomicI64::new(0),
             sync_interval_ms: AtomicU64::new(2000),
             join_lock: tokio::sync::Mutex::new(()),
@@ -251,6 +262,7 @@ impl ControlPlane {
         }
         let j: Joined = serde_json::from_slice(&bytes).map_err(|e| format!("join response: {e}"))?;
         self.adopt(&j);
+        self.joins.fetch_add(1, Ordering::Relaxed);
         if self.refused_since.lock().unwrap().take().is_some()
             && let Some(state) = self.state.clone()
         {
@@ -550,6 +562,7 @@ impl ControlPlane {
         {
             Ok(Call::Ok(StatusCode::OK, _, bytes)) => {
                 let r: Replayed = serde_json::from_slice(&bytes).unwrap_or_default();
+                self.replay_seen.store(true, Ordering::Relaxed);
                 metrics::REPLAYED_EVENTS.fetch_add(events as u64, Ordering::Relaxed);
                 metrics::REPLAY_DUPLICATE_EVENTS.fetch_add(r.duplicates, Ordering::Relaxed);
                 log_info!(
@@ -569,7 +582,9 @@ impl ControlPlane {
                 log_error!("replay: {status}; dropping {events} usage events");
                 Replay::Done
             }
-            Ok(Call::Ok(StatusCode::NOT_FOUND, _, _)) => Replay::Unsupported,
+            // Proxies answer 404 during a rollout: it only says "no replay
+            // here" of a control plane that has never answered one.
+            Ok(Call::Ok(StatusCode::NOT_FOUND, _, _)) if !self.replay_seen.load(Ordering::Relaxed) => Replay::Missing,
             Ok(Call::Ok(StatusCode::PAYLOAD_TOO_LARGE, _, _)) => Replay::TooLarge,
             Ok(Call::Ok(status, _, _)) => Replay::Retry(status.to_string()),
             Err(e) => Replay::Retry(e),
@@ -632,15 +647,19 @@ impl ControlPlane {
             };
             let body = Bytes::from(body);
             let mut wait = self.replay_retry;
+            let mut missing = 0;
             loop {
-                match self.replay(body.clone(), n).await {
+                let outcome = self.replay(body.clone(), n).await;
+                missing = if matches!(outcome, Replay::Missing) { missing + 1 } else { 0 };
+                match outcome {
                     Replay::Done => break,
-                    Replay::Unsupported => {
+                    Replay::Missing if missing >= REPLAY_MISSING => {
                         log_warn!(
                             "replay: this control plane has no /gw/v1/replay; usage left by an earlier run stays in the spool until it is upgraded"
                         );
                         return false;
                     }
+                    Replay::Missing => log_warn!("replay: 404; retrying in {}s", wait.as_secs_f32()),
                     Replay::TooLarge => {
                         log_warn!("replay: 413 for {n} usage events; retrying in {}s", wait.as_secs_f32());
                     }
@@ -663,8 +682,10 @@ impl ControlPlane {
     /// longer knows its number. Its events go through the replay instead,
     /// which stores each once; its rate counts are given up. Some(result)
     /// when that settled it or must be tried again, None to send it as a sync
-    /// after all.
-    async fn replay_pending(&self, s: &mut Syncer, generation: u64) -> Option<bool> {
+    /// after all: to a control plane that has no replay (404 on
+    /// REPLAY_MISSING syncs running and never a 200), or past a proxy that
+    /// finds it too large.
+    async fn replay_pending(&self, s: &mut Syncer, joins: u64) -> Option<bool> {
         let mut batch = s.pending.take()?;
         let n = batch.frozen.events.len();
         let (body, frozen) = tokio::task::spawn_blocking(move || {
@@ -679,18 +700,25 @@ impl ControlPlane {
         batch.frozen = frozen;
         let outcome = match body {
             Ok(body) => self.replay(body.into(), n).await,
-            Err(_) => Replay::Unsupported,
+            Err(_) => Replay::TooLarge,
         };
+        s.replay_missing = if matches!(outcome, Replay::Missing) { s.replay_missing + 1 } else { 0 };
         match outcome {
             Replay::Done => {
                 limits::discard(&batch.scopes);
                 self.settle(batch.frozen.high()).await;
                 Some(false)
             }
-            Replay::Unsupported | Replay::TooLarge => {
+            Replay::Missing if s.replay_missing < REPLAY_MISSING => {
+                log_warn!("replay: 404");
+                s.pending = Some(batch);
+                Some(false)
+            }
+            Replay::Missing | Replay::TooLarge => {
                 // An older control plane, or a proxy the sync knows how to
                 // get a large batch past.
-                batch.sent = Some(generation);
+                s.replay_missing = 0;
+                batch.sent = Some(joins);
                 s.pending = Some(batch);
                 None
             }
@@ -720,7 +748,10 @@ impl ControlPlane {
             spool.seal().await;
         }
         if s.pending.is_none() {
-            let (events, sending) = usage::take_batch(MAX_BATCH, s.max_bytes());
+            // With a spool, only what it has been through: an event queued
+            // while the seal was written waits for the next sync's.
+            let sealed = self.spool.as_ref().map_or(u64::MAX, |spool| spool.sealed());
+            let (events, sending) = usage::take_batch_upto(MAX_BATCH, s.max_bytes(), sealed);
             let (rates, scopes) = limits::freeze();
             s.batch += 1;
             let mem = crate::resources::memory();
@@ -739,15 +770,18 @@ impl ControlPlane {
                 Frozen { batch: s.batch, cursor: s.cursor.clone(), events, sending, rates, stats, dropped_high: 0 };
             s.pending = Batch::build(frozen, scopes).await;
         }
-        let (session, generation) = self.session();
-        let rejoined = |b: &Batch| b.sent.is_some_and(|sent| sent != generation) && !b.frozen.events.is_empty();
+        // A renewed session is the same instance: only a join in between
+        // sends a batch through the replay.
+        let joins = self.joins.load(Ordering::Relaxed);
+        let rejoined = |b: &Batch| b.sent.is_some_and(|sent| sent != joins) && !b.frozen.events.is_empty();
         if s.pending.as_ref().is_some_and(rejoined)
-            && let Some(done) = self.replay_pending(s, generation).await
+            && let Some(done) = self.replay_pending(s, joins).await
         {
             return done;
         }
+        let (session, generation) = self.session();
         if let Some(batch) = &mut s.pending {
-            batch.sent = Some(generation);
+            batch.sent = Some(joins);
         }
         let Some(batch) = &s.pending else { return false };
         match self
@@ -866,6 +900,8 @@ struct Syncer {
     pending: Option<Batch>,
     /// A smaller byte cap than MAX_BATCH_BYTES, after a 413.
     limit_bytes: Option<usize>,
+    /// 404s in a row for the pending batch's replay.
+    replay_missing: u32,
 }
 
 impl Syncer {
@@ -881,8 +917,8 @@ struct Batch {
     body: Bytes,
     scopes: Vec<Arc<limits::Scope>>,
     frozen: Frozen,
-    /// The join (`generation`) it was last sent under; None before the first
-    /// send.
+    /// The join (`ControlPlane::joins`) it was last sent under; None before
+    /// the first send.
     sent: Option<u64>,
 }
 
@@ -919,8 +955,9 @@ struct Replayed {
 enum Replay {
     /// Answered for: stored, already there, or refused for good.
     Done,
-    /// The control plane has no replay (before 0.4).
-    Unsupported,
+    /// 404 from a control plane that has never answered a replay: it may
+    /// have none (before 0.4), or a proxy answered for it.
+    Missing,
     TooLarge,
     Retry(String),
 }
@@ -1341,6 +1378,8 @@ mod tests {
         calls: Mutex<Vec<(String, u16, serde_json::Value)>>,
         /// How many of the next syncs are answered 401, as an ended session is.
         expire: AtomicUsize,
+        /// How many of the next syncs are answered 503.
+        fail: AtomicUsize,
         /// What a replay is answered with; 0 is 200, and CUT_OFF no answer at all.
         replay_status: AtomicUsize,
     }
@@ -1425,7 +1464,20 @@ mod tests {
                                         if expired {
                                             cp.expire.fetch_sub(1, Ordering::Relaxed);
                                         }
-                                        (if expired { 401 } else { 200 }, "{}".to_string())
+                                        let failed = !expired && cp.fail.load(Ordering::Relaxed) > 0;
+                                        if failed {
+                                            cp.fail.fetch_sub(1, Ordering::Relaxed);
+                                        }
+                                        (
+                                            if expired {
+                                                401
+                                            } else if failed {
+                                                503
+                                            } else {
+                                                200
+                                            },
+                                            "{}".to_string(),
+                                        )
                                     } else {
                                         match cp.replay_status.load(Ordering::Relaxed) {
                                             0 => (
@@ -1713,14 +1765,17 @@ mod tests {
         let files = spool_files(&dir);
         let (url, mock) = gateway_cp().await;
         mock.replay_status.store(404, Ordering::Relaxed);
-        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into()).with_spool(Some(spool_in(&dir, u64::MAX)));
+        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into())
+            .with_spool(Some(spool_in(&dir, u64::MAX)))
+            .replaying_with(Duration::from_millis(200), Duration::from_millis(10));
         let st = new_state();
         let running = tokio::spawn(Arc::new(cp).start(st));
         request("new-1");
         until("the new event is synced", || mock.models("sync", 200).iter().any(|m| m == &["new-1"])).await;
         until("its own file is settled", || spool_files(&dir).len() == 1).await;
         assert_eq!(spool_files(&dir), files, "the leftover file is kept");
-        assert_eq!(mock.models("replay", 404).len(), 1, "asked once");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(mock.models("replay", 404).len(), 3, "one 404 may be a proxy's; three in a row are not");
         assert!(st.is_ready());
         running.abort();
         let _ = running.await;
@@ -1764,14 +1819,22 @@ mod tests {
         assert_eq!(mock.models("sync", 200), [["later-1"]], "the batch itself is never sent as a sync again");
         assert!(spool_files(&dir).is_empty());
 
-        // a control plane without replay: the batch is resent as a sync, as before
+        // This control plane has answered a replay, so a 404 is a proxy's
+        // (a rollout, say): the batch waits for the replay, however long,
+        // and is never resent as a sync, which could count it twice.
         mock.replay_status.store(404, Ordering::Relaxed);
         request("pending-2");
         mock.expire.store(1, Ordering::Relaxed);
+        for _ in 0..6 {
+            assert!(!cp.sync_once(&mut s).await);
+        }
+        assert!(s.pending.is_some());
+        assert_eq!(mock.models("replay", 404).len(), 5);
+        assert_eq!(mock.models("sync", 200), [["later-1"]]);
+        mock.replay_status.store(0, Ordering::Relaxed);
         assert!(!cp.sync_once(&mut s).await);
-        assert!(cp.sync_once(&mut s).await);
-        assert_eq!(mock.models("sync", 200).last().unwrap(), &["pending-2"]);
-        assert!(spool_files(&dir).is_empty());
+        assert_eq!(mock.models("replay", 200).last().unwrap(), &["pending-2"]);
+        assert!(s.pending.is_none() && spool_files(&dir).is_empty());
 
         // a replay the control plane cannot read drops the batch, so it cannot wedge the gateway
         mock.replay_status.store(400, Ordering::Relaxed);
@@ -1871,7 +1934,9 @@ mod tests {
     }
 
     // The replay of a batch pending across a rejoin needs no state
-    // directory; without one nothing is written.
+    // directory; without one nothing is written. A control plane that has
+    // never answered a replay and says 404 three times running has none:
+    // only then is the batch resent as a sync.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
     async fn without_a_spool_nothing_is_written_and_a_rejoin_still_replays() {
@@ -1882,22 +1947,153 @@ mod tests {
         cp.join().await.unwrap();
         let mut s = cp.syncer.lock().await;
         let bytes = metrics::SPOOL_BYTES.load(Ordering::Relaxed);
+
+        mock.replay_status.store(404, Ordering::Relaxed);
         request("plain-1");
         mock.expire.store(1, Ordering::Relaxed);
         assert!(!cp.sync_once(&mut s).await, "401, and it joins again");
-        assert!(!cp.sync_once(&mut s).await, "the pending batch is replayed");
-        assert!(s.pending.is_none());
-        assert_eq!(mock.models("replay", 200), [["plain-1"]]);
-        assert!(mock.models("sync", 200).is_empty());
+        assert!(!cp.sync_once(&mut s).await, "404: it may be a proxy's");
+        assert!(!cp.sync_once(&mut s).await, "404 again");
+        assert!(mock.models("sync", 200).is_empty() && s.pending.is_some());
+        assert!(cp.sync_once(&mut s).await, "the third 404: resent as a sync");
+        assert_eq!(mock.models("replay", 404).len(), 3);
+        assert_eq!(mock.models("sync", 200), [["plain-1"]]);
 
-        // a control plane without replay: resent as a sync
-        mock.replay_status.store(404, Ordering::Relaxed);
+        // one 404 between answers does not count towards the three
         request("plain-2");
         mock.expire.store(1, Ordering::Relaxed);
         assert!(!cp.sync_once(&mut s).await);
-        assert!(cp.sync_once(&mut s).await);
-        assert_eq!(mock.models("sync", 200), [["plain-2"]]);
+        assert!(!cp.sync_once(&mut s).await, "404");
+        mock.replay_status.store(503, Ordering::Relaxed);
+        assert!(!cp.sync_once(&mut s).await, "503");
+        mock.replay_status.store(404, Ordering::Relaxed);
+        assert!(!cp.sync_once(&mut s).await, "404");
+        assert!(!cp.sync_once(&mut s).await, "404");
+        assert!(s.pending.is_some());
+        mock.replay_status.store(0, Ordering::Relaxed);
+        assert!(!cp.sync_once(&mut s).await, "replayed");
+        assert!(s.pending.is_none());
+        assert_eq!(mock.models("replay", 200), [["plain-2"]]);
+        assert_eq!(mock.models("sync", 200), [["plain-1"]]);
         assert_eq!(metrics::SPOOL_BYTES.load(Ordering::Relaxed), bytes);
+    }
+
+    // A renewed session is the same instance to the control plane, which
+    // still knows the pending batch's number: the batch is resent as the
+    // sync it is, rate counts and all. Only a new join sends it to the replay.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
+    async fn a_renewed_session_resends_the_pending_batch_as_a_sync() {
+        let _globals = hold_globals();
+        drop(usage::take(usize::MAX, usize::MAX));
+        drop(limits::freeze());
+        let (url, mock) = gateway_cp().await;
+        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into());
+        cp.join().await.unwrap();
+        let mut s = cp.syncer.lock().await;
+        let limited = crate::config::Key {
+            id: "renew-test".into(),
+            user_id: String::new(),
+            team_id: String::new(),
+            user: None,
+            team: None,
+            allowed_models: None,
+            expires_at: 0,
+            scope: limits::scope("key:renew-test".into(), None, Some(1000), None),
+            tags: Vec::new(),
+        };
+        let renew = |cp: &ControlPlane| {
+            let generation = cp.generation.load(Ordering::Relaxed);
+            cp.adopt(&Joined {
+                instance_id: String::new(),
+                session: "s".into(),
+                expires_at_ms: now_ms() + 900_000,
+                sync_interval_ms: 0,
+                group: None,
+            });
+            assert_eq!(cp.generation.load(Ordering::Relaxed), generation + 1);
+        };
+
+        request("renewed-1");
+        assert!(limits::check(&limited).is_ok());
+        mock.fail.store(1, Ordering::Relaxed);
+        assert!(!cp.sync_once(&mut s).await, "503: the batch stays pending");
+        renew(&cp);
+        assert!(cp.sync_once(&mut s).await);
+        assert!(mock.models("replay", 200).is_empty(), "a renewal is no reason to replay");
+        {
+            let calls = mock.calls.lock().unwrap();
+            let syncs: Vec<_> = calls.iter().filter(|(path, _, _)| path.ends_with("sync")).collect();
+            assert_eq!(syncs.iter().map(|(_, code, _)| *code).collect::<Vec<_>>(), [503, 200]);
+            assert_eq!(syncs[0].2, syncs[1].2, "the same batch, resent as it was");
+            let rates = syncs[1].2["rates"].as_array().unwrap();
+            assert!(rates.iter().any(|r| r["scope"] == "key:renew-test" && r["requests"] == 1), "{rates:?}");
+        }
+
+        // the session ends and the gateway joins again: now it is replayed
+        request("rejoined-1");
+        mock.expire.store(1, Ordering::Relaxed);
+        assert!(!cp.sync_once(&mut s).await, "401, and it joins again");
+        renew(&cp);
+        assert!(!cp.sync_once(&mut s).await);
+        assert_eq!(mock.models("replay", 200), [["rejoined-1"]]);
+        assert_eq!(mock.models("sync", 200), [["renewed-1"]]);
+    }
+
+    // An event queued while the seal is being written is not on disk: it
+    // waits for the next sync, so nothing is ever sent that a crash in the
+    // meantime would lose.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
+    async fn only_events_on_disk_are_sent() {
+        let _globals = hold_globals();
+        drop(usage::take(usize::MAX, usize::MAX));
+        let dir = TempDir::new("spool-gap");
+        let (url, _) = mock_cp(|_, _| 503).await;
+        let spool = spool_in(&dir, u64::MAX);
+        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into()).with_spool(Some(spool.clone()));
+        let mut s = cp.syncer.lock().await;
+        // requests finishing all the while, also during the seal's write
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let traffic = tokio::spawn(async move {
+            let mut n = 0;
+            while !stopped.load(Ordering::Relaxed) {
+                request(&format!("during-{n}"));
+                n += 1;
+                tokio::task::yield_now().await;
+            }
+        });
+        let on_disk = || -> Vec<String> {
+            spool_files(&dir)
+                .iter()
+                .flat_map(|f| spool::read(&dir.0.join("spool").join(f)).0)
+                .map(|json| {
+                    serde_json::from_slice::<serde_json::Value>(&json).unwrap()["model_name"].as_str().unwrap().into()
+                })
+                .collect()
+        };
+        let mut left_for_later = 0;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+            assert!(!cp.sync_once(&mut s).await, "503: the batch is sent and stays pending");
+            let batch = s.pending.take().unwrap();
+            let saved = on_disk();
+            assert!(!batch.frozen.events.is_empty());
+            for e in &batch.frozen.events {
+                assert!(
+                    e.seq <= spool.sealed() && saved.contains(&e.model_name),
+                    "{} was sent but is not on disk",
+                    e.model_name
+                );
+            }
+            left_for_later += usage::queued();
+            limits::discard(&batch.scopes);
+        }
+        assert!(left_for_later > 0, "events did arrive during the seal");
+        stop.store(true, Ordering::Relaxed);
+        let _ = traffic.await;
+        drop(usage::take(usize::MAX, usize::MAX));
     }
 
     // The control plane skips a batch number it has already stored and still

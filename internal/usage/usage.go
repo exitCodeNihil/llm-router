@@ -248,7 +248,25 @@ func (w *PGWriter) flush(ctx context.Context, events []Event) error {
 	if n := len(events) - len(kept); n > 0 {
 		slog.Warn("usage rows refused", "refused", n, "of", len(events))
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		// The connection can fail after Postgres committed. Writing the batch
+		// again would count its usage and spend twice, so look for it first.
+		if len(kept) > 0 && w.stored(kept[0]) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// stored reports whether e is in usage_events.
+func (w *PGWriter) stored(e Event) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var found bool
+	err := w.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM usage_events WHERE request_id = $1 AND ts = $2)`,
+		e.RequestID, e.TS).Scan(&found)
+	return err == nil && found
 }
 
 // ScopeKeys lists the spend scopes an event counts against: its key, user and
@@ -418,7 +436,7 @@ func writeCounters(ctx context.Context, tx pgx.Tx, events []Event) error {
 				ON CONFLICT (scope_type, scope_id, period_start)
 				DO UPDATE SET usd = spend_counters.usd + EXCLUDED.usd,
 				              tokens = spend_counters.tokens + EXCLUDED.tokens`,
-				k.scopeType, k.scopeID, k.start, c.usd, c.tokens)
+				k.scopeType, k.scopeID, k.start, money(c.usd), c.tokens)
 			continue
 		}
 		b.Queue(`INSERT INTO spend_totals (period, period_start, scope_type, scope_id, usd, tokens)
@@ -426,7 +444,7 @@ func writeCounters(ctx context.Context, tx pgx.Tx, events []Event) error {
 			ON CONFLICT (period, period_start, scope_type, scope_id)
 			DO UPDATE SET usd = spend_totals.usd + EXCLUDED.usd,
 			              tokens = spend_totals.tokens + EXCLUDED.tokens`,
-			k.period, k.start, k.scopeType, k.scopeID, c.usd, c.tokens)
+			k.period, k.start, k.scopeType, k.scopeID, money(c.usd), c.tokens)
 	}
 	return tx.SendBatch(ctx, b).Close()
 }

@@ -350,8 +350,16 @@ pub fn take(max_events: usize, max_bytes: usize) -> Vec<Event> {
 /// budget, moved from the queue to the returned `Sending` without a moment
 /// in which it counts nowhere.
 pub fn take_batch(max_events: usize, max_bytes: usize) -> (Vec<Event>, Sending) {
+    take_batch_upto(max_events, max_bytes, u64::MAX)
+}
+
+/// As `take_batch`, of the events numbered up to `upto` only: with a spool,
+/// those it has on disk. Later ones wait for the next batch; there may be
+/// none to take.
+pub fn take_batch_upto(max_events: usize, max_bytes: usize, upto: u64) -> (Vec<Event>, Sending) {
     let mut q = queue().lock().unwrap();
-    let n = batch_len(q.events.iter().map(Event::encoded_size), max_events, max_bytes);
+    let ready = if upto == u64::MAX { q.events.len() } else { q.events.partition_point(|e| e.seq <= upto) };
+    let n = batch_len(q.events.iter().take(ready).map(Event::encoded_size), max_events, max_bytes);
     let batch: Vec<Event> = q.events.drain(..n).collect();
     let freed: usize = batch.iter().filter_map(|e| e.content.as_ref()).map(|c| c.bytes()).sum();
     SENDING_CONTENT.fetch_add(freed, Ordering::Relaxed);

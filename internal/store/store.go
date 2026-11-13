@@ -6,6 +6,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"time"
@@ -138,6 +139,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		slog.Info("applying migration", "name", name)
 		// A migration that cannot get its table lock gives up rather than
 		// queue: every query on that table would queue behind it.
 		for try := 1; ; try++ {
@@ -159,7 +161,9 @@ func migrateOne(ctx context.Context, conn *pgxpool.Conn, name, sql string) error
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '10s'`); err != nil {
+	// UTC whatever the database's own zone: migrations do date arithmetic,
+	// and month boundaries must not move with it.
+	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '10s'; SET LOCAL TimeZone = 'UTC'`); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, sql); err != nil {

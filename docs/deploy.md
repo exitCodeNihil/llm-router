@@ -107,9 +107,12 @@ plane has not confirmed for that many seconds answers `/v1` with 503 `config_sta
 `/healthz` until the next config poll is answered. It polls about every 25 seconds.
 
 A gateway that has to join again while a batch of usage is unacknowledged, with or without state on
-disk, sends that batch's events to the control plane's replay, which stores each request once. A
-control plane before 0.4 has no replay: the batch is resent as a sync and, if the first attempt had
-been stored, counted twice.
+disk, sends that batch's events to the control plane's replay, which stores each request once; the
+batch's rate-limit counts are not sent. Renewing a session is not joining again: an unacknowledged
+batch is then resent as the sync it was. A control plane before 0.4 has no replay. A gateway
+concludes that only of a control plane that has never answered a replay and answers 404 three times
+running; it then resends the batch as a sync, which counts it twice if the first attempt had been
+stored. Once a control plane has answered a replay, a 404 is retried until the replay goes through.
 
 Deleting a group ends its gateways' sessions: each notices at its next sync or config poll, within
 seconds, and tries to join again. The control plane refuses that join, and a gateway that has been
@@ -195,7 +198,9 @@ killed, sends them to the control plane before its first sync, and the control p
 request once, however often it is sent. What a crash can still lose is the usage of requests that
 finished since the last sync, about two seconds' worth, and of requests in flight when the process
 died. Events replayed from the spool carry no prompts or responses. Replay needs a 0.4 control plane; against an
-older one the files wait for a later start. Past `LLMR_SPOOL_MAX_BYTES` new events are not spooled
+older one (three 404s running, and no replay ever answered) the files wait for a later start.
+A gateway sends only events that are in the spool: one that finishes while the spool is being
+written goes with the next sync. Past `LLMR_SPOOL_MAX_BYTES` new events are not spooled
 (`llmr_spool_skipped_events_total`) until acknowledged ones make room, which only happens while the
 control plane is unreachable for a long time: 256 MiB holds several hundred thousand events.
 

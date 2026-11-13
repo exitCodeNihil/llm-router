@@ -47,6 +47,11 @@ func (s *Server) accept(snap *snapshot.Snapshot, g *snapshot.GatewayGroup, enc *
 			dropped++
 			continue
 		}
+		// The key's owners are the control plane's to say: a gateway must not
+		// be able to charge one of its keys' usage to another user or team.
+		if k := enc.keys[e.APIKeyID]; k != nil {
+			e.UserID, e.TeamID = k.UserID, k.TeamID
+		}
 		if se.TSMS > 0 {
 			e.TS = time.UnixMilli(se.TSMS)
 		}

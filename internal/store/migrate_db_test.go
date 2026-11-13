@@ -29,6 +29,11 @@ func TestConcurrentMigrate(t *testing.T) {
 	if _, err := admin.Pool.Exec(ctx, `CREATE DATABASE `+name); err != nil {
 		t.Fatal(err)
 	}
+	// A zone with daylight saving and a month that starts on another day in
+	// UTC: migrations must not depend on the database's time zone.
+	if _, err := admin.Pool.Exec(ctx, `ALTER DATABASE `+name+` SET timezone = 'America/New_York'`); err != nil {
+		t.Fatal(err)
+	}
 	u, err := url.Parse(base)
 	if err != nil {
 		t.Fatal(err)
@@ -82,5 +87,25 @@ func TestConcurrentMigrate(t *testing.T) {
 	}
 	if tuned == 0 {
 		t.Fatal("no rollup partition carries the storage settings")
+	}
+	// Every rollup partition starts at midnight UTC on the first of a month.
+	// Bounds print in the session's zone: read them in UTC.
+	conn, err := st.Pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SET TimeZone = 'UTC'`); err != nil {
+		t.Fatal(err)
+	}
+	var crooked int
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+		WHERE i.inhparent IN ('usage_hourly'::regclass, 'usage_daily'::regclass)
+		  AND pg_get_expr(c.relpartbound, c.oid) !~ $1`,
+		`FROM \('\d{4}-\d\d-01 00:00:00\+00'\) TO \('\d{4}-\d\d-01 00:00:00\+00'\)`).Scan(&crooked); err != nil {
+		t.Fatal(err)
+	}
+	if crooked != 0 {
+		t.Fatalf("%d rollup partitions do not run from the first of a month to the next, UTC", crooked)
 	}
 }
