@@ -349,11 +349,15 @@ func queueRow(b *pgx.Batch, e Event) {
 		nilIfEmpty(e.TraceID), nilIfEmpty(e.InferenceGeo), nilIfEmpty(e.Speed), zeroIfNil(e.CostBasis))
 }
 
-// writeCounters adds the events' spend: one upsert per (scope, day).
+// TotalStart is the period_start of a scope's all-time row in spend_totals.
+var TotalStart = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// writeCounters adds the events' spend: one upsert per (scope, day) in
+// spend_counters, and the scope's month and all-time rows in spend_totals.
 func writeCounters(ctx context.Context, tx pgx.Tx, events []Event) error {
 	type counter struct {
-		scopeType, scopeID string
-		day                time.Time
+		period, scopeType, scopeID string // period: "day", "month" or "total"
+		start                      time.Time
 	}
 	type total struct {
 		usd    float64
@@ -361,18 +365,23 @@ func writeCounters(ctx context.Context, tx pgx.Tx, events []Event) error {
 	}
 	agg := map[counter]*total{}
 	for _, e := range events {
-		day := e.TS.UTC().Truncate(24 * time.Hour)
+		ts := e.TS.UTC()
 		tokens := int64(e.PromptTokens + e.CompletionTokens)
 		for _, key := range ScopeKeys(e) {
 			scopeType, scopeID, _ := strings.Cut(key, ":")
-			k := counter{scopeType, scopeID, day}
-			c := agg[k]
-			if c == nil {
-				c = &total{}
-				agg[k] = c
+			for _, k := range []counter{
+				{"day", scopeType, scopeID, ts.Truncate(24 * time.Hour)},
+				{"month", scopeType, scopeID, time.Date(ts.Year(), ts.Month(), 1, 0, 0, 0, 0, time.UTC)},
+				{"total", scopeType, scopeID, TotalStart},
+			} {
+				c := agg[k]
+				if c == nil {
+					c = &total{}
+					agg[k] = c
+				}
+				c.usd += e.CostUSD
+				c.tokens += tokens
 			}
-			c.usd += e.CostUSD
-			c.tokens += tokens
 		}
 	}
 	if len(agg) == 0 {
@@ -382,17 +391,27 @@ func writeCounters(ctx context.Context, tx pgx.Tx, events []Event) error {
 	// user's, a team's) would otherwise lock them in opposite orders and
 	// deadlock.
 	keys := slices.SortedFunc(maps.Keys(agg), func(a, b counter) int {
-		return cmp.Or(strings.Compare(a.scopeType, b.scopeType), strings.Compare(a.scopeID, b.scopeID), a.day.Compare(b.day))
+		return cmp.Or(strings.Compare(a.period, b.period), strings.Compare(a.scopeType, b.scopeType),
+			strings.Compare(a.scopeID, b.scopeID), a.start.Compare(b.start))
 	})
 	b := &pgx.Batch{}
 	for _, k := range keys {
 		c := agg[k]
-		b.Queue(`INSERT INTO spend_counters (scope_type, scope_id, period_start, usd, tokens)
-			VALUES ($1,$2,$3,$4,$5)
-			ON CONFLICT (scope_type, scope_id, period_start)
-			DO UPDATE SET usd = spend_counters.usd + EXCLUDED.usd,
-			              tokens = spend_counters.tokens + EXCLUDED.tokens`,
-			k.scopeType, k.scopeID, k.day, c.usd, c.tokens)
+		if k.period == "day" {
+			b.Queue(`INSERT INTO spend_counters (scope_type, scope_id, period_start, usd, tokens)
+				VALUES ($1,$2,$3,$4,$5)
+				ON CONFLICT (scope_type, scope_id, period_start)
+				DO UPDATE SET usd = spend_counters.usd + EXCLUDED.usd,
+				              tokens = spend_counters.tokens + EXCLUDED.tokens`,
+				k.scopeType, k.scopeID, k.start, c.usd, c.tokens)
+			continue
+		}
+		b.Queue(`INSERT INTO spend_totals (period, period_start, scope_type, scope_id, usd, tokens)
+			VALUES ($1,$2,$3,$4,$5,$6)
+			ON CONFLICT (period, period_start, scope_type, scope_id)
+			DO UPDATE SET usd = spend_totals.usd + EXCLUDED.usd,
+			              tokens = spend_totals.tokens + EXCLUDED.tokens`,
+			k.period, k.start, k.scopeType, k.scopeID, c.usd, c.tokens)
 	}
 	return tx.SendBatch(ctx, b).Close()
 }
