@@ -42,6 +42,8 @@ Both runtimes write these with the same names, so a sum over every scraped targe
 | `llmr_memory_limit_bytes` | gauge | | The cgroup's `memory.max`. Absent when there is no limit |
 | `llmr_usage_queued`, `llmr_usage_queue_capacity` | gauge | | Usage events waiting: for Postgres on the control plane, for the next sync on a gateway |
 | `llmr_usage_dropped_total` | counter | | Usage events dropped because the queue was full |
+| `llmr_usage_flush_failures_total` | counter | | Control plane: failed writes of usage events to Postgres. Each is retried, so this alone loses nothing |
+| `llmr_usage_lost_total` | counter | | Control plane: usage events still unwritten when it stopped |
 | `llmr_build_info` | gauge | `runtime` (`control_plane`, `gateway`), `version` | Always 1 |
 
 Gateways only:
@@ -137,6 +139,7 @@ scraped twice.
 | `LLMRouterRequestsShed` | A gateway sheds requests (`rate(llmr_shed_total[5m]) > 0`) | 2m |
 | `LLMRouterHighErrorRate` | More than 5% of `/v1` requests end in 5xx | 10m |
 | `LLMRouterUsageDropped` | Usage events were dropped in the last 10 minutes | |
+| `LLMRouterUsageFlushFailing` | More than 3 writes of usage to Postgres failed in 10 minutes | |
 | `LLMRouterTelemetryDestinationFailing` | A telemetry destination keeps failing (`llmr_telemetry_destination_failing{destination}`) | 10m |
 | `LLMRouterTelemetrySpansDropped` | A telemetry destination dropped spans in the last 10 minutes, by reason (info) | |
 

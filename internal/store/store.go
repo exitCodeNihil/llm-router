@@ -6,6 +6,8 @@ import (
 	"embed"
 	"fmt"
 	"sort"
+	"strconv"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -14,11 +16,56 @@ import (
 var migrationsFS embed.FS
 
 type Store struct {
+	// Pool serves ingest, gateway sync, snapshots and writes.
 	Pool *pgxpool.Pool
+	// Console serves console reads, under a statement timeout, so a slow
+	// dashboard query can neither hold ingest's connections nor run forever.
+	Console *pgxpool.Pool
+}
+
+// Options sizes the pools. Zero values take the defaults.
+type Options struct {
+	MaxConns        int           // Pool; default 16
+	ConsoleMaxConns int           // Console; default 8
+	ConsoleTimeout  time.Duration // statement_timeout on Console; default 30s
 }
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, databaseURL)
+	return OpenWith(ctx, databaseURL, Options{})
+}
+
+func OpenWith(ctx context.Context, databaseURL string, o Options) (*Store, error) {
+	if o.MaxConns <= 0 {
+		o.MaxConns = 16
+	}
+	if o.ConsoleMaxConns <= 0 {
+		o.ConsoleMaxConns = 8
+	}
+	if o.ConsoleTimeout <= 0 {
+		o.ConsoleTimeout = 30 * time.Second
+	}
+	pool, err := newPool(ctx, databaseURL, o.MaxConns, 0)
+	if err != nil {
+		return nil, err
+	}
+	console, err := newPool(ctx, databaseURL, o.ConsoleMaxConns, o.ConsoleTimeout)
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return &Store{Pool: pool, Console: console}, nil
+}
+
+func newPool(ctx context.Context, databaseURL string, maxConns int, timeout time.Duration) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("connect postgres: %w", err)
+	}
+	cfg.MaxConns = int32(maxConns)
+	if timeout > 0 {
+		cfg.ConnConfig.RuntimeParams["statement_timeout"] = strconv.FormatInt(timeout.Milliseconds(), 10)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
@@ -26,10 +73,15 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	return &Store{Pool: pool}, nil
+	return pool, nil
 }
 
-func (s *Store) Close() { s.Pool.Close() }
+func (s *Store) Close() {
+	s.Pool.Close()
+	if s.Console != nil {
+		s.Console.Close()
+	}
+}
 
 // Migrate applies embedded migrations in filename order, forward-only.
 // ponytail: swap for pressly/goose if down-migrations are ever needed.

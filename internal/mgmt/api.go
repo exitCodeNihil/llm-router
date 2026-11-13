@@ -241,6 +241,11 @@ func (m *Server) requireAdmin(next http.HandlerFunc) http.Handler {
 // --- helpers ---
 
 func httpError(w http.ResponseWriter, status int, msg string) {
+	if strings.Contains(msg, "SQLSTATE 57014") {
+		// The console pool's statement timeout cancelled the query.
+		slog.Warn("console query timed out", "err", msg)
+		status, msg = http.StatusGatewayTimeout, "the query took too long; try a shorter time range"
+	}
 	if strings.Contains(msg, "SQLSTATE") {
 		// Driver text names tables and constraints. Say what went wrong in the
 		// caller's terms and keep the detail in the log.
@@ -298,6 +303,14 @@ func (m *Server) bump(ctx context.Context) {
 	}
 }
 
+// reads is the pool for console reads: the one with a statement timeout.
+func (m *Server) reads() *pgxpool.Pool {
+	if m.Store.Console != nil {
+		return m.Store.Console
+	}
+	return m.Store.Pool
+}
+
 // listRows runs a query and returns rows as []map[string]any (column name → value).
 func listRows(ctx context.Context, pool *pgxpool.Pool, sql string, args ...any) ([]map[string]any, error) {
 	rows, err := pool.Query(ctx, sql, args...)
@@ -326,7 +339,7 @@ func listRows(ctx context.Context, pool *pgxpool.Pool, sql string, args ...any) 
 }
 
 func (m *Server) list(w http.ResponseWriter, r *http.Request, sql string, args ...any) {
-	rows, err := listRows(r.Context(), m.Store.Pool, sql, args...)
+	rows, err := listRows(r.Context(), m.reads(), sql, args...)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -578,7 +591,7 @@ func (m *Server) addTeamMember(w http.ResponseWriter, r *http.Request) {
 	// Team admins have no user directory; let them name a member by email.
 	if _, err := uuid.Parse(req.UserID); err != nil && strings.Contains(req.UserID, "@") {
 		if err := m.Store.Pool.QueryRow(r.Context(),
-			`SELECT id::text FROM users WHERE lower(email)=lower($1) AND NOT disabled`, strings.TrimSpace(req.UserID)).Scan(&req.UserID); err != nil {
+			`SELECT id::text FROM users WHERE email=$1 AND NOT disabled`, strings.TrimSpace(req.UserID)).Scan(&req.UserID); err != nil {
 			httpError(w, http.StatusNotFound, "no user with that email")
 			return
 		}

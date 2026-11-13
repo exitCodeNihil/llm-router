@@ -182,7 +182,7 @@ func (m *Server) listWorkspaces(w http.ResponseWriter, r *http.Request) {
 		sql = `SELECT ` + cols + ` FROM workspaces w JOIN users u ON u.id = w.user_id ORDER BY w.created_at DESC`
 		args = nil
 	}
-	rows, err := listRows(r.Context(), m.Store.Pool, sql, args...)
+	rows, err := listRows(r.Context(), m.reads(), sql, args...)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return

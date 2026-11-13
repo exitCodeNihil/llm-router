@@ -138,7 +138,7 @@ func (m *Server) usageByDeployment(w http.ResponseWriter, r *http.Request) {
 	}
 	deployCache.mu.Unlock()
 
-	rows, err := listRows(r.Context(), m.Store.Pool, `
+	rows, err := listRows(r.Context(), m.reads(), `
 		SELECT deployment_id, count(*) AS requests
 		FROM usage_events
 		WHERE ts >= now() - make_interval(days => $1) AND deployment_id IS NOT NULL

@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -30,6 +32,13 @@ type Config struct {
 	// MetricsListen serves /metrics on its own listener instead of the main
 	// one ("off": not at all). Empty = on the main listener, like a gateway.
 	MetricsListen string
+
+	// DBMaxConns and DBConsoleMaxConns size the two Postgres pools: ingest
+	// and sync, and console reads. DBConsoleTimeout is the statement timeout
+	// on console reads. Zero = the store's default.
+	DBMaxConns        int
+	DBConsoleMaxConns int
+	DBConsoleTimeout  time.Duration
 }
 
 func Load(args []string) (*Config, error) {
@@ -51,6 +60,17 @@ func Load(args []string) (*Config, error) {
 	}
 	c.TrustedProxies = trusted
 	c.EncryptionKey = os.Getenv("LLMR_ENCRYPTION_KEY")
+	if c.DBMaxConns, err = envInt("LLMR_DB_MAX_CONNS"); err != nil {
+		return nil, err
+	}
+	if c.DBConsoleMaxConns, err = envInt("LLMR_DB_CONSOLE_MAX_CONNS"); err != nil {
+		return nil, err
+	}
+	if v := os.Getenv("LLMR_DB_CONSOLE_TIMEOUT"); v != "" {
+		if c.DBConsoleTimeout, err = time.ParseDuration(v); err != nil || c.DBConsoleTimeout <= 0 {
+			return nil, fmt.Errorf("LLMR_DB_CONSOLE_TIMEOUT must be a duration like 30s")
+		}
+	}
 
 	if c.DatabaseURL == "" {
 		return nil, fmt.Errorf("LLMR_DATABASE_URL is required")
@@ -97,6 +117,19 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envInt reads a positive whole number; unset is 0.
+func envInt(key string) (int, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("%s must be a positive whole number", key)
+	}
+	return n, nil
 }
 
 // parsePrefixes reads a comma-separated list of addresses or CIDR ranges.

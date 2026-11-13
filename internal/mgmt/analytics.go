@@ -32,6 +32,9 @@ type usageFilter struct {
 // else there makes the driver fail the query. request_id is text (req_…).
 var uuidParams = map[string]bool{"key_id": true, "user_id": true, "team_id": true, "provider_id": true, "deployment_id": true, "gateway_id": true}
 
+// maxUsageSpan is the longest time range one usage query may cover.
+const maxUsageSpan = 366 * 24 * time.Hour
+
 // newUsageFilter reads the query string and the caller's visibility scope.
 func newUsageFilter(r *http.Request, c *Caller) *usageFilter {
 	q := r.URL.Query()
@@ -98,22 +101,34 @@ func newUsageFilter(r *http.Request, c *Caller) *usageFilter {
 		f.NeedsKeys = true
 	}
 
-	// Time window: explicit since/until win, otherwise fall back to ?days so
-	// existing callers keep working unchanged.
-	since, until := q.Get("since"), q.Get("until")
-	if since != "" {
-		if ts, err := time.Parse(time.RFC3339, since); err == nil {
-			add(`e.ts >= $?`, ts)
+	// Time window: explicit since/until win, otherwise ?days. There is always
+	// a lower bound, so no request can scan all of history.
+	parse := func(name string) (time.Time, bool) {
+		v := q.Get(name)
+		if v == "" {
+			return time.Time{}, false
 		}
-	}
-	if until != "" {
-		if ts, err := time.Parse(time.RFC3339, until); err == nil {
-			add(`e.ts <= $?`, ts)
+		ts, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			f.Err = fmt.Errorf("%s: not a valid time (RFC 3339)", name)
+			return time.Time{}, false
 		}
+		return ts, true
 	}
-	if since == "" && until == "" {
-		add(`e.ts >= now() - make_interval(days => $?)`, daysParam(r))
+	since, hasSince := parse("since")
+	until, hasUntil := parse("until")
+	end := time.Now()
+	if hasUntil {
+		end = until
+		add(`e.ts <= $?`, until)
 	}
+	if !hasSince {
+		since = end.AddDate(0, 0, -daysParam(r))
+	}
+	if end.Sub(since) > maxUsageSpan {
+		f.Err = fmt.Errorf("time range is longer than %d days", int(maxUsageSpan.Hours()/24))
+	}
+	add(`e.ts >= $?`, since)
 	return f
 }
 

@@ -65,6 +65,12 @@ spec:
             - name: LLMR_TRUSTED_PROXIES
               value: {{ join "," . | quote }}
             {{- end }}
+            - name: LLMR_DB_MAX_CONNS
+              value: {{ .Values.database.maxConns | quote }}
+            - name: LLMR_DB_CONSOLE_MAX_CONNS
+              value: {{ .Values.database.consoleMaxConns | quote }}
+            - name: LLMR_DB_CONSOLE_TIMEOUT
+              value: {{ .Values.database.consoleTimeout | quote }}
             {{- if .Values.anthropicIdentity.enabled }}
             {{- include "llm-router.anthropicIdentityEnv" . | nindent 12 }}
             {{- end }}

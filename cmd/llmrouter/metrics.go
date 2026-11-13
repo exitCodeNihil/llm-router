@@ -21,6 +21,8 @@ func newMetrics(httpm *metrics.HTTP, nodes *metrics.NodeStore, writer *usage.PGW
 		w.Gauge("llmr_usage_queued", "Usage events waiting to be written to Postgres", float64(writer.Queued()))
 		w.Gauge("llmr_usage_queue_capacity", "Usage events the queue holds", float64(writer.Capacity()))
 		w.Counter("llmr_usage_dropped_total", "Usage events dropped because the queue was full", float64(writer.Dropped.Load()))
+		w.Counter("llmr_usage_flush_failures_total", "Failed writes of usage events to Postgres; each is retried", float64(writer.FlushFailures.Load()))
+		w.Counter("llmr_usage_lost_total", "Usage events still unwritten when the control plane stopped", float64(writer.Lost.Load()))
 	}))
 	reg.Register(nodes)
 	reg.Register(metrics.CollectorFunc(func(w *metrics.PromWriter) { destinationMetrics(w, exporter.Health()) }))

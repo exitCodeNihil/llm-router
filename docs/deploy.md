@@ -151,6 +151,8 @@ For llm-router itself (the gateways have [their own](#gateways)):
 | `LLMR_ADMIN_TOKEN` | Bootstrap admin token, 12+ characters (optional) |
 | `LLMR_LISTEN` | Listen address, default `:8080` |
 | `LLMR_TRUSTED_PROXIES` | Comma-separated addresses or CIDR ranges of proxies whose `X-Forwarded-For` names the client. Console sign-in is limited to 20 attempts a minute per client address (IPv6 per /64) and 5 failures per 15 minutes per email and address; wrong admin tokens on the API to 5 per 15 minutes per address. Each proxy must append to `X-Forwarded-For` |
+| `LLMR_DB_MAX_CONNS`, `LLMR_DB_CONSOLE_MAX_CONNS` | Postgres connections for usage writes, gateway sync and config (default 16), and for console reads (default 8). Their sum must fit under the database's `max_connections` |
+| `LLMR_DB_CONSOLE_TIMEOUT` | Cancels a console query that runs longer, default `30s`; the console then answers 504 |
 | `LLMR_SEED_CLAUDE_SUBSCRIPTION` | `1` adds the [subscription pass-through](clients.md#on-your-claudeai-subscription) provider and models |
 | `LLMR_IDE_LISTEN`, `LLMR_IDE_ORIGIN`, `LLMR_COOKIE_DOMAIN` | [Workspace IDE](workspaces.md) listener, its public origin, and the session cookie domain when it is another hostname |
 | `LLMR_METRICS_LISTEN` | Serve `/metrics` on this address (e.g. `:9090`) instead of the main listener; `off` turns it off. See [Monitoring](monitoring.md) |

@@ -503,12 +503,13 @@ func (m *Server) usageRecent(w http.ResponseWriter, r *http.Request) {
 	m.list(w, r, fmt.Sprintf(`
 		SELECT ts, request_id, trace_id, model_name, api_key_id, user_id, team_id,
 		       prompt_tokens, completion_tokens, cost_usd, latency_ms, status_code, stream
-		FROM usage_events WHERE %s ORDER BY ts DESC LIMIT $1`, scope), args...)
+		FROM usage_events WHERE ts >= now() - interval '30 days' AND %s
+		ORDER BY ts DESC LIMIT $1`, scope), args...)
 }
 
 // listOne is list() but returns a single object instead of an array.
 func (m *Server) listOne(w http.ResponseWriter, r *http.Request, sql string, args ...any) {
-	rows, err := listRows(r.Context(), m.Store.Pool, sql, args...)
+	rows, err := listRows(r.Context(), m.reads(), sql, args...)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return

@@ -79,7 +79,9 @@ func run() error {
 	lim := limits.New()
 	gw := &gateway.Server{Snapshots: holder, Limits: lim}
 
-	st, err := store.Open(ctx, cfg.DatabaseURL)
+	st, err := store.OpenWith(ctx, cfg.DatabaseURL, store.Options{
+		MaxConns: cfg.DBMaxConns, ConsoleMaxConns: cfg.DBConsoleMaxConns, ConsoleTimeout: cfg.DBConsoleTimeout,
+	})
 	if err != nil {
 		return err
 	}

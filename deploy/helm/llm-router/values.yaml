@@ -23,6 +23,15 @@ encryptionKey: ""
 # name of an existing Secret with keys: database-url, admin-token, encryption-key
 existingSecret: ""
 
+# Postgres connections. llm-router keeps two pools: one for usage writes,
+# gateway sync and config, one for console reads. Their sum must fit under the
+# database's max_connections. consoleTimeout cancels a console query that runs
+# longer (the console then answers 504).
+database:
+  maxConns: 16
+  consoleMaxConns: 8
+  consoleTimeout: 30s
+
 # Workspaces (docs/workspaces.md). Adds RBAC for pods, exec, PVCs and secrets
 # in this release's namespace, plus the IDE listener on 8081 served from its own origin.
 workspaces:

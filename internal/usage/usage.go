@@ -13,6 +13,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -110,6 +111,12 @@ type PGWriter struct {
 	pool    *pgxpool.Pool
 	ch      chan Event
 	Dropped atomic.Int64
+	// FlushFailures counts failed writes to Postgres; each is retried.
+	FlushFailures atomic.Int64
+	// Lost counts events given up on: those still unwritten at shutdown.
+	Lost atomic.Int64
+
+	indexing sync.Mutex // one EnsureIndexes pass at a time
 }
 
 func NewPGWriter(pool *pgxpool.Pool) *PGWriter {
@@ -146,6 +153,8 @@ func (w *PGWriter) Run(ctx context.Context) {
 	if err := w.EnsurePartitions(ctx); err != nil {
 		slog.Error("usage partitions", "err", err)
 	}
+	// In the background: on a large partition an index takes a while to build.
+	go w.EnsureIndexes(ctx)
 	partTicker := time.NewTicker(12 * time.Hour)
 	defer partTicker.Stop()
 
@@ -153,17 +162,32 @@ func (w *PGWriter) Run(ctx context.Context) {
 	defer flushTicker.Stop()
 
 	batch := make([]Event, 0, flushBatchSize)
+	// A failed flush keeps its batch and tries again, backing off to 30 s.
+	// Meanwhile the queue takes new events, and drops the oldest once full.
+	var retryAt time.Time
+	backoff := time.Second
 	flush := func() {
-		if len(batch) == 0 {
+		if len(batch) == 0 || time.Now().Before(retryAt) {
 			return
 		}
-		if err := w.flush(ctx, batch); err != nil && ctx.Err() == nil {
-			slog.Error("usage flush failed", "events", len(batch), "err", err)
+		if err := w.flush(ctx, batch); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			w.FlushFailures.Add(1)
+			slog.Error("usage flush failed, will retry", "events", len(batch), "retry_in", backoff, "err", err)
+			retryAt = time.Now().Add(backoff)
+			backoff = min(2*backoff, 30*time.Second)
+			return
 		}
-		batch = batch[:0]
+		batch, backoff, retryAt = batch[:0], time.Second, time.Time{}
 	}
 
 	for {
+		in := w.ch
+		if len(batch) >= flushBatchSize {
+			in = nil // a full batch is waiting for its retry
+		}
 		select {
 		case <-ctx.Done():
 			// final flush with a fresh context so shutdown persists buffered events
@@ -179,12 +203,13 @@ func (w *PGWriter) Run(ctx context.Context) {
 			}
 			if len(batch) > 0 {
 				if err := w.flush(fctx, batch); err != nil {
-					slog.Error("final usage flush failed", "err", err)
+					w.Lost.Add(int64(len(batch)))
+					slog.Error("final usage flush failed", "lost", len(batch), "err", err)
 				}
 			}
 			cancel()
 			return
-		case e := <-w.ch:
+		case e := <-in:
 			batch = append(batch, e)
 			if len(batch) >= flushBatchSize {
 				flush()
@@ -193,6 +218,7 @@ func (w *PGWriter) Run(ctx context.Context) {
 			flush()
 		case <-partTicker.C:
 			w.ensurePartitions(ctx, time.Now().UTC())
+			go w.EnsureIndexes(ctx)
 		}
 	}
 }
@@ -394,17 +420,64 @@ func (w *PGWriter) ensurePartitions(ctx context.Context, now time.Time) error {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("create partition %s: %w", name, err)
 			}
-			continue
 		}
-		for _, idx := range []string{
-			`CREATE INDEX IF NOT EXISTS ` + name + `_team_ts ON ` + name + ` (team_id, ts)`,
-			`CREATE INDEX IF NOT EXISTS ` + name + `_key_ts ON ` + name + ` (api_key_id, ts)`,
-			// ts-only index powers the Requests feed / by-deployment scans.
-			// ponytail: applied to new partitions only; old dev partitions stay small.
-			`CREATE INDEX IF NOT EXISTS ` + name + `_ts ON ` + name + ` (ts DESC)`,
-		} {
-			if _, err := w.pool.Exec(ctx, idx); err != nil {
-				slog.Error("create partition index failed", "partition", name, "err", err)
+	}
+	return firstErr
+}
+
+// partitionIndexes are the indexes every usage_events partition carries, as
+// name suffix and columns.
+var partitionIndexes = [][2]string{
+	{"_team_ts", "(team_id, ts)"},
+	{"_key_ts", "(api_key_id, ts)"},
+	{"_user_ts", "(user_id, ts)"},
+	// the Requests feed and other scans bounded only by time
+	{"_ts", "(ts DESC)"},
+	// finding one request by its id
+	{"_request", "(request_id)"},
+}
+
+// EnsureIndexes builds the indexes missing from any partition, old ones
+// included. It builds them CONCURRENTLY, so writes carry on while a large
+// partition is indexed, and so it must not run inside a transaction.
+func (w *PGWriter) EnsureIndexes(ctx context.Context) error {
+	if !w.indexing.TryLock() {
+		return nil // a pass is already running
+	}
+	defer w.indexing.Unlock()
+	rows, err := w.pool.Query(ctx, `SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+		WHERE i.inhparent = 'usage_events'::regclass ORDER BY 1`)
+	if err != nil {
+		return err
+	}
+	parts, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, part := range parts {
+		for _, idx := range partitionIndexes {
+			name := part + idx[0]
+			var valid *bool
+			if err := w.pool.QueryRow(ctx,
+				`SELECT (SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1))`, name).Scan(&valid); err != nil {
+				return err
+			}
+			if valid != nil && *valid {
+				continue
+			}
+			// An interrupted concurrent build leaves an invalid index behind.
+			// names are generated, not user input
+			if valid != nil {
+				if _, err := w.pool.Exec(ctx, `DROP INDEX CONCURRENTLY IF EXISTS `+name); err != nil {
+					slog.Error("drop invalid partition index failed", "index", name, "err", err)
+				}
+			}
+			if _, err := w.pool.Exec(ctx, `CREATE INDEX CONCURRENTLY IF NOT EXISTS `+name+` ON `+part+` `+idx[1]); err != nil {
+				slog.Error("create partition index failed", "index", name, "err", err)
+				if firstErr == nil {
+					firstErr = fmt.Errorf("create index %s: %w", name, err)
+				}
 			}
 		}
 	}
