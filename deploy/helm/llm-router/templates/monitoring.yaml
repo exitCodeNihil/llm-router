@@ -117,6 +117,20 @@ spec:
           annotations:
             summary: "Gateway {{ "{{ $labels.instance }}" }} has not been ready for 5 minutes"
             description: It has no config or has not synced with the control plane since it started; see its logs.
+        - alert: LLMRouterGatewayConfigStale
+          expr: llmr_config_stale{ {{- $sel -}} } == 1
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: "Gateway {{ "{{ $labels.instance }}" }} has stopped serving: its config is stale"
+            description: The control plane has not answered the gateway's config poll within LLMR_MAX_CONFIG_AGE, so it answers /v1 with 503 until one is answered. Check the control plane and the network between them.
+        - alert: LLMRouterGatewayRefused
+          expr: llmr_refused{ {{- $sel -}} } == 1
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: "Gateway {{ "{{ $labels.instance }}" }} has stopped serving: the control plane refuses it"
+            description: The control plane has refused the gateway's join token for 15 minutes, so it answers /v1 with 503. Its group was deleted or its join token replaced; give it a current token, or remove the gateway.
         - alert: LLMRouterUsageDropped
           expr: increase(llmr_usage_dropped_total{ {{- $sel -}} }[10m]) > 0
           labels: {severity: warning}

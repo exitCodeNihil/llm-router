@@ -123,11 +123,20 @@ func (s *Server) newSession(p peer) sessionResponse {
 	return sessionResponse{Session: auth.SignToken(s.Key, sub, exp), ExpiresAtMS: exp.UnixMilli()}
 }
 
+// refuse answers 401 as the control plane's own verdict: the join token
+// matches no group, or the instance or its group is gone. The header tells it
+// apart from a 401 a proxy in between sends; a gateway refused on its join for
+// 15 minutes stops serving. Never sent for a failure to look it up.
+func refuse(w http.ResponseWriter, why string) {
+	w.Header().Set("X-Llmr-Refused", "1")
+	http.Error(w, why, http.StatusUnauthorized)
+}
+
 // join registers a new gateway instance in the group whose token it presents.
 func (s *Server) join(w http.ResponseWriter, r *http.Request) {
 	token := bearer(r)
 	if !strings.HasPrefix(token, JoinTokenPrefix) {
-		http.Error(w, "group join token required", http.StatusUnauthorized)
+		refuse(w, "group join token required")
 		return
 	}
 	var req struct {
@@ -147,15 +156,21 @@ func (s *Server) join(w http.ResponseWriter, r *http.Request) {
 	var g Group
 	err := s.Store.Pool.QueryRow(r.Context(), `SELECT id, name, region, data_rule FROM gateway_groups WHERE join_token_hash=$1`,
 		hash[:]).Scan(&g.ID, &g.Name, &g.Region, &g.DataRule)
+	if errors.Is(err, pgx.ErrNoRows) {
+		refuse(w, "unknown join token")
+		return
+	}
 	if err != nil {
-		http.Error(w, "unknown join token", http.StatusUnauthorized)
+		slog.Error("gateway join failed", "err", err)
+		http.Error(w, "join failed", http.StatusServiceUnavailable)
 		return
 	}
 	id := uuid.NewString()
 	if _, err := s.Store.Pool.Exec(r.Context(),
 		`INSERT INTO gateway_instances (id, group_id, name, version, last_seen_at) VALUES ($1,$2,$3,$4,now())`,
 		id, g.ID, trim(req.Name, 200), trim(req.Version, 100)); err != nil {
-		http.Error(w, "join failed", http.StatusInternalServerError)
+		slog.Error("gateway join failed", "group", g.Name, "err", err)
+		http.Error(w, "join failed", http.StatusServiceUnavailable)
 		return
 	}
 	// Autoscaled replicas come and go: forget the ones gone for a week.
@@ -174,9 +189,15 @@ func (s *Server) join(w http.ResponseWriter, r *http.Request) {
 func (s *Server) renew(w http.ResponseWriter, r *http.Request, p peer) {
 	instance, group := p.instance, p.group
 	var one int
-	if err := s.Store.Pool.QueryRow(r.Context(),
-		`SELECT 1 FROM gateway_instances WHERE id=$1 AND group_id=$2`, instance, group).Scan(&one); err != nil {
-		http.Error(w, "instance removed: join again", http.StatusUnauthorized)
+	err := s.Store.Pool.QueryRow(r.Context(),
+		`SELECT 1 FROM gateway_instances WHERE id=$1 AND group_id=$2`, instance, group).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		refuse(w, "instance removed: join again")
+		return
+	}
+	if err != nil {
+		slog.Error("gateway session renew failed", "instance", instance, "err", err)
+		http.Error(w, "renew failed", http.StatusServiceUnavailable)
 		return
 	}
 	writeJSON(w, http.StatusOK, s.newSession(p))

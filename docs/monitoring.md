@@ -25,7 +25,7 @@ The control plane's listener also serves the console, so it is often public. To 
 it, set `LLMR_METRICS_LISTEN` to another address, e.g. `:9090`, which your ingress does not route;
 `/metrics` is then only served there. `LLMR_METRICS_LISTEN=off` turns it off. The Helm chart does
 this by default (`metrics.port: 9090`). If you expose 8080 directly, either set it or block
-`/metrics` at your proxy. A gateway's listener serves only `/v1`, `/healthz` and `/metrics`.
+`/metrics` at your proxy. A gateway's listener serves only `/v1`, `/healthz`, `/livez` and `/metrics`.
 
 ## Metrics
 
@@ -58,10 +58,10 @@ Gateways only:
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `llmr_ready` | gauge | | 1 once it has its config and has synced |
+| `llmr_ready` | gauge | | 1 once it has its config and has synced, or has started on a config [saved on disk](deploy.md#gateway-state-on-disk); 0 again once the control plane has refused it |
 | `llmr_shed_total` | counter | | Requests refused with 503 because more than `LLMR_MAX_IN_FLIGHT` were in flight |
 | `llmr_upstream_attempts_total` | counter | `result` (`ok`, `error`, `timeout`, `retryable_status`) | Upstream attempts |
-| `llmr_limit_denials_total` | counter | `reason` (`budget_exceeded`, `rate_limit_exceeded`) | Requests refused by a budget or rate limit |
+| `llmr_limit_denials_total` | counter | `reason` (`budget_exceeded`, `rate_limit_exceeded`, `budget_unknown`) | Requests refused by a budget or rate limit, or, after a start from saved state without spend, because spend was not known yet |
 | `llmr_sync_failures_total` | counter | | Failed syncs with the control plane |
 | `llmr_sync_refused_events_total` | counter | | Usage events dropped because the control plane refused their batch, or a proxy refused one even alone and without content as too large |
 | `llmr_usage_queued_content_bytes` | gauge | | Captured prompts and responses the queued usage events hold |
@@ -69,6 +69,10 @@ Gateways only:
 | `llmr_usage_inflight_content_bytes` | gauge | | Room for captured content that requests in flight have reserved: their prompt as captured, and their response up to the capture cap. With the queued content and the batch being sent, at most 64 MiB |
 | `llmr_usage_content_stripped_total` | counter | | Usage events sent without their captured content: that 64 MiB was full (not captured at all, or put back in the queue after a failed sync), or a proxy refused even the smallest batch (64 KiB) as too large |
 | `llmr_config_version`, `llmr_workers` | gauge | | Config version in use; worker threads |
+| `llmr_config_age_seconds` | gauge | | Seconds since the control plane last answered a config poll, with the config or with "unchanged". Normally under 30; it grows while the control plane is unreachable. 0 before the first answer |
+| `llmr_config_stale` | gauge | | 1 while the config is older than `LLMR_MAX_CONFIG_AGE` and the gateway answers `/v1` with 503 |
+| `llmr_refused` | gauge | | 1 while the gateway does not serve because the control plane has refused its join token for 15 minutes; 0 again once a join succeeds |
+| `llmr_state_dir_locked` | gauge | | With `LLMR_STATE_DIR` only: 1 while this gateway holds the directory, 0 when it could not take it (another process has it, or it is not writable) and runs without saved state |
 
 The control plane only:
 
@@ -143,6 +147,8 @@ scraped twice.
 | `LLMRouterGatewayNotSyncing` | A gateway's last sync is more than 30 s old | 1m |
 | `LLMRouterGatewaySyncFailing` | A gateway's syncs keep failing | 10m |
 | `LLMRouterGatewayNotReady` | A gateway has had no config or no sync since it started (`llmr_ready == 0`) | 5m |
+| `LLMRouterGatewayConfigStale` | A gateway has stopped serving because the control plane has not confirmed its config within `LLMR_MAX_CONFIG_AGE` (`llmr_config_stale == 1`). Critical. Never fires unless that is set | 1m |
+| `LLMRouterGatewayRefused` | A gateway has stopped serving because the control plane refused its join token for 15 minutes: its group was deleted or its token replaced (`llmr_refused == 1`). Critical | 1m |
 | `LLMRouterGatewayMemoryHigh` | A gateway uses more than 85% of its memory limit, from its own `/metrics`, so it fires while the control plane is down. Needs a memory limit on the gateway | 5m |
 | `LLMRouterRequestsShed` | A gateway sheds requests (`rate(llmr_shed_total[5m]) > 0`) | 2m |
 | `LLMRouterHighErrorRate` | More than 5% of `/v1` requests end in 5xx | 10m |

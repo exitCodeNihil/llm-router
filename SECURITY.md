@@ -19,3 +19,21 @@ SSO, cloud tokens), and the workspace isolation described in
 **Out of scope:** issues that need an attacker who already holds the admin token or the
 `LLMR_ENCRYPTION_KEY`, and the workspace container runtime socket being powerful (it is, and
 that is documented).
+
+## Data at rest
+
+A gateway writes nothing to disk unless `LLMR_STATE_DIR` is set. With it, the directory holds these
+files, readable only by the gateway's user:
+
+- `config.bin`: the group's config as the control plane sent it. That includes the group's provider
+  credentials, the SHA-256 hashes of its API keys and of its users' email addresses, limits and
+  prices.
+- `confirmed.bin`: when that config was last confirmed, and the spend in USD of each budgeted key,
+  user and team.
+- `refused.bin`, only while the control plane refuses the gateway: the time that began.
+
+All are encrypted with AES-256-GCM under a key derived from the group's join token (HKDF-SHA256
+with a random salt per file). Anyone who holds both the disk and the join token can read them, so
+protect the volume as you protect the token. Replacing the join token does not re-encrypt files
+written under the old one; a gateway deletes them when it starts with the new token, and deletes
+the config and spend when the control plane has refused it for 15 minutes.

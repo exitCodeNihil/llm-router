@@ -5,8 +5,9 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use llmr_gateway::cp::{ControlPlane, VERSION};
-use llmr_gateway::metrics;
 use llmr_gateway::server::{self, State};
+use llmr_gateway::state::Store;
+use llmr_gateway::{log_error, log_info, metrics};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -15,12 +16,28 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
+/// The least LLMR_MAX_CONFIG_AGE: a config poll is answered within 25 s, and
+/// one or two missed answers must not stop a gateway.
+const MIN_CONFIG_AGE_S: u64 = 120;
+
+fn refuse(why: &str) -> ! {
+    log_error!("llmr-gateway {VERSION}: {why}");
+    std::process::exit(2);
+}
+
 fn main() {
+    if let Err(e) = llmr_gateway::log::init(env("LLMR_LOG_LEVEL").as_deref(), env("LLMR_LOG_FORMAT").as_deref()) {
+        refuse(&e);
+    }
     let (Some(cp_url), Some(join_token)) = (env("LLMR_CONTROL_PLANE_URL"), env("LLMR_JOIN_TOKEN")) else {
-        eprintln!(
-            "llmr-gateway {VERSION}: set LLMR_CONTROL_PLANE_URL and LLMR_JOIN_TOKEN (a gateway group's join token)"
-        );
-        std::process::exit(2);
+        refuse("set LLMR_CONTROL_PLANE_URL and LLMR_JOIN_TOKEN (a gateway group's join token)");
+    };
+    let max_config_age = match env("LLMR_MAX_CONFIG_AGE").map(|v| v.parse::<u64>()) {
+        None | Some(Ok(0)) => None,
+        Some(Ok(s)) if s >= MIN_CONFIG_AGE_S => Some(Duration::from_secs(s)),
+        Some(_) => {
+            refuse(&format!("LLMR_MAX_CONFIG_AGE is in seconds: 0 for no limit, or at least {MIN_CONFIG_AGE_S}"))
+        }
     };
     let listen = env("LLMR_LISTEN").unwrap_or_else(|| "0.0.0.0:8080".into());
     // available_parallelism honours the container's CPU quota.
@@ -52,14 +69,22 @@ fn main() {
             draining: Default::default(),
             max_in_flight,
         }));
-        let cp = Arc::new(ControlPlane::new(&cp_url, join_token, name));
+        st.ready.set_max_config_age(max_config_age);
+        // Without the directory, or when another process holds it, nothing
+        // is read or written.
+        let state = env("LLMR_STATE_DIR").and_then(|dir| {
+            Store::open(std::path::Path::new(&dir), &join_token)
+                .map_err(|e| log_error!("LLMR_STATE_DIR: {e}; running without saved state"))
+                .ok()
+        });
+        let cp = Arc::new(ControlPlane::new(&cp_url, join_token, name).with_state(state.map(Arc::new)));
         tokio::spawn(cp.clone().run(st));
 
         let listener = tokio::net::TcpListener::bind(&listen).await.unwrap_or_else(|e| {
-            eprintln!("listen on {listen}: {e}");
+            log_error!("listen on {listen}: {e}");
             std::process::exit(1);
         });
-        eprintln!("llmr-gateway {VERSION} listening on {listen} with {workers} workers");
+        log_info!("llmr-gateway {VERSION} listening on {listen} with {workers} workers");
         let shutdown = async {
             let mut term =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal handler");
@@ -72,6 +97,6 @@ fn main() {
         // as their requests finish, then upload the last usage.
         server::run(listener, st, shutdown, drain).await;
         cp.flush(Instant::now() + Duration::from_secs(10)).await;
-        eprintln!("llmr-gateway stopped");
+        log_info!("llmr-gateway stopped");
     });
 }

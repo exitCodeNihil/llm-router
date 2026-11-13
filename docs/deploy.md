@@ -98,12 +98,28 @@ Limits and budgets stay on keys, users and teams, and hold across every gateway.
 its usage and counts with the control plane every 2 seconds, so a key can exceed a limit by at most
 what all gateways admit in that time.
 
-Config changes reach gateways within about a second. A gateway needs the control plane to start.
-After that it keeps serving on its last config if the control plane goes away, and uploads the
-usage it held (up to 200,000 events) when it's back.
+Config changes reach gateways within about a second. A gateway needs the control plane to start,
+unless it [keeps state on disk](#gateway-state-on-disk). After that, if the control plane goes away,
+it keeps serving on its last config for as long as the outage lasts, holds budgets against the last
+spend it was told plus its own, and uploads the usage it held (up to 200,000 events) when the
+control plane is back. To bound that, set `LLMR_MAX_CONFIG_AGE`: a gateway whose config the control
+plane has not confirmed for that many seconds answers `/v1` with 503 `config_stale` and fails
+`/healthz` until the next config poll is answered. It polls about every 25 seconds.
 
-A new join token stops further gateways joining with the old one; running ones carry on. Deleting a
-group stops its gateways getting config at once, and they stop serving within 15 minutes.
+Deleting a group ends its gateways' sessions: each notices at its next sync or config poll, within
+seconds, and tries to join again. The control plane refuses that join, and a gateway that has been
+refused for 15 minutes stops serving: `/v1` answers 503 `gateway_refused`, `/healthz` fails, and it
+deletes the config and spend it saved on disk. With state on disk the 15 minutes run across
+restarts, and a gateway that restarts while it is refused serves nothing until it can join. Until then it serves on its last config without syncing limits or usage.
+It keeps trying to join every 30 seconds and serves again if a join succeeds. Only the control
+plane's own refusal counts: a 401 from a proxy in between, an older control plane, or one that
+cannot reach its database never stops a gateway.
+
+A new join token stops gateways joining with the old one. Running gateways carry on with the session
+they have, which they renew without the token. They need the token again when they restart, or when
+the session lapses because the control plane was unreachable for longer than it had left (5 to 15
+minutes); they are then refused as above and stop serving 15 minutes later. Give running gateways
+the new token before that.
 
 A gateway that stops syncing turns red on the Gateways page and disappears from it after 10 minutes.
 Its row is deleted from the database after 7 days, when it joins, and in the twice-daily maintenance
@@ -141,9 +157,35 @@ A gateway logs why it refuses them, and requests to those providers fail with th
 | `LLMR_MAX_IN_FLIGHT` | Above this many requests in flight, answer 503 with `Retry-After` (default 10000) |
 | `LLMR_SHUTDOWN_TIMEOUT` | Seconds to finish requests on SIGTERM before exiting (default 30). Idle keep-alive connections close at once and the rest after their current request, so clients reconnect to another gateway |
 | `LLMR_GATEWAY_NAME` | Name on the Gateways page (default: the hostname) |
+| `LLMR_MAX_CONFIG_AGE` | Seconds a gateway serves after the control plane last confirmed its config; unset or 0: no limit. At least 120 |
+| `LLMR_STATE_DIR` | Directory for [state on disk](#gateway-state-on-disk); unset: nothing is written |
+| `LLMR_LOG_LEVEL` | `debug`, `info` (default), `warn` or `error` |
+| `LLMR_LOG_FORMAT` | `text` (default) or `json`, one object per line with `ts`, `level` and `msg`. Logs go to stderr |
 
 `/healthz` answers 200 once the gateway has its config and has synced, and 503 while it starts or
-drains. `/metrics` is in Prometheus format; see [Monitoring](monitoring.md).
+drains, while its config is older than `LLMR_MAX_CONFIG_AGE`, and once the control plane has refused
+it. `/livez` answers 200 for as long as the process runs: use it for liveness and `/healthz` for
+readiness, as the chart does. `/metrics` is in Prometheus format; see [Monitoring](monitoring.md).
+
+### Gateway state on disk
+
+With `LLMR_STATE_DIR` (`gateway.state.enabled` in the chart) a gateway saves, at most every 30
+seconds, the config it last received and, beside it, when the control plane last confirmed that
+config and the spend of every budgeted key, user and team as of its last sync. While the control
+plane refuses the gateway, it also keeps since when. The files are encrypted with a key derived from
+the join token.
+
+A gateway that starts with these files serves at once, before it reaches the control plane, if the
+config was confirmed within the last 24 hours (or within `LLMR_MAX_CONFIG_AGE`, when that is
+shorter). Budgets continue from the saved spend; if none was saved, requests under a budget get 429
+`budget_unknown` until the first sync, and the rest are served. It then joins as usual and takes the
+control plane's config. Files it cannot read, for example after the join token changed, are deleted
+and it starts as it would without them.
+
+One gateway uses a directory at a time: a second one logs an error and runs without saved state
+(`llmr_state_dir_locked` is 0). The chart uses an `emptyDir`, which survives a container restart but
+not the pod, so a new or rescheduled pod still needs the control plane. What is on disk is described
+in [SECURITY.md](../SECURITY.md#data-at-rest).
 
 ## Configuration
 

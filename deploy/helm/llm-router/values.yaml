@@ -91,6 +91,18 @@ gateway:
   joinToken: ""
   existingSecret: ""
   controlPlaneUrl: ""  # default: this release's llm-router service
+  logLevel: info     # debug, info, warn or error
+  logFormat: text    # text or json
+  # Seconds a gateway keeps serving after the control plane last confirmed its
+  # config (LLMR_MAX_CONFIG_AGE, at least 120). Empty: for as long as the
+  # control plane is away.
+  maxConfigAge: ""
+  # Keep the last config and spend, encrypted with a key derived from the join
+  # token, in an emptyDir (LLMR_STATE_DIR), so a restarted container serves
+  # before it reaches the control plane. A new pod starts without it.
+  state:
+    enabled: false
+    sizeLimit: 64Mi
   serviceAccount:
     create: true
     name: ""         # default: <release>-llm-router-gateway
