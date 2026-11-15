@@ -322,3 +322,66 @@ async fn an_unpriced_model_reserves_nothing() {
     assert_eq!(priced.await.unwrap().0, 200);
     assert!(close(limits::reserved_usd(), 0.0));
 }
+
+fn post(key: &str, path: &str, length: usize, body: &str) -> Vec<u8> {
+    format!(
+        "POST {path} HTTP/1.1\r\nhost: x\r\nauthorization: Bearer llmr_{key}\r\n\
+         content-type: application/json\r\ncontent-length: {length}\r\nconnection: close\r\n\r\n{body}"
+    )
+    .into_bytes()
+}
+
+// A request that ends on its body (not JSON, no model) takes its rate-limit
+// slot like any other, and a key over a limit is refused before its body is
+// read: neither is a way around the limits.
+#[tokio::test]
+async fn limits_hold_before_and_whatever_the_body() {
+    let _serial = SERIAL.lock().await;
+    let (up, hits) = upstream(Duration::from_millis(1)).await;
+    for path in ["/v1/chat/completions", "/v1/messages"] {
+        let key = format!("res-body{}", path.len());
+        let addr = gateway(&key, &up, json!({"rpm_limit": 3})).await;
+        let (status, _, body) = send(addr, post(&key, path, 8, "not json")).await;
+        assert_eq!(status, 400, "{body}");
+        let (status, _, body) = send(addr, post(&key, path, 15, r#"{"stream":true}"#)).await;
+        assert!(status == 400 && body.contains("model"), "{body}");
+        // a body that never arrives in full
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(&post(&key, path, 100, "{\"model\":")).await.unwrap();
+        c.shutdown().await.unwrap();
+        let mut out = Vec::new();
+        let _ = c.read_to_end(&mut out).await;
+        // three slots are gone: the next request is refused, whatever it is
+        let (status, _, body) = send(addr, chat(&key, "priced", false)).await;
+        assert!(status == 429 && body.contains("\"code\":\"rate_limit_exceeded\""), "{path}: {body}");
+
+        // and refused without its body: 5 MB are announced, none is sent
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(&post(&key, path, 5 << 20, "")).await.unwrap();
+        let mut out = Vec::new();
+        let answered = tokio::time::timeout(Duration::from_secs(5), async {
+            while !out.windows(4).any(|w| w == b"\r\n\r\n") {
+                let mut chunk = [0u8; 1024];
+                let n = c.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "closed without an answer");
+                out.extend_from_slice(&chunk[..n]);
+            }
+        })
+        .await;
+        assert!(answered.is_ok(), "{path}: no answer before the body");
+        assert!(out.starts_with(b"HTTP/1.1 429"), "{}", String::from_utf8_lossy(&out));
+    }
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
+
+    // a spent budget, too, is refused before the body
+    let addr = gateway("res-spent", &up, json!({"budget_usd": 0.05})).await;
+    assert_eq!(send(addr, chat("res-spent", "priced", false)).await.0, 200); // costs $0.10
+    let mut c = TcpStream::connect(addr).await.unwrap();
+    c.write_all(&post("res-spent", "/v1/chat/completions", 5 << 20, "")).await.unwrap();
+    let mut out = vec![0u8; 12];
+    tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut out))
+        .await
+        .expect("no answer before the body")
+        .unwrap();
+    assert_eq!(out, b"HTTP/1.1 429");
+}

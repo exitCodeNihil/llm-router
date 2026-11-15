@@ -529,13 +529,16 @@ fn cost(p: Price, u: Usage) -> f64 {
     usd / 1e6
 }
 
-/// Completion tokens this process has seen per model: (responses, tokens).
+/// Completion tokens this process has seen per model, by the name the
+/// config serves it under (a pattern is one model): (responses, tokens).
 fn completions() -> &'static Mutex<HashMap<String, (u64, u64)>> {
     static C: OnceLock<Mutex<HashMap<String, (u64, u64)>>> = OnceLock::new();
     C.get_or_init(Default::default)
 }
 
-/// Models tracked at most: a pattern admits any name a caller makes up.
+/// Models tracked at most. They are the config's model names, not what
+/// callers ask for, so only configs coming and going grow the map: full, it
+/// starts over, and no model is left on the default for good.
 const MAX_TRACKED_MODELS: usize = 4096;
 /// Responses before a model's mean is trusted, and the guess until then.
 const MEAN_AFTER: u64 = 20;
@@ -545,7 +548,7 @@ fn saw_completion(model: &str, tokens: i64) {
     let mut seen = completions().lock().unwrap();
     if !seen.contains_key(model) {
         if seen.len() >= MAX_TRACKED_MODELS {
-            return;
+            seen.clear();
         }
         seen.insert(model.to_string(), (0, 0));
     }
@@ -615,21 +618,14 @@ pub fn text_bytes(body: &[u8]) -> usize {
 /// body's text at four bytes a token, and `expected_completion` output tokens
 /// (none when `output` is false: embeddings), at the price `d` bills at.
 /// Zero for a deployment without a price of its own to bill.
-pub fn expected_cost(
-    cfg: &Config,
-    d: &Deployment,
-    model: &str,
-    body: &[u8],
-    max_tokens: Option<u64>,
-    output: bool,
-) -> f64 {
+pub fn expected_cost(cfg: &Config, d: &Deployment, body: &[u8], max_tokens: Option<u64>, output: bool) -> f64 {
     // Billed to the caller's own plan: nothing counts against a budget.
     if d.provider.auth_mode == AuthMode::OAuthPassthrough {
         return 0.0;
     }
     let Some(p) = rates(cfg, d) else { return 0.0 };
     let prompt = (text_bytes(body) / 4) as i64;
-    let completion = if output { expected_completion(model, max_tokens) as i64 } else { 0 };
+    let completion = if output { expected_completion(&d.model_name, max_tokens) as i64 } else { 0 };
     cost(p, Usage { prompt, completion, ..Usage::default() })
 }
 
@@ -958,8 +954,8 @@ impl Emit {
         let content = self.take_content();
         let reserved = std::mem::take(&mut self.reserved);
         let budget = std::mem::take(&mut self.budget);
-        if status == 200 && self.deployment.is_some() && u.completion > 0 {
-            saw_completion(&self.model, u.completion);
+        if let Some(d) = self.deployment.as_ref().filter(|_| status == 200 && u.completion > 0) {
+            saw_completion(&d.model_name, u.completion);
         }
         let mut e = Event {
             ts_ms: self.ts_ms,
@@ -1333,6 +1329,7 @@ pub(crate) mod tests {
             "deployments":[
               {"id":"e-priced","provider_id":"p","model_name":"expect-priced","upstream_name":"a","input_per_1m":2,"output_per_1m":10},
               {"id":"e-free","provider_id":"p","model_name":"expect-free","upstream_name":"c"},
+              {"id":"e-any","provider_id":"p","model_name":"expect-any-*","upstream_name":"*","input_per_1m":2,"output_per_1m":10},
               {"id":"e-own","provider_id":"own","model_name":"expect-own","upstream_name":"d","input_per_1m":2,"output_per_1m":10}
             ]}"#,
         )
@@ -1343,7 +1340,7 @@ pub(crate) mod tests {
         body.truncate(3998);
         body.push_str("\"}");
         assert_eq!(text_bytes(body.as_bytes()), 4000);
-        let expect = |model: &str, max, output| expected_cost(&cfg, &d(model), model, body.as_bytes(), max, output);
+        let expect = |model: &str, max, output| expected_cost(&cfg, &d(model), body.as_bytes(), max, output);
         let usd = |prompt: f64, completion: f64| (prompt * 2.0 + completion * 10.0) / 1e6;
         let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
         // 1000 tokens of text; no history of the model yet: 1024 out, or the request's own cap
@@ -1375,6 +1372,29 @@ pub(crate) mod tests {
         em.deployment = Some(d("expect-priced"));
         em.send(500, "upstream_error", Usage { completion: 100_000, ..Usage::default() }, 0);
         assert!(close(expect("expect-priced", None, true), usd(1000.0, 800.0)));
+
+        // A pattern is one model, whatever names callers make up under it:
+        // they share its mean, and none of them is tracked by name.
+        let tracked = completions().lock().unwrap().len();
+        for i in 0..20 {
+            let name = format!("expect-any-{i}-{}", "x".repeat(10_000));
+            let mut em = emit_capturing(&name, 0);
+            em.deployment = Some(d(&name));
+            em.send(200, "", Usage { completion: 50, ..Usage::default() }, 0);
+        }
+        assert!(close(expect("expect-any-never-asked-for", None, true), usd(1000.0, 100.0)));
+        assert_eq!(completions().lock().unwrap().len(), tracked + 1);
+        assert!(completions().lock().unwrap().keys().all(|k| k.len() < 100));
+        // full, the map starts over rather than leaving new models on the default
+        for i in 0..MAX_TRACKED_MODELS {
+            saw_completion(&format!("expect-gone-{i}"), 1);
+        }
+        for _ in 0..20 {
+            saw_completion("expect-new", 10);
+        }
+        assert!(completions().lock().unwrap().len() <= MAX_TRACKED_MODELS);
+        assert_eq!(expected_completion("expect-new", None), 20);
+        completions().lock().unwrap().retain(|k, _| !k.starts_with("expect-gone-"));
         drop(take(usize::MAX, usize::MAX));
     }
 

@@ -287,9 +287,35 @@ pub fn admit(key: &Key, expected_usd: f64) -> Result<Reservation, Denial> {
     Ok(held)
 }
 
+/// Whether `key` would be refused whatever it asks for: a budget spent or
+/// not known yet, a rate limit reached. Takes nothing; for refusing a
+/// request before its body is read.
+pub fn peek(key: &Key) -> Result<(), Denial> {
+    admit(key, 0.0)?;
+    rates(key, false)
+}
+
 /// Check every rate limit of `key`, then take one request from each. Nothing
 /// is taken when any scope refuses.
 pub fn take_rates(key: &Key) -> Result<(), Denial> {
+    rates(key, true)
+}
+
+/// Count a request that ends before its limits are checked (its body was
+/// unreadable) against `key`'s rate limits, so such requests are throttled
+/// like any other.
+pub fn count_request(key: &Key) {
+    let (minute, _) = clock();
+    for s in key.scopes() {
+        let mut i = s.inner.lock().unwrap();
+        if i.rpm.is_some() {
+            i.add(minute, 1, 0);
+            s.mark_dirty(&mut i);
+        }
+    }
+}
+
+fn rates(key: &Key, take: bool) -> Result<(), Denial> {
     if key.scopes().next().is_none() {
         return Ok(());
     }
@@ -316,12 +342,8 @@ pub fn take_rates(key: &Key) -> Result<(), Denial> {
             });
         }
     }
-    for s in key.scopes() {
-        let mut i = s.inner.lock().unwrap();
-        if i.rpm.is_some() {
-            i.add(minute, 1, 0);
-            s.mark_dirty(&mut i);
-        }
+    if take {
+        count_request(key);
     }
     Ok(())
 }
@@ -735,6 +757,38 @@ pub(crate) mod tests {
         );
         assert_eq!(held("key:t-reserve-race"), (0.0, 0));
         assert!((reserved_usd() - before).abs() < 1e-9);
+    }
+
+    // Before a request's body is read: a key that is over a limit is
+    // refused, and looking takes nothing. A request that ends on its body
+    // still counts against the rate limit.
+    #[test]
+    fn a_look_takes_nothing_and_a_bad_body_takes_a_slot() {
+        let _serial = SERIAL.lock().unwrap();
+        drop(freeze());
+        let k = key("t-peek", Some(1.0), Some(2));
+        for _ in 0..10 {
+            assert!(peek(&k).is_ok());
+        }
+        assert!(freeze().0.iter().all(|d| d.scope != "key:t-peek"), "no slot for looking");
+        assert_eq!(held("key:t-peek"), (0.0, 0));
+        count_request(&k);
+        assert!(peek(&k).is_ok());
+        count_request(&k);
+        assert_eq!(peek(&k).unwrap_err().code, "rate_limit_exceeded");
+        let (deltas, scopes) = freeze();
+        assert!(deltas.iter().any(|d| d.scope == "key:t-peek" && d.requests == 2), "{deltas:?}");
+        discard(&scopes);
+
+        let spent = key("t-peek-spent", Some(1.0), None);
+        record(&spent, 0, 1.5);
+        assert_eq!(peek(&spent).unwrap_err().code, "budget_exceeded");
+        // a budget only held by requests in progress is for the real check:
+        // what this request costs is not known yet
+        let busy = key("t-peek-busy", Some(1.0), None);
+        let _running = admit(&busy, 5.0).unwrap();
+        assert!(peek(&busy).is_ok());
+        assert_eq!(admit(&busy, 0.1).unwrap_err().code, "budget_reserved");
     }
 
     #[test]

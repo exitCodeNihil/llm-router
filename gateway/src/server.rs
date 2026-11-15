@@ -362,8 +362,10 @@ async fn serve(
     let route = route_of(req.method(), path);
     let rq = Rq { trace, operation: telemetry::operation(path), client_ip };
     match route {
-        // These check their limits themselves, once the body says which
-        // model: what the request may cost is held against its budgets.
+        // These check their limits themselves: a look before the body is
+        // read, so a key over its limits costs nothing more, and the real
+        // check once the body says which model, when what the request may
+        // cost is held against its budgets.
         Route::Chat => proxy_openai(cfg, key, inbound, req, "/chat/completions", rq).await,
         Route::Completions => proxy_openai(cfg, key, inbound, req, "/completions", rq).await,
         Route::Embeddings => proxy_openai(cfg, key, inbound, req, "/embeddings", rq).await,
@@ -400,6 +402,14 @@ fn denied(
     r
 }
 
+/// The answer to a request that ends on its body: unreadable, not JSON, no
+/// model. Its limits were only looked at so far (`limits::peek`), so it takes
+/// its rate-limit slot here: such requests are throttled like any other.
+fn bad_body(key: &Key, r: Response<Body>) -> Response<Body> {
+    limits::count_request(key);
+    r
+}
+
 /// Admit a request for a model: hold what it is expected to cost against its
 /// key's budgets, then take its rate-limit slot. In that order, so a request
 /// a budget refuses uses no slot. The reservation lives in the request's
@@ -417,9 +427,7 @@ fn admit(
     // Priced as the first deployment in routing order would bill it; a
     // model that resolves to nothing costs nothing.
     let expected = match resolved.and_then(|r| r.deployments.first()) {
-        Some(d) if limits::budgeted(key) => {
-            crate::usage::expected_cost(cfg, d, &p.model, body, max_tokens(body), output)
-        }
+        Some(d) if limits::budgeted(key) => crate::usage::expected_cost(cfg, d, body, max_tokens(body), output),
         _ => 0.0,
     };
     limits::admit(key, expected)
@@ -668,16 +676,22 @@ async fn proxy_openai(
     path: &str,
     rq: Rq,
 ) -> Response<Body> {
+    if let Err(d) = limits::peek(&key) {
+        return denied(&cfg, &key, String::new(), false, &rq, d);
+    }
     let body = match read_body(req).await {
         Ok(b) => b,
-        Err(r) => return r,
+        Err(r) => return bad_body(&key, r),
     };
     let p = match peek(&body) {
         Ok(p) => p,
-        Err(m) => return oai_error(StatusCode::BAD_REQUEST, "invalid_request_error", "invalid_body", &m),
+        Err(m) => {
+            return bad_body(&key, oai_error(StatusCode::BAD_REQUEST, "invalid_request_error", "invalid_body", &m));
+        }
     };
     if p.model.is_empty() {
-        return oai_error(StatusCode::BAD_REQUEST, "invalid_request_error", "missing_model", "model field is required");
+        let r = oai_error(StatusCode::BAD_REQUEST, "invalid_request_error", "missing_model", "model field is required");
+        return bad_body(&key, r);
     }
     let resolved = cfg.resolve(&p.model);
     let held = match admit(&cfg, &key, resolved.as_ref(), &p, &body, path != "/embeddings", &rq) {
@@ -790,16 +804,20 @@ async fn proxy_anthropic(
     req: Request<Incoming>,
     rq: Rq,
 ) -> Response<Body> {
+    if let Err(d) = limits::peek(&key) {
+        return denied(&cfg, &key, String::new(), false, &rq, d);
+    }
+    let bad = |message: &str| bad_body(&key, anth_error(StatusCode::BAD_REQUEST, "invalid_request_error", message));
     let body = match read_body(req).await {
         Ok(b) => b,
-        Err(_) => return anth_error(StatusCode::BAD_REQUEST, "invalid_request_error", "unreadable or oversized body"),
+        Err(_) => return bad("unreadable or oversized body"),
     };
     let p = match peek(&body) {
         Ok(p) => p,
-        Err(m) => return anth_error(StatusCode::BAD_REQUEST, "invalid_request_error", &m),
+        Err(m) => return bad(&m),
     };
     if p.model.is_empty() {
-        return anth_error(StatusCode::BAD_REQUEST, "invalid_request_error", "model is required");
+        return bad("model is required");
     }
     let resolved = cfg.resolve(&p.model);
     let held = match admit(&cfg, &key, resolved.as_ref(), &p, &body, true, &rq) {

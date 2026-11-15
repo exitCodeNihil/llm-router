@@ -66,6 +66,13 @@ const MAX_CLOCK_SKEW_MS: i64 = 5 * 60_000;
 /// The control-plane replicas whose limits cursor a sync names: the ones
 /// that answered most recently.
 const MAX_CURSORS: usize = 8;
+/// How often a gateway that joined with the schema before its own asks the
+/// control plane for its own again.
+const UPGRADE_EVERY: Duration = Duration::from_secs(600);
+/// The least time between two joins made because the control plane answered
+/// a schema 3 session with an older config: replicas of two versions behind
+/// one address would otherwise have the gateway join on every poll.
+const RENEGOTIATE_EVERY: Duration = Duration::from_secs(60);
 /// Sent with a config poll in a schema 3 session: the digest of the config
 /// held, so the control plane only sends a delta to a gateway that holds
 /// exactly what the delta is built on.
@@ -117,6 +124,8 @@ pub struct ControlPlane {
     older_warned: AtomicBool,
     /// The config held is the saved one, not yet replaced or confirmed.
     restored: AtomicBool,
+    /// How often a session on an older schema asks for this gateway's own.
+    upgrade_every: Duration,
     /// The control plane has refused the join since the last one that
     /// succeeded: when that was noticed in this process, and for how long it
     /// had been going on by then, as the state directory had it.
@@ -184,6 +193,7 @@ impl ControlPlane {
             schema: AtomicI64::new(SCHEMA),
             older_warned: AtomicBool::new(false),
             restored: AtomicBool::new(false),
+            upgrade_every: UPGRADE_EVERY,
             refused_since: Mutex::new(None),
             refuse_after: REFUSE_AFTER,
             st: OnceLock::new(),
@@ -210,6 +220,12 @@ impl ControlPlane {
     #[cfg(test)]
     fn replaying_with(mut self, first: Duration, retry: Duration) -> ControlPlane {
         (self.replay_first, self.replay_retry) = (first, retry);
+        self
+    }
+
+    #[cfg(test)]
+    fn upgrading_every(mut self, d: Duration) -> ControlPlane {
+        self.upgrade_every = d;
         self
     }
 
@@ -285,24 +301,32 @@ impl ControlPlane {
     /// control plane says it is older: such a session has no config deltas
     /// and none of the newer fields, as before them.
     async fn join(&self) -> Result<(), String> {
-        let (j, schema) = match self.join_as(SCHEMA).await {
+        let (j, schema) = match self.join_as(SCHEMA, false).await {
             Ok(j) => (j, SCHEMA),
             Err(JoinError::Older(why)) => {
                 if !self.older_warned.swap(true, Ordering::Relaxed) {
                     log_warn!(
-                        "the control plane does not know config schema {SCHEMA} ({why}); joining with schema {}: no config deltas until it is upgraded",
-                        SCHEMA - 1
+                        "the control plane does not know config schema {SCHEMA} ({why}); joining with schema {}: no config deltas until it is upgraded, which is looked for every {}s",
+                        SCHEMA - 1,
+                        self.upgrade_every.as_secs()
                     );
                 }
-                match self.join_as(SCHEMA - 1).await {
+                match self.join_as(SCHEMA - 1, false).await {
                     Ok(j) => (j, SCHEMA - 1),
                     Err(JoinError::Older(e) | JoinError::Other(e)) => return Err(e),
                 }
             }
             Err(JoinError::Other(e)) => return Err(e),
         };
+        self.joined(&j, schema);
+        Ok(())
+    }
+
+    /// A join succeeded, asked for with `schema`: this gateway is a new
+    /// instance to the control plane from here on.
+    fn joined(&self, j: &Joined, schema: i64) {
         self.schema.store(if (1..schema).contains(&j.schema) { j.schema } else { schema }, Ordering::Relaxed);
-        self.adopt(&j);
+        self.adopt(j);
         self.joins.fetch_add(1, Ordering::Relaxed);
         if self.refused_since.lock().unwrap().take().is_some()
             && let Some(state) = self.state.clone()
@@ -315,10 +339,34 @@ impl ControlPlane {
         if let Some(g) = &j.group {
             log_info!("joined gateway group {} as instance {}", g.name, j.instance_id);
         }
-        Ok(())
     }
 
-    async fn join_as(&self, schema: i64) -> Result<Joined, JoinError> {
+    /// On a session joined with an older schema: ask the control plane for
+    /// this gateway's own again, in case it was upgraded since. A join that
+    /// succeeds replaces the session; any other answer leaves the one in use
+    /// as it is. True when the session was replaced.
+    async fn try_upgrade(&self) -> bool {
+        let _guard = self.join_lock.lock().await;
+        if self.schema.load(Ordering::Relaxed) >= SCHEMA {
+            return false;
+        }
+        match self.join_as(SCHEMA, true).await {
+            Ok(j) => {
+                log_info!("the control plane now knows config schema {SCHEMA}");
+                self.joined(&j, SCHEMA);
+                true
+            }
+            Err(JoinError::Older(_)) => false,
+            Err(JoinError::Other(e)) => {
+                log_debug!("looking for an upgraded control plane: {e}");
+                false
+            }
+        }
+    }
+
+    /// Ask to join with `schema`. A `probe` only looks whether the control
+    /// plane would take it: its refusal says nothing about the session in use.
+    async fn join_as(&self, schema: i64, probe: bool) -> Result<Joined, JoinError> {
         let body = serde_json::to_vec(&serde_json::json!({"name": self.name, "version": VERSION, "schema": schema}))
             .unwrap_or_default();
         let call = self
@@ -335,7 +383,7 @@ impl ControlPlane {
         let (status, bytes) = match call {
             Call::Ok(status, _, bytes) => (status, bytes),
             Call::Unauthorized(refused) => {
-                if refused {
+                if refused && !probe {
                     self.refused();
                 }
                 return Err(JoinError::Other("the control plane refused the join token".into()));
@@ -478,7 +526,7 @@ impl ControlPlane {
         }
         let (gzip, body) = (saved.gzip, Bytes::from(saved.config));
         let loaded = tokio::task::spawn_blocking(move || load(gzip, body)).await;
-        let Loaded { cfg, held } = match loaded.unwrap_or_else(|e| Err(e.to_string())) {
+        let Loaded { cfg, held, .. } = match loaded.unwrap_or_else(|e| Err(e.to_string())) {
             Ok(loaded) => loaded,
             Err(e) => {
                 log_warn!("state: the saved config is unusable ({e}); deleting it");
@@ -504,6 +552,9 @@ impl ControlPlane {
         // not is replaced by the control plane's own, whatever it has.
         self.refetch.store(held.digest.is_none(), Ordering::Relaxed);
         self.restored.store(true, Ordering::Relaxed);
+        // A control plane with nothing newer answers 304 from here on: the
+        // saved confirmation is the one those answers, and syncs, renew.
+        state.resume(saved.confirmed.clone());
         *self.held.lock().unwrap() = Some(held);
         self.install(st, cfg);
         st.ready.config_ok_ago(Duration::from_millis(age_ms.max(0) as u64));
@@ -540,11 +591,21 @@ impl ControlPlane {
         st.config.store(Some(Arc::new(cfg)));
     }
 
-    /// Renew the session five minutes before it expires.
+    /// Renew the session five minutes before it expires. On a session
+    /// joined with an older schema, also look every `upgrade_every` whether
+    /// the control plane has been upgraded.
     async fn renew_loop(self: Arc<Self>) {
         loop {
             let left = self.expires_at_ms.load(Ordering::Relaxed) - now_ms() - 5 * 60_000;
-            tokio::time::sleep(Duration::from_millis(left.max(30_000) as u64)).await;
+            let left = Duration::from_millis(left.max(30_000) as u64);
+            let fallback = self.schema.load(Ordering::Relaxed) < SCHEMA;
+            let wait = if fallback { left.min(self.upgrade_every) } else { left };
+            tokio::time::sleep(wait).await;
+            // A new join is a new session: nothing to renew. Woken early
+            // only to look, the session is not due yet either.
+            if (fallback && self.try_upgrade().await) || wait < left {
+                continue;
+            }
             let (s, generation) = self.session();
             match self.call(Method::POST, "/gw/v1/renew", &s, None, &[], Duration::from_secs(15)).await {
                 Ok(Call::Ok(StatusCode::OK, _, bytes)) => {
@@ -565,6 +626,7 @@ impl ControlPlane {
     /// apply is discarded and the full config fetched instead.
     async fn config_loop(self: Arc<Self>, st: &'static State) {
         let mut discarded = 0u32;
+        let mut renegotiated: Option<Instant> = None;
         loop {
             let (s, generation) = self.session();
             let schema = self.schema.load(Ordering::Relaxed);
@@ -583,7 +645,7 @@ impl ControlPlane {
                         tokio::task::spawn_blocking(move || receive(held, gzip, bytes, schema, unconditional)).await;
                     match received.unwrap_or_else(|e| Received::Rejected(e.to_string())) {
                         Received::Config(loaded) => {
-                            let Loaded { cfg, held } = *loaded;
+                            let Loaded { cfg, held, older } = *loaded;
                             discarded = 0;
                             self.refetch.store(false, Ordering::Relaxed);
                             self.restored.store(false, Ordering::Relaxed);
@@ -593,10 +655,22 @@ impl ControlPlane {
                             *self.held.lock().unwrap() = Some(held);
                             self.install(st, cfg);
                             st.ready.config_ok();
+                            if older {
+                                self.renegotiate(&mut renegotiated, generation).await;
+                            }
                         }
-                        Received::Ignored(why) => {
-                            log_warn!("config ignored: {why}");
-                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        Received::Kept { why, confirmed, older } => {
+                            if confirmed {
+                                st.ready.config_ok();
+                                if let Some(state) = &self.state {
+                                    state.confirm(now_ms());
+                                }
+                            } else {
+                                log_warn!("config ignored: {why}");
+                            }
+                            if !older || !self.renegotiate(&mut renegotiated, generation).await {
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                            }
                         }
                         Received::Discarded(why) => {
                             log_warn!("config delta discarded: {why}; fetching the full config");
@@ -632,6 +706,20 @@ impl ControlPlane {
         }
     }
 
+    /// The control plane answered a schema 3 session as one from before
+    /// schema 3 does (it was rolled back, or replicas of two versions share
+    /// an address): join again, which settles on the schema it speaks. At
+    /// most every RENEGOTIATE_EVERY; true when it joined.
+    async fn renegotiate(&self, last: &mut Option<Instant>, generation: u64) -> bool {
+        if last.is_some_and(|at| at.elapsed() < RENEGOTIATE_EVERY) {
+            return false;
+        }
+        *last = Some(Instant::now());
+        log_warn!("the control plane answered a schema {SCHEMA} session with an older config: joining again");
+        self.rejoin(generation).await;
+        true
+    }
+
     /// The config in use, as a schema 3 sync or replay names it, so the
     /// control plane can hold off until it knows that config too; None in a
     /// session that does not say.
@@ -654,6 +742,15 @@ impl ControlPlane {
                 continue;
             }
             tokio::time::sleep(Duration::from_millis(self.sync_interval_ms.load(Ordering::Relaxed))).await;
+        }
+    }
+
+    /// Write the state directory now, for shutdown: the timer may be up to
+    /// SAVE_INTERVAL behind, and a restart would then start from spend that
+    /// old.
+    pub async fn save(&self) {
+        if let Some(state) = self.state.clone() {
+            let _ = tokio::task::spawn_blocking(move || state.flush(limits::spend)).await;
         }
     }
 
@@ -1278,13 +1375,21 @@ fn poll_headers(held: &Held, schema: i64) -> Vec<(&'static str, String)> {
 struct Loaded {
     cfg: Config,
     held: Held,
+    /// It came, in a schema 3 session, from a control plane that does not
+    /// speak schema 3.
+    older: bool,
 }
 
 /// What became of a config response.
 enum Received {
     Config(Box<Loaded>),
-    /// Not newer than the config held: kept waiting for one that is.
-    Ignored(String),
+    /// Not newer than the config held, which stays. `confirmed`: it is the
+    /// one held, as far as can be told. `older`: as in `Loaded`.
+    Kept {
+        why: String,
+        confirmed: bool,
+        older: bool,
+    },
     /// A delta that does not apply to the config held.
     Discarded(String),
     Rejected(String),
@@ -1324,18 +1429,26 @@ fn receive(held: Option<Held>, gzip: bool, body: Bytes, schema: i64, uncondition
     // names a new one, and its config is taken whatever its number. Within
     // one, an older config is a replica lagging behind; the same version is
     // only taken when it was asked for by no name, to replace the one held.
+    //
+    // A control plane from before schema 3 names no epoch, and does not
+    // understand the one it is polled with: it answers every poll at once
+    // with its config. That is no new epoch. Its config is judged by version
+    // alone: an older one is not taken (it would bring back what was since
+    // removed), the same one confirms the config held.
+    let older = schema >= 3 && (wire.schema < 3 || wire.epoch.is_empty());
     if schema >= 3
         && let Some(h) = &held
-        && wire.epoch == h.epoch
-        && (wire.version < h.version || (wire.version == h.version && !unconditional))
+        && (older || wire.epoch == h.epoch)
+        && (wire.version < h.version || (wire.version == h.version && (older || !unconditional)))
     {
-        return Received::Ignored(format!(
-            "the control plane sent version {} of epoch {:?}; version {} is in use",
-            wire.version, wire.epoch, h.version
-        ));
+        let why = format!(
+            "the control plane sent version {} of epoch {:?}; version {} of epoch {:?} is in use",
+            wire.version, wire.epoch, h.version, h.epoch
+        );
+        return Received::Kept { why, confirmed: older && wire.version == h.version, older };
     }
     let digest = verified(&wire);
-    if schema >= 3 && digest.is_none() {
+    if schema >= 3 && digest.is_none() && !older {
         // The control plane is the authority on the config, so it is used;
         // but no delta is asked for on top of what cannot be told apart.
         log_warn!(
@@ -1347,7 +1460,7 @@ fn receive(held: Option<Held>, gzip: bool, body: Bytes, schema: i64, uncondition
     match build(wire, digest, gzip, body) {
         Ok(loaded) => {
             metrics::CONFIG_FULL.fetch_add(1, Ordering::Relaxed);
-            Received::Config(Box::new(loaded))
+            Received::Config(Box::new(Loaded { older, ..loaded }))
         }
         Err(e) => Received::Rejected(e),
     }
@@ -1390,7 +1503,7 @@ fn build(wire: Wire, digest: Option<String>, gzip: bool, body: Bytes) -> Result<
     let cfg = Config::build(wire)?;
     limits::end_config(generation);
     let held = Held { epoch, version: cfg.version, group: cfg.group.id.clone(), digest, gzip, body };
-    Ok(Loaded { cfg, held })
+    Ok(Loaded { cfg, held, older: false })
 }
 
 /// Read a full config as it was saved. Blocking.
@@ -2645,7 +2758,7 @@ mod tests {
     fn received(held: Option<&Held>, v: &serde_json::Value, unconditional: bool) -> Loaded {
         match receive(held.cloned(), true, body(v), 3, unconditional) {
             Received::Config(loaded) => *loaded,
-            Received::Ignored(why) => panic!("ignored: {why}"),
+            Received::Kept { why, .. } => panic!("ignored: {why}"),
             Received::Discarded(why) => panic!("discarded: {why}"),
             Received::Rejected(why) => panic!("rejected: {why}"),
         }
@@ -2669,7 +2782,7 @@ mod tests {
     fn a_delta_patches_the_config_held() {
         let _globals = hold_globals();
         let v3 = config3(3);
-        let Loaded { cfg, held } = received(None, &v3, true);
+        let Loaded { cfg, held, .. } = received(None, &v3, true);
         assert_eq!((cfg.version, key_ids(&cfg)), (3, vec!["cp-budgeted".to_string(), "cp-free".to_string()]));
         assert_eq!((held.epoch.as_str(), held.version, held.group.as_str()), ("e1", 3, "g1"));
         assert_eq!(held.digest.as_deref(), v3["digest"].as_str());
@@ -2694,7 +2807,7 @@ mod tests {
             "users": {"upsert": v5["users"]}, "teams": {"upsert": v5["teams"]},
             "emails": {"upsert": v5["emails"]},
         });
-        let Loaded { cfg, held } = received(Some(&held), &delta3(&v3, &v5, changes), false);
+        let Loaded { cfg, held, .. } = received(Some(&held), &delta3(&v3, &v5, changes), false);
         assert_eq!((cfg.version, key_ids(&cfg)), (5, vec!["cp-free".to_string(), "cp-new".to_string()]));
         let new = &cfg.keys[&[0x33; 32]];
         assert!(new.user.is_some() && new.team.is_some() && cfg.emails.contains_key(&[0xee; 32]));
@@ -2719,14 +2832,14 @@ mod tests {
             "users": {"remove": ["u1"]}, "teams": {"remove": ["t1"]}, "emails": {"remove": ["ee".repeat(32)]},
             "rest": {"group": v6["group"], "providers": v6["providers"], "deployments": v6["deployments"], "rest_hash": "r2"},
         });
-        let Loaded { cfg, held } = received(Some(&held), &delta3(&v5, &v6, changes), false);
+        let Loaded { cfg, held, .. } = received(Some(&held), &delta3(&v5, &v6, changes), false);
         assert_eq!((cfg.version, key_ids(&cfg)), (6, vec!["cp-free".to_string()]));
         assert!(cfg.emails.is_empty() && cfg.teams.is_empty());
         assert_eq!((cfg.group.name.as_str(), cfg.names.as_slice()), ("renamed", &["m1".to_string()][..]));
         assert_eq!(held.digest.as_deref(), v6["digest"].as_str());
 
         // what is held is a full config: saved and loaded, it is the same one
-        let Loaded { cfg, held: reloaded } = load(held.gzip, held.body.clone()).unwrap();
+        let Loaded { cfg, held: reloaded, .. } = load(held.gzip, held.body.clone()).unwrap();
         assert_eq!((cfg.version, key_ids(&cfg), cfg.names.len()), (6, vec!["cp-free".to_string()], 1));
         assert_eq!(
             (reloaded.epoch, reloaded.version, reloaded.digest, reloaded.group),
@@ -2793,7 +2906,10 @@ mod tests {
         let _globals = hold_globals();
         let Loaded { held, .. } = received(None, &config3(7), true);
         let ignored = |v: &serde_json::Value, unconditional| {
-            matches!(receive(Some(held.clone()), true, body(v), 3, unconditional), Received::Ignored(_))
+            matches!(
+                receive(Some(held.clone()), true, body(v), 3, unconditional),
+                Received::Kept { confirmed: false, older: false, .. }
+            )
         };
         assert!(ignored(&config3(6), false), "older, the same epoch");
         assert!(ignored(&config3(6), true), "older, even when asked for by no name");
@@ -2804,7 +2920,7 @@ mod tests {
         // a control plane that started over: a new epoch, a lower version
         let mut restored = config3(2);
         restored["epoch"] = "e2".into();
-        let Loaded { cfg, held: now } = received(Some(&held), &restored, false);
+        let Loaded { cfg, held: now, .. } = received(Some(&held), &restored, false);
         assert_eq!((cfg.version, now.epoch.as_str(), now.version), (2, "e2", 2));
         assert_eq!(header_names(&now)[0].1, "\"e2-v2\"");
 
@@ -2821,7 +2937,7 @@ mod tests {
         let _globals = hold_globals();
         let mut wrong = config3(3);
         wrong["digest"] = "00".repeat(32).into();
-        let Loaded { cfg, held } = received(None, &wrong, true);
+        let Loaded { cfg, held, .. } = received(None, &wrong, true);
         assert_eq!(cfg.version, 3);
         assert_eq!(held.digest, None);
         assert_eq!(header_names(&held), [("if-none-match", "\"e1-v3\"".to_string())]);
@@ -2849,7 +2965,7 @@ mod tests {
             {"hash": "22".repeat(32), "id": "cp-free", "h": "k2"},
         ]);
         let v3 = delta::tests::sealed(v3);
-        let Loaded { cfg, held } = received(None, &v3, true);
+        let Loaded { cfg, held, .. } = received(None, &v3, true);
         assert_eq!(cfg.keys.len(), 3);
         let (old, new) = (&cfg.keys[&[0xaa; 32]], &cfg.keys[&[0xbb; 32]]);
         assert_eq!((old.id.as_str(), new.id.as_str()), ("cp-rotated", "cp-rotated"));
@@ -2863,7 +2979,7 @@ mod tests {
         v4["keys"].as_array_mut().unwrap().remove(0);
         let v4 = delta::tests::sealed(v4);
         let gone = delta3(&v3, &v4, serde_json::json!({"keys": {"remove": ["aa".repeat(32)]}}));
-        let Loaded { cfg, held } = received(Some(&held), &gone, false);
+        let Loaded { cfg, held, .. } = received(Some(&held), &gone, false);
         assert!(!cfg.keys.contains_key(&[0xaa; 32]), "the old secret no longer works");
         assert_eq!(cfg.keys[&[0xbb; 32]].id, "cp-rotated");
         assert_eq!(cfg.keys.len(), 2);
@@ -2996,7 +3112,8 @@ mod tests {
 
     // A control plane that only knows schema 2 answers the join with a 400
     // that says to upgrade it: the gateway joins with schema 2 and runs as
-    // it did before schema 3, until a join finds the control plane upgraded.
+    // it did before schema 3, until a join finds the control plane upgraded
+    // (it also looks by itself: see a_fallback_session_looks_for_an_upgraded_control_plane).
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
     async fn an_older_control_plane_is_joined_with_its_schema() {
@@ -3134,6 +3251,147 @@ mod tests {
         assert!(spool_files(&dir).is_empty());
     }
 
+    // A saved config the control plane has nothing newer than is confirmed
+    // by 304s and never sent again: those confirmations, and the spend the
+    // syncs bring, must still reach the state directory, or the next start
+    // would find a confirmation as old as the last config change.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
+    async fn a_restored_config_confirmed_by_304_is_saved_again() {
+        let _globals = hold_globals();
+        let (url, mock) = gateway_cp().await;
+        let dir = TempDir::new("restored-304");
+        let hour_ago = now_ms() - 3_600_000;
+        {
+            let store = Store::open(&dir.0, "llmrg_test").unwrap();
+            store.put_config(true, body(&config3(3)), hour_ago, 3, "g1");
+            store.flush(|| Some([("key:cp-budgeted".to_string(), 0.25)].into_iter().collect()));
+        }
+        let (st, running, store) = running(&url, Some(&dir));
+        let store = store.unwrap();
+        until("several polls", || mock.polls.lock().unwrap().len() >= 4).await;
+        until("several syncs", || mock.syncs().len() >= 3).await;
+        assert_eq!(version_of(st), 3);
+        assert!(mock.polls.lock().unwrap().iter().all(|tag| tag.as_deref() == Some("\"e1-v3\"")), "never sent anew");
+        let started = now_ms();
+        until("a 304 after this", || st.ready.config_age().is_some_and(|age| age < Duration::from_millis(50))).await;
+        store.flush(|| Some([("key:cp-budgeted".to_string(), 0.75)].into_iter().collect()));
+        running.abort();
+        let _ = running.await;
+        let saved = store.load().unwrap();
+        assert!(saved.confirmed.confirmed_at_ms >= started - 1000, "{:?}", saved.confirmed);
+        assert_eq!((saved.confirmed.version, saved.confirmed.group.as_str()), (3, "g1"));
+        assert_eq!(saved.confirmed.spend.unwrap()["key:cp-budgeted"], 0.75);
+        // and the config beside it is still the one it confirms
+        assert_eq!(load(saved.gzip, saved.config.into()).unwrap().cfg.version, 3);
+    }
+
+    // A control plane from before schema 3 answering a schema 3 session
+    // (rolled back, or one replica of several): its config has no epoch,
+    // which is not a new epoch. It is taken only when newer by version; the
+    // same version confirms the config held; and the gateway joins again.
+    #[test]
+    fn an_older_control_planes_config_is_judged_by_version() {
+        let _globals = hold_globals();
+        let Loaded { held, .. } = received(None, &config3(7), true);
+        let answer = |version: i64, unconditional| {
+            receive(Some(held.clone()), false, wire_config(version).into(), 3, unconditional)
+        };
+        for unconditional in [false, true] {
+            assert!(
+                matches!(answer(6, unconditional), Received::Kept { confirmed: false, older: true, .. }),
+                "an older version would bring back what was removed since"
+            );
+            assert!(matches!(answer(7, unconditional), Received::Kept { confirmed: true, older: true, .. }));
+        }
+        let Received::Config(newer) = answer(8, false) else { panic!("a newer version is taken") };
+        assert!(newer.older && newer.cfg.version == 8 && newer.held.digest.is_none());
+        // with nothing held there is nothing to compare: taken, and noted
+        let Received::Config(first) = receive(None, false, wire_config(6).into(), 3, true) else { panic!("not taken") };
+        assert!(first.older);
+        // a schema 3 config is never mistaken for one
+        assert!(!received(Some(&held), &config3(8), false).older);
+    }
+
+    // Over the wire: the control plane is rolled back under a schema 3
+    // session. The config held stays and counts as confirmed, and the
+    // gateway joins again, on schema 2, where polls are long polls again.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
+    async fn a_rolled_back_control_plane_is_joined_again_on_its_schema() {
+        let _globals = hold_globals();
+        let (url, mock) = gateway_cp().await;
+        let (st, running, _) = running(&url, None);
+        until("it polls by name", || mock.polls.lock().unwrap().len() >= 2).await;
+        assert_eq!(*mock.join_schemas.lock().unwrap(), [3]);
+
+        mock.older.store(true, Ordering::Relaxed);
+        until("it joins again", || mock.join_schemas.lock().unwrap().len() >= 3).await;
+        assert_eq!(*mock.join_schemas.lock().unwrap(), [3, 3, 2]);
+        until("it polls as schema 2 does", || {
+            mock.polls.lock().unwrap().last().is_some_and(|tag| tag.as_deref() == Some("\"v3\""))
+        })
+        .await;
+        assert_eq!(version_of(st), 3);
+        assert!(st.is_ready() && st.ready.config_age().is_some_and(|age| age < Duration::from_secs(5)));
+        // long polls, not a download every two seconds
+        let polls = mock.polls.lock().unwrap().len();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let later = mock.polls.lock().unwrap();
+        assert!(later.len() <= polls + 6 && later[polls..].iter().all(|tag| tag.as_deref() == Some("\"v3\"")));
+        drop(later);
+        running.abort();
+        let _ = running.await;
+    }
+
+    // A gateway on a schema 2 session keeps asking for schema 3: a control
+    // plane upgraded later is picked up without a restart, and until then
+    // each attempt leaves the session in use alone.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
+    async fn a_fallback_session_looks_for_an_upgraded_control_plane() {
+        let _globals = hold_globals();
+        let (url, mock) = gateway_cp().await;
+        mock.older.store(true, Ordering::Relaxed);
+        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into());
+        cp.join().await.unwrap();
+        let before = (cp.session(), cp.joins.load(Ordering::Relaxed));
+        assert_eq!(cp.schema.load(Ordering::Relaxed), 2);
+        assert!(!cp.try_upgrade().await);
+        assert_eq!(*mock.join_schemas.lock().unwrap(), [3, 2, 3], "asked once, not joined on 2 again");
+        assert_eq!((cp.session(), cp.joins.load(Ordering::Relaxed)), before, "the session in use is untouched");
+        assert_eq!(cp.schema.load(Ordering::Relaxed), 2);
+        // a refusal of the attempt is no verdict on the gateway
+        mock.mode.store(REFUSE, Ordering::Relaxed);
+        assert!(!cp.try_upgrade().await);
+        assert!(cp.refused_since.lock().unwrap().is_none());
+        mock.mode.store(ACCEPT, Ordering::Relaxed);
+
+        mock.older.store(false, Ordering::Relaxed);
+        assert!(cp.try_upgrade().await);
+        assert_eq!(cp.schema.load(Ordering::Relaxed), 3);
+        assert_eq!(cp.joins.load(Ordering::Relaxed), before.1 + 1);
+        let asked = mock.join_schemas.lock().unwrap().len();
+        assert!(!cp.try_upgrade().await, "nothing to look for on schema 3");
+        assert_eq!(mock.join_schemas.lock().unwrap().len(), asked);
+
+        // the running gateway does it by itself
+        mock.older.store(true, Ordering::Relaxed);
+        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into()).upgrading_every(Duration::from_millis(30));
+        let st = new_state();
+        let running = tokio::spawn(Arc::new(cp).start(st));
+        until("it serves on schema 2", || st.is_ready()).await;
+        let asked = mock.join_schemas.lock().unwrap().len();
+        until("it asks again, twice", || mock.join_schemas.lock().unwrap().len() >= asked + 2).await;
+        assert!(mock.join_schemas.lock().unwrap()[asked..].iter().all(|schema| *schema == 3));
+        assert!(mock.digests.lock().unwrap().iter().all(|d| d.is_none()), "still a schema 2 session");
+        mock.older.store(false, Ordering::Relaxed);
+        until("it polls as schema 3 does", || mock.digests.lock().unwrap().last().unwrap().is_some()).await;
+        assert_eq!(version_of(st), 3);
+        running.abort();
+        let _ = running.await;
+    }
+
     /// This process's resident memory in MiB, as `ps` reports it.
     fn rss_mib() -> f64 {
         let out = std::process::Command::new("ps")
@@ -3226,7 +3484,7 @@ mod tests {
         println!("before: {start:.0} MiB, the response body ({:.1} MiB gzipped) in it", body.len() as f64 / 1048576.0);
 
         let took = Instant::now();
-        let Loaded { cfg, held } = match receive(None, true, body, 3, true) {
+        let Loaded { cfg, held, .. } = match receive(None, true, body, 3, true) {
             Received::Config(loaded) => *loaded,
             _ => panic!("the config was not taken"),
         };
@@ -3240,7 +3498,7 @@ mod tests {
         );
 
         let took = Instant::now();
-        let Loaded { cfg: next, held } = match receive(Some(held), true, d, 3, false) {
+        let Loaded { cfg: next, held, .. } = match receive(Some(held), true, d, 3, false) {
             Received::Config(loaded) => *loaded,
             Received::Discarded(why) => panic!("{why}"),
             _ => panic!("the delta was not taken"),

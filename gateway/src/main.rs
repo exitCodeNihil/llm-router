@@ -125,6 +125,7 @@ fn main() {
         // as their requests finish, then upload the last usage.
         server::run(listener, st, shutdown, drain).await;
         cp.flush(Instant::now() + Duration::from_secs(10)).await;
+        cp.save().await;
         log_info!("llmr-gateway stopped");
     });
 }

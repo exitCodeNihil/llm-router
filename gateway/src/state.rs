@@ -120,6 +120,14 @@ impl Store {
         self.changed.notify_one();
     }
 
+    /// The config in use is the one `load` returned, with its confirmation:
+    /// a control plane that has nothing newer confirms it again (`confirm`),
+    /// and syncs bring its spend up to date (`touch`), without it ever being
+    /// sent anew.
+    pub fn resume(&self, confirmed: Confirmed) {
+        self.pending.lock().unwrap().confirmed = Some(confirmed);
+    }
+
     /// The control plane confirmed the config in use.
     pub fn confirm(&self, at_ms: i64) {
         let mut p = self.pending.lock().unwrap();

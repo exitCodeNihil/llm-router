@@ -253,8 +253,9 @@ func (s *Server) config(w http.ResponseWriter, r *http.Request, p peer) {
 			// gateway a later one. A different database (restored, replaced)
 			// starts over, whatever its number.
 			due := snap.Version != have
-			if p.schema >= 3 && haveEpoch != "" && haveEpoch == snap.Epoch {
-				due = snap.Version > have
+			if p.schema >= 3 && haveEpoch != "" {
+				// Equal numbers in two databases are two configs.
+				due = haveEpoch != snap.Epoch || snap.Version > have
 			}
 			if due {
 				enc := s.encoded(snap, group, p.schema)

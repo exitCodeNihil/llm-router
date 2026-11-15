@@ -288,6 +288,9 @@ func TestConfigEndpointSchema3(t *testing.T) {
 	if w := get(3, `"other-v9"`, "x", 0); w.Code != http.StatusOK {
 		t.Fatalf("restored database: %d", w.Code)
 	}
+	if w := get(3, `"other-v7"`, "x", 0); w.Code != http.StatusOK {
+		t.Fatalf("another database on the same version number: %d", w.Code)
+	}
 
 	// A change wakes a waiting gateway at once, with a delta.
 	s2 := fixture()
