@@ -7,6 +7,9 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 pub static IN_FLIGHT: AtomicI64 = AtomicI64::new(0);
 pub static SHED: AtomicU64 = AtomicU64::new(0);
 pub static SYNC_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Configs taken whole, and as a change to the one held.
+pub static CONFIG_FULL: AtomicU64 = AtomicU64::new(0);
+pub static CONFIG_DELTAS: AtomicU64 = AtomicU64::new(0);
 pub static SYNC_REFUSED_EVENTS: AtomicU64 = AtomicU64::new(0);
 pub static CONFIG_VERSION: AtomicI64 = AtomicI64::new(0);
 /// Seconds since the control plane last answered a config poll, and whether
@@ -202,6 +205,12 @@ pub fn render(ready: bool, usage_queued: usize, usage_capacity: usize, usage_dro
     for (i, d) in DENIALS.iter().enumerate() {
         let _ = writeln!(s, "llmr_limit_denials_total{{reason=\"{d}\"}} {}", DENIAL[i].load(Relaxed));
     }
+    let _ = writeln!(
+        s,
+        "# HELP llmr_config_updates_total Configs received: whole, or as a delta to the one held\n# TYPE llmr_config_updates_total counter\nllmr_config_updates_total{{kind=\"full\"}} {}\nllmr_config_updates_total{{kind=\"delta\"}} {}",
+        CONFIG_FULL.load(Relaxed),
+        CONFIG_DELTAS.load(Relaxed)
+    );
     let mut counter = |name: &str, help: &str, v: u64| {
         let _ = writeln!(s, "# HELP {name} {help}\n# TYPE {name} counter\n{name} {v}");
     };

@@ -62,7 +62,7 @@ Gateways only:
 | `llmr_ready` | gauge | | 1 once it has its config and has synced, or has started on a config [saved on disk](deploy.md#gateway-state-on-disk); 0 again once the control plane has refused it |
 | `llmr_shed_total` | counter | | Requests refused with 503 because more than `LLMR_MAX_IN_FLIGHT` were in flight |
 | `llmr_upstream_attempts_total` | counter | `result` (`ok`, `error`, `timeout`, `retryable_status`) | Upstream attempts |
-| `llmr_limit_denials_total` | counter | `reason` (`budget_exceeded`, `rate_limit_exceeded`, `budget_unknown`) | Requests refused by a budget or rate limit, or, after a start from saved state without spend, because spend was not known yet |
+| `llmr_limit_denials_total` | counter | `reason` (`budget_exceeded`, `budget_reserved`, `rate_limit_exceeded`, `budget_unknown`) | Requests refused by a budget or rate limit, or, after a start from saved state without spend, because spend was not known yet |
 | `llmr_sync_failures_total` | counter | | Failed syncs with the control plane |
 | `llmr_sync_refused_events_total` | counter | | Usage events dropped because the control plane refused their batch, or a proxy refused one even alone and without content as too large |
 | `llmr_usage_queued_content_bytes` | gauge | | Captured prompts and responses the queued usage events hold |
@@ -70,6 +70,8 @@ Gateways only:
 | `llmr_usage_inflight_content_bytes` | gauge | | Room for captured content that requests in flight have reserved: their prompt as captured, and their response up to the capture cap. With the queued content and the batch being sent, at most 64 MiB |
 | `llmr_usage_content_stripped_total` | counter | | Usage events sent without their captured content: that 64 MiB was full (not captured at all, or put back in the queue after a failed sync), or a proxy refused even the smallest batch (64 KiB) as too large |
 | `llmr_config_version`, `llmr_workers` | gauge | | Config version in use; worker threads |
+| `llmr_config_updates_total` | counter | `kind` (`full`, `delta`) | Configs received whole, or as a change to the one held |
+| `llmr_budget_reserved_usd`, `llmr_budget_reserved_refusals_total` | gauge, counter | | Expected cost of requests in flight held against budgets; requests refused because a budget was held by others |
 | `llmr_config_age_seconds` | gauge | | Seconds since the control plane last answered a config poll, with the config or with "unchanged". Normally under 30; it grows while the control plane is unreachable. 0 before the first answer |
 | `llmr_config_stale` | gauge | | 1 while the config is older than `LLMR_MAX_CONFIG_AGE` and the gateway answers `/v1` with 503 |
 | `llmr_refused` | gauge | | 1 while the gateway does not serve because the control plane has refused its join token for 15 minutes; 0 again once a join succeeds |

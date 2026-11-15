@@ -1308,7 +1308,10 @@ fn receive(held: Option<Held>, gzip: bool, body: Bytes, schema: i64, uncondition
     };
     if schema >= 3 && delta::is_delta(&raw) {
         return match patched(held, &raw) {
-            Ok(loaded) => Received::Config(Box::new(loaded)),
+            Ok(loaded) => {
+                metrics::CONFIG_DELTAS.fetch_add(1, Ordering::Relaxed);
+                Received::Config(Box::new(loaded))
+            }
             Err(e) => Received::Discarded(e),
         };
     }
@@ -1342,7 +1345,10 @@ fn receive(held: Option<Held>, gzip: bool, body: Bytes, schema: i64, uncondition
         );
     }
     match build(wire, digest, gzip, body) {
-        Ok(loaded) => Received::Config(Box::new(loaded)),
+        Ok(loaded) => {
+            metrics::CONFIG_FULL.fetch_add(1, Ordering::Relaxed);
+            Received::Config(Box::new(loaded))
+        }
         Err(e) => Received::Rejected(e),
     }
 }
