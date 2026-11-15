@@ -53,6 +53,9 @@ type Server struct {
 	// Tokens verifies callers' identity tokens for /gw/v1/provision; nil
 	// makes one on first use.
 	Tokens *auth.CloudValidator
+	// RecordClientIP keeps the client address gateways report with usage
+	// (LLMR_USAGE_CLIENT_IP); off, it is dropped.
+	RecordClientIP bool
 
 	mu    sync.Mutex
 	cache map[string]*encoded // by group id

@@ -24,6 +24,10 @@ type Key struct {
 	TPMLimit      *int
 	ExpiresAt     *time.Time
 	Tags          []string
+	// OldHash marks the entry for a rotated-out secret, a copy of the key
+	// whose ExpiresAt is the end of its grace period (or the key's own
+	// expiry, if sooner). Code that wants each key once skips these.
+	OldHash bool
 }
 
 type User struct {
@@ -124,6 +128,7 @@ type GatewayGroup struct {
 	ID           string
 	Name         string
 	Region       string
+	StrictRegion bool            // only deployments in Region, no fallback to others
 	AllowedTeams map[string]bool // nil = every team
 	DataRule     string          // inherit | no_content | no_export
 }
@@ -164,7 +169,9 @@ type Snapshot struct {
 	Prices             map[string]Price         // catalog model_id -> price
 	Issuers            []*Issuer
 	// Spend holds current-period spend keyed by "key:"+id / "user:"+id / "team:"+id.
-	Spend         map[string]Spend
+	Spend map[string]Spend
+	// SpendAt is when Spend was read from Postgres.
+	SpendAt       time.Time
 	Telemetry     Telemetry
 	GatewayGroups map[string]*GatewayGroup
 	Destinations  []*Destination // by name

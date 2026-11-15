@@ -12,11 +12,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/exitcodenihil/llm-router/internal/auth"
+	"github.com/exitcodenihil/llm-router/internal/console"
 	"github.com/exitcodenihil/llm-router/internal/provider"
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
 	"github.com/exitcodenihil/llm-router/internal/usage"
@@ -39,6 +41,25 @@ type Server struct {
 	Usage     usage.Writer
 	Limits    LimitChecker
 	CloudAuth CloudTokenValidator
+	// RecordClientIP stores each request's client address with its usage
+	// (LLMR_USAGE_CLIENT_IP); TrustedProxies name the proxies whose
+	// X-Forwarded-For is believed.
+	RecordClientIP bool
+	TrustedProxies []netip.Prefix
+}
+
+// clientIP is the address to store with r's usage: "" unless RecordClientIP.
+func (g *Server) clientIP(r *http.Request) string {
+	if !g.RecordClientIP {
+		return ""
+	}
+	// ClientIP falls back to RemoteAddr's text, which inet may refuse (a
+	// unix socket), and with it the whole usage row.
+	ip := console.ClientIP(r, g.TrustedProxies)
+	if _, err := netip.ParseAddr(ip); err != nil {
+		return ""
+	}
+	return ip
 }
 
 type ctxKey int
@@ -107,6 +128,7 @@ func (g *Server) authenticate(next http.Handler) http.Handler {
 		}
 
 		tr := newTrace(w, r)
+		tr.ClientIP = g.clientIP(r)
 		if g.Limits != nil {
 			if ok, status, code, msg := g.Limits.Check(id, snap); !ok {
 				writeLimitError(w, status, code, msg)
@@ -147,7 +169,9 @@ func (g *Server) ServeAuthed(w http.ResponseWriter, r *http.Request, id *auth.Id
 			return
 		}
 	}
-	ctx := withTrace(context.WithValue(r.Context(), identityKey, id), newTrace(w, r))
+	tr := newTrace(w, r)
+	tr.ClientIP = g.clientIP(r)
+	ctx := withTrace(context.WithValue(r.Context(), identityKey, id), tr)
 	g.handleProxy(w, r.WithContext(ctx))
 }
 

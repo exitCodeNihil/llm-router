@@ -120,6 +120,7 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 		s.UsersByID[id].TeamModels = nil
 	}
 
+	keysByID := map[string]*Key{}
 	rows, err = b.Pool.Query(ctx, `
 		SELECT id, key_hash, key_prefix, name, user_id, team_id, allowed_models,
 		       budget_usd, budget_period, rpm_limit, tpm_limit, expires_at, tags
@@ -148,9 +149,13 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 			copy(h[:], hash)
 			s.KeysByHash[h] = k
 		}
+		keysByID[k.ID] = k
 	}
 	if rows.Err() != nil {
 		return nil, rows.Err()
+	}
+	if err := b.loadOldHashes(ctx, s, keysByID); err != nil {
+		return nil, err
 	}
 
 	providers := map[string]*Provider{}
@@ -252,19 +257,20 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 	if err := b.Pool.QueryRow(ctx, `SELECT value FROM settings WHERE key='telemetry'`).Scan(&telemetryRaw); err == nil {
 		s.Telemetry = parseTelemetry(telemetryRaw)
 	}
+	s.Telemetry.Compile()
 
 	if err := b.loadDestinations(ctx, s); err != nil {
 		return nil, err
 	}
 
-	rows, err = b.Pool.Query(ctx, `SELECT id, name, region, allowed_teams, data_rule FROM gateway_groups`)
+	rows, err = b.Pool.Query(ctx, `SELECT id, name, region, strict_region, allowed_teams, data_rule FROM gateway_groups`)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		g := &GatewayGroup{}
 		var teams []string
-		if err := rows.Scan(&g.ID, &g.Name, &g.Region, &teams, &g.DataRule); err != nil {
+		if err := rows.Scan(&g.ID, &g.Name, &g.Region, &g.StrictRegion, &teams, &g.DataRule); err != nil {
 			return nil, err
 		}
 		if len(teams) > 0 {
@@ -337,6 +343,41 @@ var spendTotalStart = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
 // loadSpend caches current-period spend for every scope that has a budget, for
 // O(1) budget checks. It reads one row per scope: today's from spend_counters,
 // this month's and the all-time one from spend_totals.
+// loadOldHashes adds the secrets of rotated keys still in their grace
+// period, each pointing at a copy of its (enabled) key that expires when the
+// grace ends: ResolveKey refuses it from then on without waiting for a rebuild.
+func (b *Builder) loadOldHashes(ctx context.Context, s *Snapshot, keysByID map[string]*Key) error {
+	rows, err := b.Pool.Query(ctx, `SELECT key_hash, key_id, expires_at FROM api_key_old_hashes WHERE expires_at > now()`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var hash []byte
+		var keyID string
+		var until time.Time
+		if err := rows.Scan(&hash, &keyID, &until); err != nil {
+			return err
+		}
+		k := keysByID[keyID] // nil: disabled, so its old secrets are not served either
+		if k == nil || len(hash) != sha256.Size {
+			continue
+		}
+		var h [32]byte
+		copy(h[:], hash)
+		if s.KeysByHash[h] != nil {
+			continue
+		}
+		old := *k
+		old.OldHash = true
+		if k.ExpiresAt == nil || until.Before(*k.ExpiresAt) {
+			old.ExpiresAt = &until
+		}
+		s.KeysByHash[h] = &old
+	}
+	return rows.Err()
+}
+
 func (b *Builder) loadSpend(ctx context.Context, s *Snapshot) error {
 	// The budgeted scopes, by the period their budget runs over.
 	type scopes struct{ types, ids []string }
@@ -360,7 +401,9 @@ func (b *Builder) loadSpend(ctx context.Context, s *Snapshot) error {
 		to.types, to.ids = append(to.types, scopeType), append(to.ids, scopeID)
 	}
 	for _, k := range s.KeysByHash {
-		add("key", k.ID, k.BudgetUSD, k.BudgetPeriod)
+		if !k.OldHash {
+			add("key", k.ID, k.BudgetUSD, k.BudgetPeriod)
+		}
 	}
 	for _, u := range s.UsersByID {
 		add("user", u.ID, u.BudgetUSD, u.BudgetPeriod)
@@ -373,6 +416,7 @@ func (b *Builder) loadSpend(ctx context.Context, s *Snapshot) error {
 	}
 
 	now := time.Now().UTC()
+	s.SpendAt = now // before the queries: a reading is never dated later than it was taken
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
 

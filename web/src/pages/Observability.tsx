@@ -52,6 +52,7 @@ import { int, money } from "../lib/format";
 import { Empty, ErrorState, Loading, Page } from "../components/Page";
 import { Confirm } from "../components/dialogs";
 import { EntityPicker } from "../components/EntityPicker";
+import { RedactionCard } from "../components/RedactionCard";
 import { CONTROL_PLANE, DestinationDialog } from "../components/DestinationDialog";
 import { IconEdit, IconPlus, IconTrash } from "../components/icons";
 
@@ -540,7 +541,7 @@ export default function Observability() {
 
   async function savePolicy() {
     try {
-      await save.mutateAsync({ mode, capture_content: captureContent, rules });
+      await save.mutateAsync({ ...saved!, mode, capture_content: captureContent, rules });
       showToast({ body: "Capture policy applied" });
     } catch (err) {
       showToast({ body: err instanceof Error ? err.message : "Failed", type: "error" });
@@ -855,6 +856,8 @@ export default function Observability() {
             )}
           </VStack>
         </Card>
+
+        <RedactionCard />
 
         {/* Live export feed */}
         <Card padding={0}>

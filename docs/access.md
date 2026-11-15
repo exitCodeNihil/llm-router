@@ -16,6 +16,14 @@ owner; team name). Without `limit` they answer the full array as before, and `q`
 `limit` is a 400. Paged keys also carry `user_email` and `team_name`. `POST /api/lookup` turns ids into
 names: `{"users": [...], "keys": [...], "teams": [...]}`, at most 100 of each kind.
 
+**Rotate** (the arrow on a key's row, or `POST /api/keys/{id}/rotate` with `{"grace_hours": N}`, 0
+to 720, default 24) gives a key a new secret, shown once. The key keeps its id, owner, limits and
+usage. The old secret keeps working until the grace period ends, so clients can move over without an
+outage, and the row says until when. Rotating again during a grace period starts another one; the
+older secret still stops at its own time. **Now** (grace 0) stops the old secret, and any from earlier
+rotations, at once: use it when a key has leaked. An old secret never outlives the key's own expiry,
+and a disabled key serves none. Who may rotate a key is who may edit it.
+
 ## Who may call which model
 
 **Allowed models** can be set on a team, a user and a key. Empty means everything.
@@ -53,6 +61,18 @@ Keycloak). **Auto-create users** provisions people on their first sign-in.
 The client secret is stored encrypted with `LLMR_ENCRYPTION_KEY` and never shown again. If that key
 changes, the secret can no longer be read: SSO sign-in stops, the error is logged, and the settings
 page asks for the secret again.
+
+Sign-in uses the authorization code flow with PKCE (S256), a nonce checked against the ID token, and a
+state value; all three are kept in short-lived HttpOnly cookies and cleared by the callback.
+
+Console sessions last 12 hours. **Sign out** ends that session on the server, not just in the
+browser: a copied cookie stops working too. **Sign out everywhere** ends every session of an account:
+on **Account settings** for yourself (`POST /api/me/sign-out`), and on a row of **Users** for an admin
+(`POST /api/users/{id}/sign-out`). It also happens on its own when a password is changed (your own
+session carries on; an admin's reset signs the user out) and when a user is disabled, so enabling the
+account again does not bring old sessions back. API keys are not affected. A workspace IDE that is
+already open stays connected until it is closed or reloaded: revocation applies to each new request,
+not to a connection already open.
 
 ## Deleting and erasing users
 

@@ -13,6 +13,7 @@ import (
 
 	"github.com/exitcodenihil/llm-router/internal/console"
 	"github.com/exitcodenihil/llm-router/internal/provider"
+	"github.com/exitcodenihil/llm-router/internal/redact"
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
 )
 
@@ -318,7 +319,32 @@ func (m *Server) getTelemetry(w http.ResponseWriter, r *http.Request) {
 	if cfg.Rules == nil {
 		cfg.Rules = []snapshot.TelemetryRule{}
 	}
+	if cfg.Redaction.Custom == nil {
+		cfg.Redaction.Custom = []redact.Pattern{}
+	}
 	writeJSON(w, http.StatusOK, cfg)
+}
+
+// testRedaction shows what a redaction, saved or not, does to sample text.
+func (m *Server) testRedaction(w http.ResponseWriter, r *http.Request) {
+	req, ok := decode[struct {
+		Redaction redact.Config `json:"redaction"`
+		Text      string        `json:"text"`
+	}](w, r)
+	if !ok {
+		return
+	}
+	if len(req.Text) > 64<<10 {
+		httpError(w, http.StatusBadRequest, "sample text is limited to 64 KiB")
+		return
+	}
+	req.Redaction.Enabled = true
+	red, err := redact.Compile(req.Redaction)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"text": red.String(req.Text)})
 }
 
 func (m *Server) putTelemetry(w http.ResponseWriter, r *http.Request) {
@@ -353,6 +379,16 @@ func checkPolicy(cfg *snapshot.Telemetry) error {
 	if cfg.Rules == nil {
 		cfg.Rules = []snapshot.TelemetryRule{}
 	}
+	if cfg.Redaction.Custom == nil {
+		cfg.Redaction.Custom = []redact.Pattern{}
+	}
+	// Refused here, so a pattern that can't run is never stored: a stored one
+	// that can't be compiled stops content export altogether.
+	check := cfg.Redaction
+	check.Enabled = true
+	if _, err := redact.Compile(check); err != nil {
+		return fmt.Errorf("redaction: %v", err)
+	}
 	for i := range cfg.Rules {
 		rule := &cfg.Rules[i]
 		if rule.ID == "" {
@@ -375,14 +411,36 @@ func checkPolicy(cfg *snapshot.Telemetry) error {
 
 // --- usage dashboards ---
 
-// usageScope returns a WHERE fragment limiting rows to what the caller may see.
+// usageScope returns a WHERE fragment limiting aggregated usage to what the
+// caller may see: their own, and that of every team they are in.
 func usageScope(c *Caller, args *[]any) string {
 	if c.IsAdmin {
 		return "TRUE"
 	}
 	*args = append(*args, c.UserID)
-	n := strconv.Itoa(len(*args))
-	return `(user_id = $` + n + ` OR team_id = ANY(SELECT team_id FROM team_members WHERE user_id = $` + n + `))`
+	return scopeSQL("", "$"+strconv.Itoa(len(*args)), false)
+}
+
+// usageRowScope is usageScope for individual requests: a team's requests
+// only for an admin of that team.
+func usageRowScope(c *Caller, args *[]any) string {
+	if c.IsAdmin {
+		return "TRUE"
+	}
+	*args = append(*args, c.UserID)
+	return scopeSQL("", "$"+strconv.Itoa(len(*args)), true)
+}
+
+// scopeSQL is a non-admin's visibility over usage columns prefixed col:
+// their own rows plus their teams' — with rows, only the teams they
+// administer. user is the caller's id placeholder.
+func scopeSQL(col, user string, rows bool) string {
+	role := ""
+	if rows {
+		role = ` AND role = 'admin'`
+	}
+	return `(` + col + `user_id = ` + user + ` OR ` + col + `team_id = ANY(SELECT team_id FROM team_members WHERE user_id = ` +
+		user + role + `))`
 }
 
 func daysParam(r *http.Request) int {
@@ -482,7 +540,7 @@ func (m *Server) usageRecent(w http.ResponseWriter, r *http.Request) {
 		limit = 50
 	}
 	args := []any{limit}
-	scope := usageScope(c, &args)
+	scope := usageRowScope(c, &args)
 	m.list(w, r, fmt.Sprintf(`
 		SELECT ts, request_id, trace_id, model_name, api_key_id, user_id, team_id,
 		       prompt_tokens, completion_tokens, cost_usd, latency_ms, status_code, stream

@@ -82,8 +82,7 @@ func TestFlushRetriesUntilWritten(t *testing.T) {
 	}
 }
 
-// Every partition gets every index, and an invalid one left by an interrupted
-// build is replaced.
+// Every partition gets every index.
 func TestEnsureIndexesCoversEveryPartition(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
@@ -94,18 +93,7 @@ func TestEnsureIndexesCoversEveryPartition(t *testing.T) {
 	if err := w.EnsureIndexes(ctx); err != nil {
 		t.Fatal(err)
 	}
-	var missing int
-	if err := st.Pool.QueryRow(ctx, `
-		SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid,
-		       unnest($1::text[]) AS suffix
-		WHERE i.inhparent = 'usage_events'::regclass
-		  AND NOT coalesce((SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass(c.relname || suffix)), false)`,
-		[]string{"_team_ts", "_key_ts", "_user_ts", "_ts", "_request"}).Scan(&missing); err != nil {
-		t.Fatal(err)
-	}
-	if missing != 0 {
-		t.Fatalf("%d partition indexes missing or invalid", missing)
-	}
+	checkIndexes(t, st)
 }
 
 // Prune drops the months past the retention and nothing newer: not last

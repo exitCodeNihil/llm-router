@@ -52,7 +52,9 @@ var deploymentAuditFields = []string{"provider_id", "model_name", "upstream_name
 // URL, which can carry credentials of its own.
 var auditPolicy = map[string]detailPolicy{
 	"POST /api/me/password":         noDetail,
+	"POST /api/me/sign-out":         noDetail,
 	"POST /api/users/{id}/password": noDetail,
+	"POST /api/users/{id}/sign-out": noDetail,
 
 	"POST /api/users":                      keep(with(spendFields, "role")...),
 	"PATCH /api/users/{id}":                keep(with(spendFields, "role", "disabled")...),
@@ -67,6 +69,7 @@ var auditPolicy = map[string]detailPolicy{
 	"POST /api/keys":                       keep(with(spendFields, "name", "user_id", "team_id", "expires_at")...),
 	"PATCH /api/keys/{id}":                 keep(with(spendFields, "name", "expires_at", "disabled")...),
 	"DELETE /api/keys/{id}":                noDetail,
+	"POST /api/keys/{id}/rotate":           keep("grace_hours"), // the new secret is in the response only
 
 	"POST /api/providers":          noDetail,
 	"PATCH /api/providers/{id}":    noDetail,
@@ -94,8 +97,8 @@ var auditPolicy = map[string]detailPolicy{
 	"POST /api/workspaces/{id}/stop":           noDetail,
 	"POST /api/workspaces/{id}/upload":         noDetail, // multipart
 
-	"POST /api/gateway-groups":                   keep("name", "region", "allowed_teams", "data_rule"),
-	"PATCH /api/gateway-groups/{id}":             keep("name", "region", "allowed_teams", "data_rule"),
+	"POST /api/gateway-groups":                   keep("name", "region", "strict_region", "allowed_teams", "data_rule"),
+	"PATCH /api/gateway-groups/{id}":             keep("name", "region", "strict_region", "allowed_teams", "data_rule"),
 	"POST /api/gateway-groups/{id}/rotate-token": noDetail,
 	"DELETE /api/gateway-groups/{id}":            noDetail,
 	"DELETE /api/gateway-instances/{id}":         noDetail,
@@ -117,9 +120,11 @@ var auditSkip = map[string]bool{
 	"POST /api/chat/completions": true,
 	"POST /api/chats":            true,
 	"POST /api/lookup":           true, // a read: POST only so the ids fit in the body
-	"PUT /api/chats/{id}":        true,
-	"DELETE /api/chats/{id}":     true,
-	"/api/workspaces/{id}/ide/":  true,
+	// A dry run on sample text, which may be a real secret: nothing changes.
+	"POST /api/settings/telemetry/redaction-test": true,
+	"PUT /api/chats/{id}":                         true,
+	"DELETE /api/chats/{id}":                      true,
+	"/api/workspaces/{id}/ide/":                   true,
 }
 
 // maxDetailBytes bounds the stored detail; past it only field names are kept.

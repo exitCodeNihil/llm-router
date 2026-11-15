@@ -16,6 +16,7 @@ import { Selector } from "@astryxdesign/core/Selector";
 import { MultiSelector } from "@astryxdesign/core/MultiSelector";
 import { Timestamp } from "@astryxdesign/core/Timestamp";
 import { Tooltip } from "@astryxdesign/core/Tooltip";
+import { SegmentedControl, SegmentedControlItem } from "@astryxdesign/core/SegmentedControl";
 import { useToast } from "@astryxdesign/core/Toast";
 
 import type { ApiKey, Me, TelemetryDestination, TelemetryPolicy } from "../lib/types";
@@ -26,11 +27,12 @@ import {
   useDeployments,
   useDestinations,
   useKeysPage,
+  useRotateKey,
   useTeams,
   useTelemetry,
   useUpdateKey,
 } from "../lib/hooks";
-import { budgetLabel } from "../lib/format";
+import { budgetLabel, dateTime } from "../lib/format";
 import { Empty, ErrorState, Loading, Page } from "../components/Page";
 import { Confirm, FormActions, FormDialog } from "../components/dialogs";
 import { ConnectDialog } from "../components/connect";
@@ -48,6 +50,7 @@ import {
 import {
   IconEdit,
   IconPlus,
+  IconRotate,
   IconTerminal,
   IconTrash,
 } from "../components/icons";
@@ -56,8 +59,75 @@ import { EntityPicker } from "../components/EntityPicker";
 
 type OwnerType = "self" | "team" | "user";
 
-/** What key creation hands back: the secret and the models it was scoped to. */
-type Created = { key: string; models: string[] | null };
+/**
+ * What key creation (or rotation) hands back: the secret and the models it
+ * was scoped to. A rotation also says until when the old secret works.
+ */
+type Created = {
+  key: string;
+  models: string[] | null;
+  rotated?: { oldUntil: string | null };
+};
+
+/** When the old secret stops working, in hours from now. */
+const GRACE_OPTIONS = [
+  { value: "0", label: "Now" },
+  { value: "1", label: "1 hour" },
+  { value: "24", label: "24 hours" },
+  { value: "168", label: "7 days" },
+];
+
+function RotateForm({
+  apiKey,
+  onClose,
+  onSecret,
+}: {
+  apiKey: ApiKey;
+  onClose: () => void;
+  onSecret: (c: Created) => void;
+}) {
+  const rotate = useRotateKey();
+  const showToast = useToast();
+  const [grace, setGrace] = useState("24");
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    try {
+      const res = await rotate.mutateAsync({ id: apiKey.id, grace_hours: Number(grace) });
+      onClose();
+      onSecret({
+        key: res.key,
+        models: apiKey.allowed_models,
+        rotated: { oldUntil: res.old_key_expires_at },
+      });
+    } catch (err) {
+      showToast({ body: err instanceof Error ? err.message : "Failed", type: "error" });
+    }
+  }
+
+  return (
+    <form onSubmit={submit}>
+      <VStack gap={4}>
+        <SegmentedControl
+          label="The old secret stops working"
+          size="sm"
+          value={grace}
+          onChange={setGrace}
+        >
+          {GRACE_OPTIONS.map((o) => (
+            <SegmentedControlItem key={o.value} value={o.value} label={o.label} />
+          ))}
+        </SegmentedControl>
+        <Text type="supporting" color="secondary">
+          {grace === "0"
+            ? "Clients still on the old secret, or one from an earlier rotation, fail from now on. Use this when a key has leaked."
+            : "Both secrets work until then, so clients can move over without an outage. The key keeps its limits, usage and id."}
+        </Text>
+        <FormActions onCancel={onClose} submitLabel="Rotate" isLoading={rotate.isPending} />
+      </VStack>
+    </form>
+  );
+}
 
 function ownerLabel(k: ApiKey): string {
   const teamName = k.team_name ?? undefined;
@@ -404,6 +474,7 @@ export default function Keys({ me }: { me: Me }) {
   const [secret, setSecret] = useState<Created | null>(null);
   const [connecting, setConnecting] = useState<ApiKey | null>(null);
   const [deleting, setDeleting] = useState<ApiKey | null>(null);
+  const [rotating, setRotating] = useState<ApiKey | null>(null);
 
   const openCreate = () => {
     setEditing(null);
@@ -437,6 +508,11 @@ export default function Keys({ me }: { me: Me }) {
             {k.name || "—"}
           </Text>
           <Code>{k.key_prefix}…</Code>
+          {k.old_key_expires_at && !k.disabled && (
+            <Text type="supporting" color="secondary" maxLines={1}>
+              Old key works until {dateTime(k.old_key_expires_at)}
+            </Text>
+          )}
         </VStack>
       ),
     },
@@ -505,7 +581,7 @@ export default function Keys({ me }: { me: Me }) {
     {
       key: "actions",
       header: <VisuallyHidden>Actions</VisuallyHidden>,
-      width: pixel(120),
+      width: pixel(152),
       align: "end",
       renderCell: (k) => (
         <HStack gap={1} vAlign="center" hAlign="end">
@@ -527,6 +603,13 @@ export default function Keys({ me }: { me: Me }) {
                   setEditing(k);
                   setShowForm(true);
                 }}
+              />
+              <IconButton
+                label={`Rotate ${k.name}`}
+                variant="ghost"
+                size="sm"
+                icon={<Icon icon={IconRotate} size="sm" />}
+                onClick={() => setRotating(k)}
               />
               <IconButton
                 label={`Delete ${k.name}`}
@@ -624,11 +707,28 @@ export default function Keys({ me }: { me: Me }) {
         </FormDialog>
       )}
 
+      {rotating && (
+        <FormDialog
+          isOpen
+          onClose={() => setRotating(null)}
+          title="Rotate key"
+          subtitle={`A new secret for "${rotating.name || rotating.key_prefix}", shown once.`}
+        >
+          <RotateForm apiKey={rotating} onClose={() => setRotating(null)} onSecret={setSecret} />
+        </FormDialog>
+      )}
+
       {secret && (
         <ConnectDialog
           secret={secret.key}
           allowedModels={secret.models}
           onClose={() => setSecret(null)}
+          {...(secret.rotated && {
+            title: "API key rotated",
+            subtitle: secret.rotated.oldUntil
+              ? `This is the only time the new key is shown. The old one works until ${dateTime(secret.rotated.oldUntil)}.`
+              : "This is the only time the new key is shown. The old one no longer works.",
+          })}
         />
       )}
       {connecting && (

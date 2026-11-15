@@ -95,6 +95,11 @@ export const IconLogout = (p: SVGProps<SVGSVGElement>) => (
     <path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l-5-5 5-5M4 12h11" />
   </svg>
 );
+export const IconRotate = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...base(p)}>
+    <path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v5h-5" />
+  </svg>
+);
 export const IconEdit = (p: SVGProps<SVGSVGElement>) => (
   <svg {...base(p)}>
     <path d="M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17v3z" />

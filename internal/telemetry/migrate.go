@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
+	"github.com/exitcodenihil/llm-router/internal/store"
 )
 
 // legacyLock serializes the migration across control planes starting at once.
@@ -108,7 +108,7 @@ func insertLegacy(ctx context.Context, tx pgx.Tx, encryptionKey, host, publicKey
 	if _, err := tx.Exec(ctx, `INSERT INTO telemetry_destinations
 		(id, name, kind, enabled, endpoint, config, secrets_enc, secret_names, content_mode)
 		VALUES ($1,$2,'langfuse',$3,$4,$5,$6,$7,'content')`,
-		uuid.New(), name, enabled, host, cfg, enc, append([]string{}, names...)); err != nil {
+		store.NewID(), name, enabled, host, cfg, enc, append([]string{}, names...)); err != nil {
 		return fmt.Errorf("migrate Langfuse settings: %w", err)
 	}
 	slog.Info("moved the Langfuse exporter settings into a telemetry destination", "name", name, "enabled", enabled)

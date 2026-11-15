@@ -201,6 +201,34 @@ func TestReplayStoresEachRequestOnce(t *testing.T) {
 		t.Fatalf("a replay set last_batch to %d", batch)
 	}
 
+	// A client address is stored only when the setting is on, and one that
+	// is not an address is dropped rather than refusing the row.
+	clientIP := func(id string) *string {
+		t.Helper()
+		var ip *string
+		if err := st.Pool.QueryRow(ctx, `SELECT host(client_ip) FROM usage_events WHERE request_id=$1`, id).Scan(&ip); err != nil {
+			t.Fatal(err)
+		}
+		return ip
+	}
+	off, on, bad := ev(teamA), ev(teamA), ev(teamA)
+	off.ClientIP, on.ClientIP, bad.ClientIP = "203.0.113.7", "2001:db8::7", "not-an-address"
+	replay(second.Session, off)
+	s.RecordClientIP = true
+	if r := replay(second.Session, on, bad); r.Stored != 2 {
+		t.Fatalf("replay with addresses: %+v", r)
+	}
+	s.RecordClientIP = false
+	if ip := clientIP(off.RequestID); ip != nil {
+		t.Fatalf("client address stored with the setting off: %s", *ip)
+	}
+	if ip := clientIP(on.RequestID); ip == nil || *ip != "2001:db8::7" {
+		t.Fatalf("client address %v, want 2001:db8::7", ip)
+	}
+	if ip := clientIP(bad.RequestID); ip != nil {
+		t.Fatalf("an invalid address was stored: %s", *ip)
+	}
+
 	// A body that is not a replay is the one data error answered 4xx; a
 	// removed instance is told to join again.
 	req, _ := http.NewRequest("POST", srv.URL+"/gw/v1/replay", bytes.NewReader([]byte("{not json")))

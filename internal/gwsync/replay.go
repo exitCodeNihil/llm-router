@@ -65,6 +65,9 @@ func (s *Server) accept(snap *snapshot.Snapshot, g *snapshot.GatewayGroup, enc *
 			fixed++
 		}
 		e.GatewayID, e.GatewayGroupID = p.instance, p.group
+		if !s.RecordClientIP {
+			e.ClientIP = ""
+		}
 		if e.TraceID == "" {
 			e.TraceID = usage.TraceIDFor(e.RequestID) // gateways before 0.3.0 send none
 		}

@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
+	"github.com/exitcodenihil/llm-router/internal/store"
 	"github.com/exitcodenihil/llm-router/internal/workspace"
 )
 
@@ -35,7 +36,7 @@ func (m *Server) createWorkspaceTemplate(w http.ResponseWriter, r *http.Request)
 		httpError(w, http.StatusBadRequest, "name and image are required")
 		return
 	}
-	id := uuid.New()
+	id := store.NewID()
 	if _, err := m.Store.Pool.Exec(r.Context(), `
 		INSERT INTO workspace_templates (id, name, description, image, dockerfile, source)
 		VALUES ($1, $2, $3, $4, $5, 'admin')`,

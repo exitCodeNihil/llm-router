@@ -8,6 +8,9 @@ package store
 const (
 	LockMigrate  int64 = 0x6c6c6d726d6967 // "llmrmig": schema migrations
 	LockMaintain int64 = 0x6c6c6d726d6e74 // "llmrmnt": partition indexes and retention
+	// LockPartitions keeps two control planes from creating the same monthly
+	// partitions at once, each from bounds read before the other's existed.
+	LockPartitions int64 = 0x6c6c6d72707274 // "llmrprt"
 	// LockSSOSecret is a transaction lock, for the one-time encryption of the
 	// SSO client secret.
 	LockSSOSecret int64 = 0x6c6c6d72737363 // "llmrssc"

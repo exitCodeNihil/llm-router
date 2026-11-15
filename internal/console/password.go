@@ -6,8 +6,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/exitcodenihil/llm-router/internal/store"
 )
 
 // Password auth: first-run setup creates the initial admin; after that,
@@ -75,7 +76,7 @@ func (a *Auth) handleSetup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "hashing failed", http.StatusInternalServerError)
 		return
 	}
-	id := uuid.New()
+	id := store.NewID()
 	// One statement, so two concurrent setup calls cannot both win.
 	tag, err := a.Store.Pool.Exec(r.Context(),
 		`INSERT INTO users (id, email, name, role, password_hash)
@@ -90,7 +91,7 @@ func (a *Auth) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	adminID, adminEmail = id.String(), req.Email
-	setSessionCookie(w, r, a.EncryptionKey, a.CookieDomain, id.String())
+	SetSessionCookie(w, r, a.EncryptionKey, a.CookieDomain, id.String(), 0)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -127,9 +128,10 @@ func (a *Auth) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	var userID string
 	var hash []byte
+	var epoch int
 	err := a.Store.Pool.QueryRow(r.Context(),
-		`SELECT id, password_hash FROM users WHERE email=$1 AND NOT disabled`, req.Email).
-		Scan(&userID, &hash)
+		`SELECT id, password_hash, session_epoch FROM users WHERE email=$1 AND NOT disabled`, req.Email).
+		Scan(&userID, &hash, &epoch)
 	if err != nil || len(hash) == 0 ||
 		bcrypt.CompareHashAndPassword(hash, []byte(req.Password)) != nil {
 		http.Error(w, "incorrect email or password", http.StatusUnauthorized)
@@ -137,7 +139,7 @@ func (a *Auth) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	lim.succeeded(ip, email)
 	signedIn, signedInEmail = userID, req.Email
-	setSessionCookie(w, r, a.EncryptionKey, a.CookieDomain, userID)
+	SetSessionCookie(w, r, a.EncryptionKey, a.CookieDomain, userID, epoch)
 	w.WriteHeader(http.StatusNoContent)
 }
 

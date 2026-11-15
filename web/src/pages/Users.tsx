@@ -24,6 +24,7 @@ import {
   useDeletedUsers,
   useEraseUser,
   useSetUserPassword,
+  useSignOutUser,
   useUpdateUser,
   useUsersPage,
 } from "../lib/hooks";
@@ -41,7 +42,7 @@ import {
   limitsPayload,
   type LimitsState,
 } from "../components/forms";
-import { IconEdit, IconPlus, IconTrash } from "../components/icons";
+import { IconEdit, IconLogout, IconPlus, IconTrash } from "../components/icons";
 import { LoadMore, SearchBox, useServerSearch } from "../components/tables";
 
 function UserForm({
@@ -158,7 +159,7 @@ function UserForm({
           }
           description={
             editing
-              ? "Sets a new password for this user; they are not signed out."
+              ? "Sets a new password for this user and signs them out everywhere."
               : "Leave blank if they will sign in with SSO. An admin can set one later from Edit."
           }
           status={
@@ -290,6 +291,8 @@ export default function Users() {
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState<User | null>(null);
   const [deleting, setDeleting] = useState<User | null>(null);
+  const [signingOut, setSigningOut] = useState<User | null>(null);
+  const signOut = useSignOutUser();
 
   // Confirmed rather than applied on click: disabling locks someone out of the
   // console and kills their keys; enabling hands all of it back.
@@ -376,10 +379,17 @@ export default function Users() {
     {
       key: "actions",
       header: <VisuallyHidden>Actions</VisuallyHidden>,
-      width: pixel(88),
+      width: pixel(120),
       align: "end",
       renderCell: (u) => (
         <HStack gap={1} hAlign="end">
+          <IconButton
+            label={`Sign ${u.email} out everywhere`}
+            variant="ghost"
+            size="sm"
+            icon={<Icon icon={IconLogout} size="sm" />}
+            onClick={() => setSigningOut(u)}
+          />
           <IconButton
             label={`Edit ${u.email}`}
             variant="ghost"
@@ -492,6 +502,28 @@ export default function Users() {
           if (!toggling) return;
           await toggle(toggling);
           setToggling(null);
+        }}
+      />
+
+      <Confirm
+        target={signingOut}
+        title="Sign out everywhere"
+        description={`End every console session of ${signingOut?.email}? They have to sign in again; their API keys keep working. An IDE already open stays connected until it is closed.`}
+        actionLabel="Sign out"
+        isLoading={signOut.isPending}
+        onCancel={() => setSigningOut(null)}
+        onConfirm={async () => {
+          if (!signingOut) return;
+          try {
+            await signOut.mutateAsync(signingOut.id);
+            showToast({ body: `${signingOut.email} signed out everywhere` });
+          } catch (err) {
+            showToast({
+              body: err instanceof Error ? err.message : "Failed",
+              type: "error",
+            });
+          }
+          setSigningOut(null);
         }}
       />
 

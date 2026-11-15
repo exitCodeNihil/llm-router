@@ -109,7 +109,9 @@ exactly like the control plane's own `/v1`. A group can:
 - **serve only some teams.** Their keys, and their members' own keys, work; others get a 401. A
   team's gateways receive only the providers their models need.
 - **prefer a region.** Deployments with the same region label are tried first, then the rest in
-  the usual order.
+  the usual order. With **Only this region** on, the group's gateways use no other deployments
+  and are not sent their credentials; a model with no deployment in the region is not served
+  there. The control plane's own `/v1` has no region and is not affected.
 - **limit telemetry.** Never capture prompts and responses, or never export at all.
 
 Limits and budgets stay on keys, users and teams, and hold across every gateway. Each gateway syncs
@@ -246,7 +248,10 @@ For llm-router itself (the gateways have [their own](#gateways)):
 | `LLMR_LOG_LEVEL` | Least severe level logged: `debug`, `info` (default), `warn` or `error`. Health checks, metrics scrapes and gateway syncs are logged at `debug` |
 | `LLMR_LOG_FORMAT` | `text` (default) or `json`, one object per line |
 | `LLMR_USAGE_RETENTION_MONTHS` | Months of individual requests to keep, besides the current one; older months are deleted. `0` (default) keeps them for ever; otherwise at least 2. See [Usage data](#usage-data) |
+| `LLMR_USAGE_CLIENT_IP` | `true` stores each request's client address with its usage row: the connecting address, or what a proxy in `LLMR_TRUSTED_PROXIES` forwarded for. For a gateway's requests it is the address the gateway reports. Default `false`: the address is personal data. Daily and hourly totals never hold it |
 | `LLMR_ROLLUP_RETENTION_MONTHS` | Months of daily totals and per-day spend to keep. `0` (default) keeps them for ever; otherwise at least 3 |
+| `LLMR_TELEMETRY_CONCURRENCY` | Batches sent at once to each [telemetry destination](observability.md#delivery), 1 to 16. Default `4` |
+| `LLMR_TELEMETRY_DRAIN` | How long a shutdown keeps delivering queued telemetry, up to `5m`. Default `20s`; keep the pod's termination grace period above it plus 15 seconds |
 | `LLMR_AUDIT_RETENTION_MONTHS` | Months of the [audit log](access.md#audit-log) to keep; older rows are deleted twice a day. `0` (default) keeps it for ever. Chart: `retention.auditMonths` |
 | `LLMR_SEED_CLAUDE_SUBSCRIPTION` | `1` adds the [subscription pass-through](clients.md#on-your-claudeai-subscription) provider and models |
 | `LLMR_IDE_LISTEN`, `LLMR_IDE_ORIGIN`, `LLMR_COOKIE_DOMAIN` | [Workspace IDE](workspaces.md) listener, its public origin, and the session cookie domain when it is another hostname |

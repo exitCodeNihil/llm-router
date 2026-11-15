@@ -2,10 +2,22 @@ package snapshot
 
 import (
 	"hash/fnv"
+	"log/slog"
 	"slices"
 	"sort"
 	"strings"
+
+	"github.com/exitcodenihil/llm-router/internal/redact"
 )
+
+// Compile prepares the policy's redaction. Call it once after loading.
+func (t *Telemetry) Compile() {
+	r, err := redact.Compile(t.Redaction)
+	if err != nil {
+		slog.Error("telemetry redaction can't be used; content is not exported until it is saved again", "err", err)
+	}
+	t.redactor, t.withhold = r, err != nil
+}
 
 // Telemetry is the capture policy (settings key 'telemetry'). It applies
 // before every destination: a request it doesn't export reaches none of them,
@@ -18,7 +30,17 @@ type Telemetry struct {
 	Mode           string          `json:"mode"`
 	CaptureContent bool            `json:"capture_content"` // for "everything" mode
 	Rules          []TelemetryRule `json:"rules"`
+	// Redaction is applied to captured content before any destination gets it.
+	Redaction redact.Config `json:"redaction"`
+	// redactor is Redaction compiled; withhold is set when it can't be, and
+	// content is then not exported at all.
+	redactor *redact.Redactor
+	withhold bool
 }
+
+// Redactor is the compiled redaction, nil when off. ok is false when the
+// stored redaction can't be compiled: content must then stay in.
+func (t Telemetry) Redactor() (r *redact.Redactor, ok bool) { return t.redactor, !t.withhold }
 
 // TelemetryRule is one ordered export rule (by_rule mode).
 type TelemetryRule struct {

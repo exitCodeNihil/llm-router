@@ -46,9 +46,21 @@ func NewManager(h *snapshot.Holder, pool *pgxpool.Pool) *Manager {
 	return &Manager{Snapshots: h, Pool: pool, p: defaultPolicy, ctx: context.Background()}
 }
 
+// SetDelivery sets how many batches each destination is sent at once (1 to
+// 16) and how long a shutdown keeps delivering. Call it before Run.
+func (m *Manager) SetDelivery(parallel int, drain time.Duration) {
+	m.p.Parallel = min(max(parallel, 1), 16)
+	if drain > 0 {
+		m.p.Drain = drain
+	}
+}
+
+// Drain is how long Run may take to return after its context ends.
+func (m *Manager) Drain() time.Duration { return m.p.Drain }
+
 // Run applies destination changes from the snapshot as they arrive. When ctx
-// ends it makes one last attempt at what is queued, about 5 seconds at most,
-// and returns once that is done: cancel it after the last event is written.
+// ends it delivers what is queued, for at most the drain time, and returns
+// once that is done: cancel it after the last event is written.
 func (m *Manager) Run(ctx context.Context) {
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
@@ -180,7 +192,8 @@ func (m *Manager) Write(e usage.Event) {
 	if rule == "no_export" {
 		return
 	}
-	allowContent := e.CaptureContent && rule == "inherit"
+	redactor, ok := snap.Telemetry.Redactor()
+	allowContent := e.CaptureContent && rule == "inherit" && ok
 	type target struct {
 		w       *worker
 		max     int
@@ -203,6 +216,10 @@ func (m *Manager) Write(e usage.Event) {
 	}
 	if !anyContent {
 		e.Input, e.Output, e.System = nil, "", nil // no queue holds on to it
+	} else if redactor != nil {
+		// Once, before any queue: no destination, retry or recent-export
+		// view ever holds the original.
+		e.Input, e.System, e.Output = redactor.JSON(e.Input), redactor.JSON(e.System), redactor.String(e.Output)
 	}
 	e.CaptureContent = anyContent
 	it := &Item{E: e, Group: group}

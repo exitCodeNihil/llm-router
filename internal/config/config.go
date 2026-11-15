@@ -49,6 +49,13 @@ type Config struct {
 	// AuditRetentionMonths is how many months of the audit log are kept.
 	// Zero keeps it for ever.
 	AuditRetentionMonths int
+	// UsageClientIP stores each request's client address with its usage.
+	// Off by default: the address is personal data.
+	UsageClientIP bool
+	// TelemetryConcurrency is how many batches each telemetry destination is
+	// sent at once; TelemetryDrain how long a shutdown keeps delivering.
+	TelemetryConcurrency int
+	TelemetryDrain       time.Duration
 
 	// LogLevel is the least severe level logged; LogJSON writes one JSON
 	// object per line instead of text.
@@ -108,6 +115,22 @@ func Load(args []string) (*Config, error) {
 	}
 	if c.AuditRetentionMonths, err = envInt("LLMR_AUDIT_RETENTION_MONTHS"); err != nil {
 		return nil, err
+	}
+	if v := os.Getenv("LLMR_USAGE_CLIENT_IP"); v != "" {
+		if c.UsageClientIP, err = strconv.ParseBool(v); err != nil {
+			return nil, fmt.Errorf("LLMR_USAGE_CLIENT_IP must be true or false")
+		}
+	}
+	c.TelemetryConcurrency, c.TelemetryDrain = 4, 20*time.Second
+	if v := os.Getenv("LLMR_TELEMETRY_CONCURRENCY"); v != "" {
+		if c.TelemetryConcurrency, err = strconv.Atoi(v); err != nil || c.TelemetryConcurrency < 1 || c.TelemetryConcurrency > 16 {
+			return nil, fmt.Errorf("LLMR_TELEMETRY_CONCURRENCY must be 1 to 16")
+		}
+	}
+	if v := os.Getenv("LLMR_TELEMETRY_DRAIN"); v != "" {
+		if c.TelemetryDrain, err = time.ParseDuration(v); err != nil || c.TelemetryDrain <= 0 || c.TelemetryDrain > 5*time.Minute {
+			return nil, fmt.Errorf("LLMR_TELEMETRY_DRAIN must be a duration up to 5m, like 20s")
+		}
 	}
 	if v := os.Getenv("LLMR_DB_CONSOLE_TIMEOUT"); v != "" {
 		if c.DBConsoleTimeout, err = time.ParseDuration(v); err != nil || c.DBConsoleTimeout <= 0 {

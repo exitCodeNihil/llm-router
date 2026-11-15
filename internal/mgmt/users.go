@@ -57,6 +57,15 @@ func (m *Server) patchUser(w http.ResponseWriter, r *http.Request) {
 	if !m.applyPatch(w, r, "users", id, userPatchCols, fields) {
 		return
 	}
+	if disable {
+		// Disabled users are refused anyway; the epoch makes sure enabling
+		// the account again does not bring its old sessions back.
+		if _, err := m.Store.Pool.Exec(r.Context(),
+			`UPDATE users SET session_epoch=session_epoch+1 WHERE id=$1`, id); err != nil {
+			httpError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 	m.bump(r.Context())
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -227,10 +236,33 @@ func (m *Server) eraseUser(w http.ResponseWriter, r *http.Request) {
 	// Gateways hold a hash of each user's email: the next config drops it.
 	m.bump(ctx)
 	notReached := []string{"application logs", "database backups", "traces already exported to telemetry destinations"}
+	if err := m.eraseClientIPs(ctx, id.String()); err != nil {
+		slog.Error("erasing client addresses failed", "user", id, "err", err)
+		notReached = append(notReached, "client addresses on some of the user's requests (erase again to finish)")
+	}
 	for _, s := range m.removeSandboxes(ctx, wsIDs) {
 		notReached = append(notReached, "workspace volume "+s)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"erased": true, "not_reached": notReached})
+}
+
+// eraseClientIPs clears the client address on the user's requests, where
+// LLMR_USAGE_CLIENT_IP stored one. In batches and outside the erase
+// transaction: there can be millions of rows, and a batch that fails is
+// finished by erasing again.
+func (m *Server) eraseClientIPs(ctx context.Context, userID string) error {
+	for {
+		tag, err := m.Store.Pool.Exec(ctx, `
+			UPDATE usage_events SET client_ip = NULL
+			WHERE (ts, id) IN (SELECT ts, id FROM usage_events
+				WHERE user_id = $1 AND client_ip IS NOT NULL LIMIT 5000)`, userID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return nil
+		}
+	}
 }
 
 var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)

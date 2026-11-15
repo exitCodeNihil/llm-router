@@ -6,8 +6,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/exitcodenihil/llm-router/internal/store"
 )
 
 //go:embed templates/*.Dockerfile
@@ -44,7 +45,7 @@ func SeedTemplates(ctx context.Context, pool *pgxpool.Pool) error {
 			    dockerfile = EXCLUDED.dockerfile, updated_at = now()
 			WHERE workspace_templates.source = 'seed'
 			  AND workspace_templates.dockerfile IS DISTINCT FROM EXCLUDED.dockerfile`,
-			uuid.New(), t.Name, t.Description, t.Image, strings.TrimSpace(string(df))+"\n"); err != nil {
+			store.NewID(), t.Name, t.Description, t.Image, strings.TrimSpace(string(df))+"\n"); err != nil {
 			return fmt.Errorf("seed template %s: %w", t.Name, err)
 		}
 	}

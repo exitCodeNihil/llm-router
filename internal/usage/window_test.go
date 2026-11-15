@@ -58,9 +58,48 @@ func TestSanitize(t *testing.T) {
 	if big.PromptTokens != math.MaxInt32 || big.NotionalCostUSD != 0 || big.RequestID != "rid" || big.DeploymentID != "" {
 		t.Fatalf("got %+v", big)
 	}
-	ok := Event{RequestID: "req_1", ModelName: "m", StatusCode: 200}
+	ok := Event{RequestID: "req_1", ModelName: "m", StatusCode: 200, ClientIP: "2001:db8::1"}
 	if n := Sanitize(&ok); n != 0 {
 		t.Fatalf("a valid event changed %d fields", n)
+	}
+	// Postgres would refuse the row over an address inet cannot hold.
+	for _, ip := range []string{"not-an-ip", "10.0.0.1:443", "fe80::1%eth0", "10.0.0.0/8"} {
+		e := Event{RequestID: "r", ModelName: "m", ClientIP: ip}
+		if n := Sanitize(&e); n != 1 || e.ClientIP != "" {
+			t.Errorf("client_ip %q: kept as %q, %d fixed", ip, e.ClientIP, n)
+		}
+	}
+}
+
+func TestEventSpan(t *testing.T) {
+	d := func(s string) time.Time {
+		t, err := time.Parse("2006-01-02 15:04", s)
+		if err != nil {
+			panic(err)
+		}
+		return t
+	}
+	jan := d("2027-01-01 00:00")
+	for _, c := range []struct {
+		name     string
+		have     map[string]span
+		from, to time.Time
+		ok       bool
+	}{
+		{"none", nil, jan, d("2027-02-01 00:00"), true},
+		{"UTC below", map[string]span{"dec": {d("2026-12-01 00:00"), jan}}, jan, d("2027-02-01 00:00"), true},
+		// New York's December ends 05:00 UTC, Tokyo's 15:00 UTC the day before.
+		{"behind UTC", map[string]span{"dec": {d("2026-12-01 05:00"), d("2027-01-01 05:00")}}, d("2027-01-01 05:00"), d("2027-02-01 00:00"), true},
+		{"ahead of UTC", map[string]span{"dec": {d("2026-11-30 15:00"), d("2026-12-31 15:00")}}, d("2026-12-31 15:00"), d("2027-02-01 00:00"), true},
+		{"above too", map[string]span{"dec": {d("2026-11-30 15:00"), d("2026-12-31 15:00")}, "feb": {d("2027-01-31 15:00"), d("2027-02-28 15:00")}},
+			d("2026-12-31 15:00"), d("2027-01-31 15:00"), true},
+		{"far below", map[string]span{"oct": {d("2026-10-01 00:00"), d("2026-11-01 00:00")}}, jan, d("2027-02-01 00:00"), true},
+		{"covered", map[string]span{"other": {d("2026-12-15 00:00"), d("2027-03-01 00:00")}}, time.Time{}, time.Time{}, false},
+	} {
+		from, to, ok := eventSpan(jan, c.have)
+		if ok != c.ok || ok && (!from.Equal(c.from) || !to.Equal(c.to)) {
+			t.Errorf("%s: [%v, %v) %v, want [%v, %v) %v", c.name, from, to, ok, c.from, c.to, c.ok)
+		}
 	}
 }
 

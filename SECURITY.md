@@ -43,3 +43,6 @@ The spool is not encrypted. Its events hold request and trace ids, the ids of th
 deployment and provider, model names, token counts, costs, latency and status. They never hold
 prompts, responses, API keys or provider credentials: captured content stays in memory and is left
 out of what is written.
+
+Client addresses are personal data. The control plane stores them with usage rows only when
+`LLMR_USAGE_CLIENT_IP` is on, and `LLMR_USAGE_RETENTION_MONTHS` deletes them with the rows.

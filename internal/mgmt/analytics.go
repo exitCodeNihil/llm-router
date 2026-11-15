@@ -47,9 +47,11 @@ func newUsageFilter(r *http.Request, c *Caller, aggregate bool) *usageFilter {
 
 	if !c.IsAdmin {
 		f.args = append(f.args, c.UserID)
-		n := "$" + strconv.Itoa(len(f.args))
-		f.conds = append(f.conds,
-			`(e.user_id = `+n+` OR e.team_id = ANY(SELECT team_id FROM team_members WHERE user_id = `+n+`))`)
+		// Individual requests (the feed, or one request's raw events) are
+		// narrower than totals: a member sees their teammates' spend, not
+		// what each of them sent when.
+		rows := !aggregate || q.Get("request_id") != ""
+		f.conds = append(f.conds, scopeSQL("e.", "$"+strconv.Itoa(len(f.args)), rows))
 	}
 
 	add := func(cond string, val any) {

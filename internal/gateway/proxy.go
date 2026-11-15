@@ -632,6 +632,7 @@ func (g *Server) emit(snap *snapshot.Snapshot, id *auth.Identity, d *snapshot.De
 		TraceID:          extra.Trace.TraceID,
 		ParentSpanID:     extra.Trace.ParentID,
 		Operation:        extra.Trace.Operation,
+		ClientIP:         extra.Trace.ClientIP,
 		InferenceGeo:     counts.Geo,
 		Speed:            counts.Speed,
 	}

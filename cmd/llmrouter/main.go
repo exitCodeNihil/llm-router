@@ -167,6 +167,12 @@ func run() error {
 		if err := gwsync.PruneStale(ctx, st.Pool); err != nil {
 			return fmt.Errorf("gateway instances: %w", err)
 		}
+		if err := console.PruneSessions(ctx, st.Pool); err != nil {
+			return fmt.Errorf("revoked sessions: %w", err)
+		}
+		if err := mgmt.PruneKeyHashes(ctx, st.Pool); err != nil {
+			return fmt.Errorf("rotated key hashes: %w", err)
+		}
 		return nil
 	})
 	if err := writer.EnsurePartitions(ctx); err != nil {
@@ -184,6 +190,7 @@ func run() error {
 	recorder := telemetry.NewRecorder()
 	exporter := telemetry.NewManager(holder, st.Pool)
 	exporter.Recorder = recorder
+	exporter.SetDelivery(cfg.TelemetryConcurrency, cfg.TelemetryDrain)
 	// Stopped only once the HTTP server has drained, so the events of the
 	// last requests are in the queues it flushes.
 	exportCtx, stopExport := context.WithCancel(context.Background())
@@ -201,6 +208,7 @@ func run() error {
 	go watchConfigEpoch(ctx, holder, events)
 	gw.Usage = usage.MultiWriter{writer, exporter, live}
 	gw.CloudAuth = auth.NewCloudValidator(st.Pool).Validate
+	gw.RecordClientIP, gw.TrustedProxies = cfg.UsageClientIP, cfg.TrustedProxies
 
 	if cfg.AdminToken == "" {
 		slog.Warn("LLMR_ADMIN_TOKEN is not set; bootstrap admin login is disabled")
@@ -208,7 +216,8 @@ func run() error {
 	mg := &mgmt.Server{Store: st, AdminToken: cfg.AdminToken, EncryptionKey: cfg.EncryptionKey,
 		Snapshots: holder, Live: live, NodeStore: nodeStore, HTTP: httpm, Events: events, Recorder: recorder, Telemetry: exporter,
 		Gateway: gw, Version: version, Started: time.Now(), IDEOrigin: cfg.IDEOrigin,
-		UsageRetentionMonths: cfg.UsageRetentionMonths, Audit: auditRec, TrustedProxies: cfg.TrustedProxies}
+		UsageRetentionMonths: cfg.UsageRetentionMonths, Audit: auditRec, TrustedProxies: cfg.TrustedProxies,
+		CookieDomain: cfg.CookieDomain}
 	mg.Register(mux)
 	go mg.SyncWorkspaceModels(ctx)
 	if cfg.IDEListen != "" {
@@ -233,7 +242,7 @@ func run() error {
 	consoleAuth.Register(mux)
 	mg.TokenGuard = consoleAuth
 	gwSync := &gwsync.Server{Store: st, Snapshots: holder, Limits: lim, Export: usage.MultiWriter{exporter, live}, Nodes: nodeStore,
-		Key: auth.DeriveKey("llmr-gw-session", cfg.EncryptionKey)}
+		Key: auth.DeriveKey("llmr-gw-session", cfg.EncryptionKey), RecordClientIP: cfg.UsageClientIP}
 	gwSync.Register(mux)
 	mg.GatewaySync = gwSync
 	mux.Handle("/", console.SPA())
@@ -278,7 +287,7 @@ func run() error {
 	stopExport()
 	select {
 	case <-exportDone:
-	case <-time.After(7 * time.Second):
+	case <-time.After(exporter.Drain() + 2*time.Second):
 		slog.Warn("telemetry export did not finish flushing before exit")
 	}
 	return nil

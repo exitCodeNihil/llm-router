@@ -21,6 +21,9 @@ type traceCtx struct {
 	Sampled bool
 	// Operation is gen_ai.operation.name for the route.
 	Operation string
+	// ClientIP is not the trace's but travels with it to the usage event:
+	// the caller's address when it is recorded, else "".
+	ClientIP string
 }
 
 const traceKey ctxKey = 1

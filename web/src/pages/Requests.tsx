@@ -70,6 +70,7 @@ function RequestDetail({
     ["Request id", <Code key="r">{r.request_id}</Code>],
     ["Trace id", r.trace_id ? <Code key="t">{r.trace_id}</Code> : "—"],
     ["Model", <Code key="m">{r.model_name || "—"}</Code>],
+    ...(r.client_ip ? ([["Client address", <Code key="ip">{r.client_ip}</Code>]] as [string, ReactNode][]) : []),
     ["Upstream", r.upstream_name ? `${r.upstream_name}${r.provider_name ? ` · ${r.provider_name}` : ""}` : "—"],
     ["Key", r.key_name ?? "—"],
     ["Status", `${r.status_code}${r.error_code ? ` · ${r.error_code}` : ""}`],
@@ -452,6 +453,13 @@ export default function Requests() {
           </VStack>
         </Card>
 
+        {me && !me.is_admin && (
+          // Totals elsewhere cover every team you are in; individual requests
+          // are narrower, so say so rather than let the two seem to disagree.
+          <Text type="supporting" color="secondary">
+            You see your own requests and those of teams you administer.
+          </Text>
+        )}
         <Card padding={0}>
           {req.isLoading ? (
             <Loading />

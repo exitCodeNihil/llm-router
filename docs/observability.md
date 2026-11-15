@@ -37,6 +37,26 @@ Content is captured only when at least one destination in scope wants it, and is
 Postgres. A change to the policy, a destination or a data rule also applies to spans still queued
 for delivery.
 
+## Redaction
+
+**Redaction** on the Observability page replaces personal data and secrets in captured content
+with `[REDACTED:kind]` before any destination receives it. It runs once per request on the control
+plane, on the system prompt, every message, tool-call arguments and the completion. It is off by
+default.
+
+- Built-in detectors: email addresses, card numbers (13 to 19 digits that pass the card check), API
+  keys and tokens (bearer tokens, `sk-…` keys, AWS, Google, GitHub and Slack tokens, JWTs) and PEM
+  private keys. Turn each on or off.
+- Your own patterns: a name and a regular expression in [RE2 syntax](https://github.com/google/re2/wiki/Syntax).
+  A pattern that does not compile, or that matches empty text, is refused when you save.
+- **Try it** shows what the settings on the page do to a sample, saved or not. The sample is not
+  stored.
+
+Pattern matching finds what has a recognisable shape. It does not find names, addresses or free
+text about a person, so treat it as a safety net and keep **metadata only** for traffic that must
+not leave. If the stored redaction ever can't be read, content is withheld from export until it is
+saved again. `/metrics` counts replacements in `llmr_telemetry_redacted_total` by kind.
+
 ## Destinations
 
 On **Observability**, **Add destination**, pick a kind, fill in its connection, choose the content
@@ -114,7 +134,14 @@ the start of an error response in the console. Only admins can add destinations,
 a provider's base URL.
 
 Each destination has its own queue, so a slow or failing one never holds up the others or the
-requests themselves. Spans are sent in batches of up to 512, at least every 2 seconds.
+requests themselves. Spans are sent in batches of up to 512, at least every 2 seconds, up to four
+batches at a time per destination (`LLMR_TELEMETRY_CONCURRENCY`, 1 to 16). A destination that asks
+for a pause gets one retry at a time until it recovers.
+
+Export is best effort. Queues live in the control plane's memory and nothing is written to
+Postgres, so prompts never rest there. On shutdown the control plane keeps delivering what is
+queued for up to 20 seconds (`LLMR_TELEMETRY_DRAIN`); what is left after that, or queued when a
+process is killed, is lost. Usage, spend and the Requests page do not depend on export.
 
 - A destination that is down or answers 429, 502, 503 or 504 is retried with backoff (honouring
   `Retry-After`) for up to 10 minutes, then the spans are dropped as expired.

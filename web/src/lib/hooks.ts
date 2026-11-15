@@ -40,6 +40,7 @@ import type {
   TeamMember,
   TelemetryDestination,
   TelemetryKind,
+  Redaction,
   TelemetryPolicy,
   TimeseriesPoint,
   TokenIssuer,
@@ -157,6 +158,11 @@ export function useDeletedUsers() {
     queryFn: () => api.get<DeletedUser[]>("/api/deleted-users"),
   });
 }
+/** Ends every console session of a user (admin). */
+export const useSignOutUser = () =>
+  useMutation({
+    mutationFn: (id: string) => api.post(`/api/users/${id}/sign-out`, {}),
+  });
 export const useSetUserPassword = () =>
   useMutation({
     mutationFn: ({ id, password }: { id: string; password: string }) =>
@@ -280,6 +286,16 @@ export const useUpdateKey = () =>
     ({ id, ...b }: { id: string } & Record<string, unknown>) =>
       api.patch(`/api/keys/${id}`, b),
     [["keys"], ["lookup"]],
+  );
+/** A new secret for a key; the old one keeps working for grace_hours. */
+export const useRotateKey = () =>
+  useInvalidatingMutation(
+    ({ id, grace_hours }: { id: string; grace_hours: number }) =>
+      api.post<{ id: string; key: string; old_key_expires_at: string | null }>(
+        `/api/keys/${id}/rotate`,
+        { grace_hours },
+      ),
+    [["keys"]],
   );
 export const useDeleteKey = () =>
   useInvalidatingMutation(
@@ -544,6 +560,11 @@ export function useTelemetry(enabled = true) {
       const d = await api.get<TelemetryPolicy>("/api/settings/telemetry");
       d.rules = d.rules ?? [];
       d.mode = d.mode || "everything";
+      d.redaction = {
+        enabled: d.redaction?.enabled ?? false,
+        builtin: d.redaction?.builtin ?? null,
+        custom: d.redaction?.custom ?? [],
+      };
       return d;
     },
   });
@@ -553,6 +574,12 @@ export const useSetTelemetry = () =>
     (b: TelemetryPolicy) => api.put("/api/settings/telemetry", b),
     [["telemetry"]],
   );
+
+export const useTestRedaction = () =>
+  useMutation({
+    mutationFn: (b: { redaction: Redaction; text: string }) =>
+      api.post<{ text: string }>("/api/settings/telemetry/redaction-test", b),
+  });
 
 // ── Telemetry destinations ──────────────────────────────────────
 export function useTelemetryKinds() {

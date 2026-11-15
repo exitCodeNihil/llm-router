@@ -14,6 +14,7 @@ import { useToast } from "@astryxdesign/core/Toast";
 import type { Me } from "../lib/types";
 import { api, token } from "../lib/api";
 import { Page } from "../components/Page";
+import { Confirm } from "../components/dialogs";
 import { useMode } from "../mode";
 import type { Mode } from "../theme";
 
@@ -25,6 +26,7 @@ export default function Account({ me }: { me: Me }) {
   const [next, setNext] = useState("");
   const [confirm, setConfirm] = useState("");
   const [busy, setBusy] = useState(false);
+  const [confirmAll, setConfirmAll] = useState(false);
 
   const mismatch = confirm.length > 0 && next !== confirm;
   const tooShort = next.length > 0 && next.length < 8;
@@ -42,7 +44,7 @@ export default function Account({ me }: { me: Me }) {
     setBusy(true);
     try {
       await api.post("/api/me/password", { current, new: next });
-      showToast({ body: "Password updated" });
+      showToast({ body: "Password updated; other sessions are signed out" });
       setCurrent("");
       setNext("");
       setConfirm("");
@@ -56,6 +58,17 @@ export default function Account({ me }: { me: Me }) {
   function signOut() {
     token.clear();
     window.location.href = "/auth/logout";
+  }
+
+  // Ends every session of this account, this one included.
+  async function signOutEverywhere() {
+    try {
+      await api.post("/api/me/sign-out");
+      token.clear();
+      window.location.href = "/?signed_out=1";
+    } catch (err) {
+      showToast({ body: err instanceof Error ? err.message : "Failed", type: "error" });
+    }
   }
 
   const teamCount = Object.keys(me.team_roles ?? {}).length;
@@ -161,6 +174,29 @@ export default function Account({ me }: { me: Me }) {
             <Button label="Sign out" variant="destructive" onClick={signOut} />
           </HStack>
         </Card>
+
+        {me.user_id && (
+          <Card>
+            <HStack hAlign="between" vAlign="center" gap={3} wrap="wrap">
+              <VStack gap={0}>
+                <Heading level={4}>Sign out everywhere</Heading>
+                <Text type="supporting" color="secondary">
+                  Ends every console session of your account, on every device, this one included. An IDE already open
+                  stays connected until it is closed.
+                </Text>
+              </VStack>
+              <Button label="Sign out everywhere" variant="secondary" onClick={() => setConfirmAll(true)} />
+            </HStack>
+          </Card>
+        )}
+        <Confirm
+          target={confirmAll || null}
+          title="Sign out everywhere"
+          description="End every session of your account, including this one? You will need to sign in again."
+          actionLabel="Sign out everywhere"
+          onCancel={() => setConfirmAll(false)}
+          onConfirm={signOutEverywhere}
+        />
       </VStack>
     </Page>
   );

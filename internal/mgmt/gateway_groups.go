@@ -9,9 +9,10 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/exitcodenihil/llm-router/internal/gwsync"
+	"github.com/exitcodenihil/llm-router/internal/store"
 )
 
-var gatewayGroupPatchCols = []string{"name", "region", "allowed_teams", "data_rule"}
+var gatewayGroupPatchCols = []string{"name", "region", "strict_region", "allowed_teams", "data_rule"}
 
 func newJoinToken() (string, []byte) {
 	b := make([]byte, 32)
@@ -22,7 +23,7 @@ func newJoinToken() (string, []byte) {
 }
 
 func (m *Server) listGatewayGroups(w http.ResponseWriter, r *http.Request) {
-	m.list(w, r, `SELECT g.id, g.name, g.region, g.allowed_teams, g.data_rule, g.created_at,
+	m.list(w, r, `SELECT g.id, g.name, g.region, g.strict_region, g.allowed_teams, g.data_rule, g.created_at,
 			count(i.id) FILTER (WHERE i.last_seen_at > now() - interval '1 minute') AS live_instances
 		FROM gateway_groups g LEFT JOIN gateway_instances i ON i.group_id = g.id
 		GROUP BY g.id ORDER BY g.created_at`)
@@ -32,6 +33,7 @@ func (m *Server) createGatewayGroup(w http.ResponseWriter, r *http.Request) {
 	req, ok := decode[struct {
 		Name         string   `json:"name"`
 		Region       string   `json:"region"`
+		StrictRegion bool     `json:"strict_region"`
 		AllowedTeams []string `json:"allowed_teams"`
 		DataRule     string   `json:"data_rule"`
 	}](w, r)
@@ -46,10 +48,10 @@ func (m *Server) createGatewayGroup(w http.ResponseWriter, r *http.Request) {
 		req.DataRule = "inherit"
 	}
 	token, hash := newJoinToken()
-	id := uuid.New()
+	id := store.NewID()
 	if _, err := m.Store.Pool.Exec(r.Context(),
-		`INSERT INTO gateway_groups (id, name, region, allowed_teams, data_rule, join_token_hash) VALUES ($1,$2,$3,$4,$5,$6)`,
-		id, req.Name, req.Region, req.AllowedTeams, req.DataRule, hash); err != nil {
+		`INSERT INTO gateway_groups (id, name, region, strict_region, allowed_teams, data_rule, join_token_hash) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+		id, req.Name, req.Region, req.StrictRegion, req.AllowedTeams, req.DataRule, hash); err != nil {
 		httpError(w, http.StatusBadRequest, err.Error())
 		return
 	}

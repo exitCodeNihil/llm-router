@@ -23,32 +23,38 @@ func SignToken(key []byte, subject string, exp time.Time) string {
 
 // VerifyToken returns the subject of a token signed with key that has not expired.
 func VerifyToken(key []byte, value string) (string, error) {
+	subject, _, err := VerifyTokenExpiry(key, value)
+	return subject, err
+}
+
+// VerifyTokenExpiry is VerifyToken that also returns when the token expires.
+func VerifyTokenExpiry(key []byte, value string) (string, time.Time, error) {
 	payloadB64, sigB64, ok := strings.Cut(value, ".")
 	if !ok {
-		return "", errors.New("malformed token")
+		return "", time.Time{}, errors.New("malformed token")
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(payloadB64)
 	if err != nil {
-		return "", errors.New("malformed token")
+		return "", time.Time{}, errors.New("malformed token")
 	}
 	sig, err := base64.RawURLEncoding.DecodeString(sigB64)
 	if err != nil {
-		return "", errors.New("malformed token")
+		return "", time.Time{}, errors.New("malformed token")
 	}
 	mac := hmac.New(sha256.New, key)
 	mac.Write(payload)
 	if !hmac.Equal(sig, mac.Sum(nil)) {
-		return "", errors.New("bad signature")
+		return "", time.Time{}, errors.New("bad signature")
 	}
 	i := strings.LastIndexByte(string(payload), '|')
 	if i < 0 {
-		return "", errors.New("malformed token")
+		return "", time.Time{}, errors.New("malformed token")
 	}
 	exp, err := strconv.ParseInt(string(payload[i+1:]), 10, 64)
 	if err != nil || time.Now().Unix() > exp {
-		return "", errors.New("expired token")
+		return "", time.Time{}, errors.New("expired token")
 	}
-	return string(payload[:i]), nil
+	return string(payload[:i]), time.Unix(exp, 0), nil
 }
 
 // DeriveKey derives a signing key for one purpose from the deployment secret.

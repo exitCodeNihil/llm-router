@@ -24,11 +24,17 @@ type policy struct {
 	// A batch is retried until its oldest record has been queued MaxAge, so
 	// an outage of a few minutes loses nothing the queue can hold.
 	MaxAge time.Duration
+	// Parallel is how many batches a destination is sent at once. A slow
+	// backend then holds up one connection, not the queue.
+	Parallel int
+	// Drain is how long a shutdown keeps delivering what is queued.
+	Drain time.Duration
 }
 
 var defaultPolicy = policy{
 	MaxItems: 20000, MaxBytes: 64 << 20, BatchSpans: 512, BatchBytes: 4 << 20, Linger: 2 * time.Second,
 	BackoffMin: time.Second, BackoffMax: 30 * time.Second, MaxAge: 10 * time.Minute,
+	Parallel: 4, Drain: 20 * time.Second,
 }
 
 // queue is a destination's backlog. Full, it drops its oldest records: fresh
@@ -130,7 +136,11 @@ type worker struct {
 	stop    context.CancelFunc
 	done    chan struct{}
 	flushOn atomic.Bool  // deliver what is queued when stopped (shutdown)
-	sending atomic.Int64 // records in the batch being delivered or retried
+	sending atomic.Int64 // records in the batches being delivered or retried
+	// holdUntil (unix nanoseconds) is set by a batch that has to wait before
+	// its retry: no new batch starts before then, so a failing backend sees
+	// one retry at a time and not Parallel of them.
+	holdUntil atomic.Int64
 }
 
 type sinkSlot struct {
@@ -147,9 +157,12 @@ func newWorker(d *snapshot.Destination, p *policy) *worker {
 
 func (w *worker) run(ctx context.Context) {
 	defer close(w.done)
+	slots := make(chan struct{}, max(w.p.Parallel, 1))
+	var inflight sync.WaitGroup
 	for {
 		select {
 		case <-ctx.Done():
+			inflight.Wait() // each puts its batch back when stopped mid-export
 			if w.flushOn.Load() {
 				w.final()
 			}
@@ -157,18 +170,44 @@ func (w *worker) run(ctx context.Context) {
 		case <-w.q.notify:
 		}
 		w.linger(ctx)
-		for ctx.Err() == nil {
+		for w.hold(ctx) {
 			batch := w.q.take()
 			if len(batch) == 0 {
 				break
 			}
+			select {
+			case slots <- struct{}{}:
+			case <-ctx.Done():
+				w.q.requeue(batch)
+				continue
+			}
 			// Still waiting to be delivered, so health counts it as queued
 			// while it is retried.
-			w.sending.Store(int64(len(batch)))
-			w.deliver(ctx, batch)
-			w.sending.Store(0)
+			w.sending.Add(int64(len(batch)))
+			inflight.Add(1)
+			go func() {
+				defer func() { w.sending.Add(-int64(len(batch))); <-slots; inflight.Done() }()
+				w.deliver(ctx, batch)
+			}()
 		}
 	}
+}
+
+// hold waits out a retry pause and reports whether the worker is still running.
+func (w *worker) hold(ctx context.Context) bool {
+	for ctx.Err() == nil {
+		wait := time.Until(time.Unix(0, w.holdUntil.Load()))
+		if wait <= 0 {
+			return true
+		}
+		t := time.NewTimer(wait)
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			t.Stop()
+		}
+	}
+	return false
 }
 
 // linger waits for a full batch, at most Linger.
@@ -192,10 +231,15 @@ func (w *worker) linger(ctx context.Context) {
 	}
 }
 
-// final makes one quick attempt at what is still queued at shutdown,
-// including a batch that was in flight when the worker was stopped.
+// final delivers what is still queued at shutdown, including batches that
+// were in flight when the worker was stopped, for at most Drain. A batch the
+// backend refuses for now is tried again each second until then.
 func (w *worker) final() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	drain := w.p.Drain
+	if drain <= 0 {
+		drain = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), drain)
 	defer cancel()
 	for ctx.Err() == nil {
 		batch := w.q.take()
@@ -209,11 +253,28 @@ func (w *worker) final() {
 		if slot.s == nil {
 			return
 		}
-		if err := slot.s.Export(ctx, batch); err != nil {
-			w.st.failed(err, &w.st.expired, len(batch))
-			return
+		for {
+			err := slot.s.Export(ctx, batch)
+			if err == nil {
+				w.st.ok(len(batch))
+				break
+			}
+			var xe *ExportError
+			if !errors.As(err, &xe) || !xe.Retryable || ctx.Err() != nil {
+				w.st.failed(err, &w.st.expired, len(batch))
+				if ctx.Err() != nil {
+					return
+				}
+				break
+			}
+			select {
+			case <-time.After(time.Second):
+			case <-ctx.Done():
+			}
 		}
-		w.st.ok(len(batch))
+	}
+	if n, _ := w.q.depth(); n > 0 {
+		slog.Warn("telemetry spans left undelivered at shutdown", "destination", w.dest.Load().Name, "spans", n)
 	}
 }
 
@@ -270,6 +331,7 @@ func (w *worker) deliver(ctx context.Context, batch []*Record) {
 			return
 		}
 		w.st.noteErr(err)
+		w.holdUntil.Store(time.Now().Add(wait).UnixNano())
 		t := time.NewTimer(wait)
 		select {
 		case <-t.C:

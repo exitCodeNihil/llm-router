@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/exitcodenihil/llm-router/internal/audit"
 	"github.com/exitcodenihil/llm-router/internal/metrics"
+	"github.com/exitcodenihil/llm-router/internal/redact"
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
 	"github.com/exitcodenihil/llm-router/internal/store"
 	"github.com/exitcodenihil/llm-router/internal/telemetry"
@@ -90,6 +93,11 @@ func destinationMetrics(w *metrics.PromWriter, hs []telemetry.Health) {
 		w.Sample("llmr_telemetry_destination_dropped_total", float64(h.Dropped.Overflow), "destination", h.Name, "reason", "overflow")
 		w.Sample("llmr_telemetry_destination_dropped_total", float64(h.Dropped.Rejected), "destination", h.Name, "reason", "rejected")
 		w.Sample("llmr_telemetry_destination_dropped_total", float64(h.Dropped.Expired), "destination", h.Name, "reason", "expired")
+	}
+	w.Family("llmr_telemetry_redacted_total", "counter", "Values replaced in captured content before export, by kind")
+	counts := redact.Counts()
+	for _, kind := range slices.Sorted(maps.Keys(counts)) {
+		w.Sample("llmr_telemetry_redacted_total", float64(counts[kind]), "kind", kind)
 	}
 }
 

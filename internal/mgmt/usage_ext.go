@@ -82,13 +82,20 @@ func (m *Server) usageRequests(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	args := append(f.args, limit)
+	// Where a request came from is for admins only, and only stored when
+	// LLMR_USAGE_CLIENT_IP is on.
+	clientIP := "NULL::text"
+	if c.IsAdmin {
+		clientIP = "host(e.client_ip)"
+	}
 
 	m.list(w, r, `
 		SELECT e.id, e.ts, e.request_id, e.model_name, e.api_key_id, e.user_id, e.team_id,
 		       e.deployment_id, e.provider_id,
 		       coalesce(k.name, `+deletedLabel("dk")+`) AS key_name, p.name AS provider_name, d.upstream_name AS upstream_name,
 		       e.prompt_tokens, e.completion_tokens, e.cost_usd, e.latency_ms, e.status_code, e.stream,
-		       e.attempts, e.error_code, e.ttft_ms, e.notional_cost_usd, e.trace_id
+		       e.attempts, e.error_code, e.ttft_ms, e.notional_cost_usd, e.trace_id,
+		       `+clientIP+` AS client_ip
 		FROM usage_events e
 		LEFT JOIN api_keys k ON k.id = e.api_key_id
 		LEFT JOIN deleted_entities dk ON dk.kind = 'key' AND dk.id = e.api_key_id

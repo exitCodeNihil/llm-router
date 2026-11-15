@@ -84,7 +84,12 @@ func (m *Server) metricsLive(w http.ResponseWriter, r *http.Request) {
 
 	keys, aliases, upstreams := 0, 0, len(provName)
 	if s != nil {
-		keys, aliases = len(s.KeysByHash), len(s.DeploymentsByModel)
+		aliases = len(s.DeploymentsByModel)
+		for _, k := range s.KeysByHash {
+			if !k.OldHash { // a rotated key's old secret is not another key
+				keys++
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"providers": providers, "edges": edges, "nodes": nodes,

@@ -38,14 +38,18 @@ func (m *Server) resolveCaller(r *http.Request) *Caller {
 		subtle.ConstantTimeCompare([]byte(token), []byte(m.AdminToken)) == 1 {
 		return &Caller{IsAdmin: true, Email: "bootstrap-admin"}
 	}
-	userID := console.SessionUserID(m.EncryptionKey, r)
-	if userID == "" {
+	s, ok := console.RequestSession(m.EncryptionKey, r)
+	if !ok {
 		return nil
 	}
+	userID := s.UserID
 	c := &Caller{UserID: userID, TeamRoles: map[string]string{}}
 	var role string
+	// Revocation rides on this lookup: a session signed out, or issued
+	// before the user's last "sign out everywhere", finds no row.
 	err := m.Store.Pool.QueryRow(r.Context(),
-		`SELECT email, role FROM users WHERE id=$1 AND NOT disabled`, userID).Scan(&c.Email, &role)
+		`SELECT u.email, u.role FROM users u WHERE u.id=$1 AND NOT u.disabled AND `+console.SessionLiveSQL("$2", "$3"),
+		userID, s.Epoch, s.SID).Scan(&c.Email, &role)
 	if err != nil {
 		return nil
 	}

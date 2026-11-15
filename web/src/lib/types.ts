@@ -69,6 +69,8 @@ export interface ApiKey {
   disabled: boolean;
   tags: string[] | null;
   created_at: string;
+  /** End of a rotation's grace period, while the old secret still works. */
+  old_key_expires_at?: string | null;
   /** Owner labels, present on the paged list only. */
   user_email?: string | null;
   team_name?: string | null;
@@ -230,6 +232,7 @@ export interface GatewayGroup {
   id: string;
   name: string;
   region: string;
+  strict_region: boolean; // only deployments in the region, no fallback
   allowed_teams: string[] | null; // null or empty = every team
   data_rule: DataRule;
   created_at: string;
@@ -257,6 +260,16 @@ export interface TelemetryPolicy {
   mode: TelemetryMode | ""; // "" == everything
   capture_content: boolean;
   rules: TelemetryRule[];
+  redaction: Redaction;
+}
+
+// Redaction of captured content before export. builtin null means every
+// built-in detector.
+export type RedactionKind = "email" | "card" | "secret" | "private_key";
+export interface Redaction {
+  enabled: boolean;
+  builtin: RedactionKind[] | null;
+  custom: { name: string; pattern: string }[];
 }
 
 // ── Telemetry destinations (/api/telemetry/*) ───────────────────
@@ -466,6 +479,8 @@ export interface RequestRow {
   notional_cost_usd: number | null;
   /** OTel trace id; null on rows from before 0.3.0. */
   trace_id: string | null;
+  /** The caller's address: admins only, and only when the server stores it. */
+  client_ip?: string | null;
 }
 export interface RequestFilters {
   limit?: number;

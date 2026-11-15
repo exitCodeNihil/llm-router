@@ -40,6 +40,9 @@ type Server struct {
 	// IDEOrigin is the public origin of the separate IDE listener ("" = the
 	// IDE is served from this mux, which shares the console's origin).
 	IDEOrigin string
+	// CookieDomain is the session cookie's domain (LLMR_COOKIE_DOMAIN), for
+	// the cookie reissued after a password change.
+	CookieDomain string
 	// UsageRetentionMonths is how many months of individual requests are
 	// kept (usage.Retention.RawMonths), for the console to say so. 0 = for ever.
 	UsageRetentionMonths int
@@ -87,7 +90,9 @@ func (m *Server) routes(handle func(string, http.Handler)) {
 
 	handle("GET /api/me", ha(m.me))
 	handle("POST /api/me/password", ha(m.changeOwnPassword))
+	handle("POST /api/me/sign-out", ha(m.signOutSelf))
 	handle("POST /api/users/{id}/password", h(m.setUserPassword))
+	handle("POST /api/users/{id}/sign-out", h(m.signOutUser))
 
 	handle("GET /api/users", h(m.listUsers))
 	handle("POST /api/users", h(m.createUser))
@@ -109,6 +114,7 @@ func (m *Server) routes(handle func(string, http.Handler)) {
 	handle("POST /api/lookup", ha(m.lookup))
 	handle("POST /api/keys", ha(m.createKey))
 	handle("PATCH /api/keys/{id}", ha(m.patchKey))
+	handle("POST /api/keys/{id}/rotate", ha(m.rotateKey))
 	handle("DELETE /api/keys/{id}", ha(m.deleteKey))
 
 	handle("GET /api/providers", h(m.listProviders))
@@ -130,6 +136,7 @@ func (m *Server) routes(handle func(string, http.Handler)) {
 	handle("PUT /api/settings/sso", h(m.putSSO))
 	handle("GET /api/settings/telemetry", h(m.getTelemetry))
 	handle("PUT /api/settings/telemetry", h(m.putTelemetry))
+	handle("POST /api/settings/telemetry/redaction-test", h(m.testRedaction))
 	handle("GET /api/settings/workspaces", h(m.getWorkspaceSettings))
 	handle("PUT /api/settings/workspaces", h(m.putWorkspaceSettings))
 
@@ -453,7 +460,7 @@ func (m *Server) createUser(w http.ResponseWriter, r *http.Request) {
 		}
 		hash = h
 	}
-	id := uuid.New()
+	id := store.NewID()
 	_, err := m.Store.Pool.Exec(r.Context(), `
 		INSERT INTO users (id, email, name, role, budget_usd, budget_period, rpm_limit, tpm_limit, tags, password_hash, allowed_models)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
@@ -618,7 +625,7 @@ func (m *Server) createTeam(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "name is required")
 		return
 	}
-	id := uuid.New()
+	id := store.NewID()
 	_, err := m.Store.Pool.Exec(r.Context(), `
 		INSERT INTO teams (id, name, budget_usd, budget_period, rpm_limit, tpm_limit, tags, allowed_models)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
@@ -687,8 +694,8 @@ func (m *Server) addTeamMember(w http.ResponseWriter, r *http.Request) {
 
 // --- api keys ---
 
-const keyCols = `id, key_prefix, name, user_id, team_id, allowed_models, budget_usd, budget_period,
-	rpm_limit, tpm_limit, expires_at, tags, disabled, created_at`
+var keyCols = `id, key_prefix, name, user_id, team_id, allowed_models, budget_usd, budget_period,
+	rpm_limit, tpm_limit, expires_at, tags, disabled, created_at, ` + oldKeyCol("api_keys")
 
 // listKeys: admins see all keys; others see their own keys and their teams' keys.
 func (m *Server) listKeys(w http.ResponseWriter, r *http.Request) {
@@ -724,7 +731,8 @@ func (m *Server) pagedKeys(w http.ResponseWriter, r *http.Request, p pageParams,
 		l.where = append(l.where, `(k.user_id = `+me+` OR k.team_id IN (SELECT team_id FROM team_members WHERE user_id = `+me+`))`)
 	}
 	l.sel = `SELECT k.id, k.key_prefix, k.name, k.user_id, k.team_id, k.allowed_models, k.budget_usd, k.budget_period,
-		k.rpm_limit, k.tpm_limit, k.expires_at, k.tags, k.disabled, k.created_at, ` + ownerEmail + ` AS user_email, t.name AS team_name
+		k.rpm_limit, k.tpm_limit, k.expires_at, k.tags, k.disabled, k.created_at, ` + oldKeyCol("k") + `,
+		` + ownerEmail + ` AS user_email, t.name AS team_name
 		FROM api_keys k LEFT JOIN users u ON u.id = k.user_id LEFT JOIN teams t ON t.id = k.team_id`
 	l.search = []string{"k.name", "k.key_prefix", ownerEmail, "t.name"}
 	m.servePage(w, r, p, l)
@@ -784,7 +792,7 @@ func (m *Server) createKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	secret, hash, prefix := auth.GenerateKey()
-	id := uuid.New()
+	id := store.NewID()
 	_, err := m.Store.Pool.Exec(r.Context(), `
 		INSERT INTO api_keys (id, key_hash, key_prefix, name, user_id, team_id, allowed_models,
 			budget_usd, budget_period, rpm_limit, tpm_limit, expires_at, tags)
@@ -869,7 +877,7 @@ func (m *Server) createProvider(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	id := uuid.New()
+	id := store.NewID()
 	_, err := m.Store.Pool.Exec(r.Context(), `
 		INSERT INTO providers (id, name, type, base_url, auth_mode, api_key_enc, config)
 		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
@@ -1049,7 +1057,7 @@ func (m *Server) createDeployment(w http.ResponseWriter, r *http.Request) {
 			req.APIFlavor = "anthropic"
 		}
 	}
-	id := uuid.New()
+	id := store.NewID()
 	_, err := m.Store.Pool.Exec(r.Context(), `
 		INSERT INTO model_deployments (id, provider_id, model_name, upstream_name, api_flavor, priority, catalog_model_id, input_per_1m, output_per_1m, cached_input_per_1m, context_tokens, region, timeout_ms)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,

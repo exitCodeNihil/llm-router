@@ -177,6 +177,33 @@ func TestConfigRegionFirst(t *testing.T) {
 	}
 }
 
+// A strict group gets its region's deployments only, and no provider that
+// serves nothing there.
+func TestConfigStrictRegion(t *testing.T) {
+	b := buildConfig(fixture(), &snapshot.GatewayGroup{ID: "g", Name: "eu", Region: "eu", StrictRegion: true}, schemaVersion)
+	if len(b.cfg.Deployments) == 0 {
+		t.Fatal("no deployments left")
+	}
+	used := map[string]bool{}
+	for _, d := range b.cfg.Deployments {
+		if d.ID == "d-a-us" {
+			t.Fatalf("a strict eu group was sent a us deployment: %+v", b.cfg.Deployments)
+		}
+		used[d.ProviderID] = true
+	}
+	for _, p := range b.cfg.Providers {
+		if !used[p.ID] {
+			t.Fatalf("provider %s is sent though nothing in the region uses it", p.Name)
+		}
+	}
+	// Strict without a region restricts nothing.
+	all := buildConfig(fixture(), &snapshot.GatewayGroup{ID: "g", Name: "none", StrictRegion: true}, schemaVersion)
+	loose := buildConfig(fixture(), &snapshot.GatewayGroup{ID: "g", Name: "none"}, schemaVersion)
+	if len(all.cfg.Deployments) != len(loose.cfg.Deployments) {
+		t.Fatal("strict with no region dropped deployments")
+	}
+}
+
 func TestReachablePattern(t *testing.T) {
 	id := &auth.Identity{Key: &snapshot.Key{AllowedModels: map[string]bool{"claude-sonnet-4": true}}}
 	if !reachable(id, "claude-*") {

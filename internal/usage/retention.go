@@ -72,18 +72,21 @@ func (w *PGWriter) Prune(ctx context.Context, now time.Time) error {
 	return firstErr
 }
 
-// dropPartitions drops table's monthly partitions (table_YYYY_MM) that start
-// before the given month. A partition is detached without blocking writes to
-// the others, then dropped; one left half-detached or detached by an earlier,
-// interrupted pass is finished off.
+// dropPartitions drops table's monthly partitions (table_YYYY_MM) that end by
+// before, read from their bounds: a usage_events partition made before 0.4
+// may end hours into the next UTC month, and those hours are kept. A
+// partition is detached without blocking writes to the others, then dropped;
+// one left half-detached or detached by an earlier, interrupted pass (which
+// has no bounds left) is finished off when its name's month is before.
 func (w *PGWriter) dropPartitions(ctx context.Context, conn *pgx.Conn, table string, before time.Time) error {
 	rows, err := conn.Query(ctx, `
-		SELECT c.relname, i.inhrelid IS NOT NULL, coalesce(i.inhdetachpending, false), c.reltuples::bigint
+		SELECT c.relname, i.inhrelid IS NOT NULL, coalesce(i.inhdetachpending, false), c.reltuples::bigint,
+		       (regexp_match(pg_get_expr(c.relpartbound, c.oid), $2))[2]::timestamptz
 		FROM pg_class c
 		LEFT JOIN pg_inherits i ON i.inhrelid = c.oid AND i.inhparent = $1::regclass
 		WHERE c.relkind = 'r' AND c.relname ~ ('^' || $1 || '_[0-9]{4}_[0-9]{2}$')
 		  AND c.relnamespace = (SELECT relnamespace FROM pg_class WHERE oid = $1::regclass)
-		ORDER BY 1`, table)
+		ORDER BY 1`, table, boundsRE)
 	if err != nil {
 		return err
 	}
@@ -91,10 +94,11 @@ func (w *PGWriter) dropPartitions(ctx context.Context, conn *pgx.Conn, table str
 		name              string
 		attached, pending bool
 		rows              int64
+		end               *time.Time
 	}
 	parts, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (part, error) {
 		var p part
-		return p, r.Scan(&p.name, &p.attached, &p.pending, &p.rows)
+		return p, r.Scan(&p.name, &p.attached, &p.pending, &p.rows, &p.end)
 	})
 	if err != nil {
 		return err
@@ -102,7 +106,7 @@ func (w *PGWriter) dropPartitions(ctx context.Context, conn *pgx.Conn, table str
 	var firstErr error
 	for _, p := range parts {
 		month, err := time.Parse("2006_01", p.name[len(table)+1:])
-		if err != nil || !month.Before(before) {
+		if err != nil || !month.Before(before) || p.end != nil && p.end.After(before) {
 			continue
 		}
 		// names come from the catalog and match the pattern above

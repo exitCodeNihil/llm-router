@@ -47,6 +47,9 @@ type Event struct {
 	// GatewayGroupID is the instance's group, set by the control plane when a
 	// gateway syncs; "" = the control plane. Telemetry scopes use it; not stored.
 	GatewayGroupID string `json:"gateway_group_id,omitempty"`
+	// ClientIP is the caller's address, set only when LLMR_USAGE_CLIENT_IP is
+	// on: it is personal data.
+	ClientIP string `json:"client_ip,omitempty"`
 
 	// TraceID (32 hex) comes from the caller's traceparent or is new;
 	// ParentSpanID (16 hex) is the caller's span, not stored.
@@ -371,15 +374,16 @@ func queueRow(b *pgx.Batch, e Event) {
 		(ts, request_id, api_key_id, user_id, team_id, model_name, deployment_id, provider_id,
 		 prompt_tokens, completion_tokens, cached_tokens, cost_usd, unpriced, latency_ms, status_code, stream, gateway_id,
 		 attempts, error_code, ttft_ms, notional_cost_usd, cache_write_5m_tokens, cache_write_1h_tokens,
-		 trace_id, inference_geo, speed, cost_basis)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)`,
+		 trace_id, inference_geo, speed, cost_basis, client_ip)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)`,
 		e.TS, e.RequestID, nilIfEmpty(e.APIKeyID), nilIfEmpty(e.UserID), nilIfEmpty(e.TeamID),
 		e.ModelName, nilIfEmpty(e.DeploymentID), nilIfEmpty(e.ProviderID),
 		e.PromptTokens, e.CompletionTokens, e.CachedTokens, e.CostUSD, e.Unpriced,
 		e.LatencyMS, e.StatusCode, e.Stream, nilIfEmpty(e.GatewayID),
 		zeroIfNil(e.Attempts), nilIfEmpty(e.ErrorCode), zeroIfNil(e.TTFTMs), zeroFloatIfNil(e.NotionalCostUSD),
 		e.CacheWrite5m, e.CacheWrite1h,
-		nilIfEmpty(e.TraceID), nilIfEmpty(e.InferenceGeo), nilIfEmpty(e.Speed), zeroIfNil(e.CostBasis))
+		nilIfEmpty(e.TraceID), nilIfEmpty(e.InferenceGeo), nilIfEmpty(e.Speed), zeroIfNil(e.CostBasis),
+		nilIfEmpty(e.ClientIP))
 }
 
 // TotalStart is the period_start of a scope's all-time row in spend_totals.
@@ -458,35 +462,55 @@ func (w *PGWriter) EnsurePartitions(ctx context.Context) error {
 }
 
 func (w *PGWriter) ensurePartitions(ctx context.Context, now time.Time) error {
-	// One connection, so the lock timeout stays with these statements. A new
-	// partition briefly locks its parent; behind a long query it gives up and
-	// tries again rather than hold every insert up behind it.
+	// One connection, so the lock and the lock timeout stay with these
+	// statements. A new partition briefly locks its parent; behind a long query
+	// it gives up and tries again rather than hold every insert up behind it.
 	conn, err := w.pool.Acquire(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Release()
+	// Waited for, not tried: the other control plane's pass is short, and this
+	// one must then read the bounds of what it made.
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, store.LockPartitions); err != nil {
+		return err
+	}
+	defer func() {
+		uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if _, err := conn.Exec(uctx, `SELECT pg_advisory_unlock($1)`, store.LockPartitions); err != nil {
+			conn.Conn().Close(uctx)
+		}
+	}()
 	if _, err := conn.Exec(ctx, `SET lock_timeout = '5s'`); err != nil {
 		return err
 	}
 	defer conn.Exec(context.WithoutCancel(ctx), `RESET lock_timeout`)
+	have, err := partitionSpans(ctx, conn.Conn(), "usage_events")
+	if err != nil {
+		return err
+	}
 
 	lo, hi := Window(now)
 	var firstErr error
 	for start := lo; start.Before(hi); start = start.AddDate(0, 1, 0) {
 		end := start.AddDate(0, 1, 0)
-		// usage_events' bounds are dates, read in the database's time zone, as
-		// its first partitions were made; the rollups' are UTC instants. The
-		// rollups' rows are updated in place: see migration 0028.
-		for _, t := range []struct{ table, layout, with string }{
-			{"usage_events", "2006-01-02", ""},
-			{"usage_hourly", "2006-01-02 15:04:05Z07", rollupStorage},
-			{"usage_daily", "2006-01-02 15:04:05Z07", rollupStorage},
-		} {
-			name := t.table + "_" + start.Format("2006_01")
+		for _, table := range []string{"usage_events", "usage_hourly", "usage_daily"} {
+			name := table + "_" + start.Format("2006_01")
+			from, to, with := start, end, rollupStorage
+			if table == "usage_events" {
+				if _, ok := have[name]; ok {
+					continue
+				}
+				var ok bool
+				if from, to, ok = eventSpan(start, have); !ok {
+					continue // its neighbours cover the month already
+				}
+				with = ""
+			}
 			// DDL cannot take bind params; bounds are generated, not user input
-			ddl := `CREATE TABLE IF NOT EXISTS ` + name + ` PARTITION OF ` + t.table +
-				` FOR VALUES FROM ('` + start.Format(t.layout) + `') TO ('` + end.Format(t.layout) + `')` + t.with
+			ddl := `CREATE TABLE IF NOT EXISTS ` + name + ` PARTITION OF ` + table +
+				` FOR VALUES FROM ('` + from.Format(boundLayout) + `') TO ('` + to.Format(boundLayout) + `')` + with
 			var err error
 			for try := 1; ; try++ {
 				if _, err = conn.Exec(ctx, ddl); err == nil || try == 3 || !store.LockTimedOut(err) {
@@ -499,10 +523,79 @@ func (w *PGWriter) ensurePartitions(ctx context.Context, now time.Time) error {
 				if firstErr == nil {
 					firstErr = fmt.Errorf("create partition %s: %w", name, err)
 				}
+				continue
+			}
+			if table == "usage_events" {
+				have[name] = span{from, to}
 			}
 		}
 	}
 	return firstErr
+}
+
+// boundLayout writes a partition bound as a UTC instant.
+const boundLayout = "2006-01-02 15:04:05Z07"
+
+type span struct{ from, to time.Time }
+
+// boundsRE picks the two instants out of pg_get_expr's FOR VALUES FROM (...)
+// TO (...); a DEFAULT or MINVALUE partition does not match.
+const boundsRE = `^FOR VALUES FROM \('([^']+)'\) TO \('([^']+)'\)$`
+
+// partitionSpans reads the bounds of table's partitions from the catalog, by
+// partition name.
+func partitionSpans(ctx context.Context, conn *pgx.Conn, table string) (map[string]span, error) {
+	rows, err := conn.Query(ctx, `
+		SELECT c.relname, b[1]::timestamptz, b[2]::timestamptz
+		FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid,
+		     regexp_match(pg_get_expr(c.relpartbound, c.oid), $2) AS b
+		WHERE i.inhparent = $1::regclass AND b IS NOT NULL`, table, boundsRE)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]span{}
+	var name string
+	var from, to time.Time
+	_, err = pgx.ForEachRow(rows, []any{&name, &from, &to}, func() error {
+		out[name] = span{from.UTC(), to.UTC()}
+		return nil
+	})
+	return out, err
+}
+
+// eventSpan is the range a new usage_events partition for the month starting
+// at start takes: that UTC month, but starting where the partition below it
+// ends and ending where the one above it starts. Partitions made before 0.4
+// have bounds in the database's time zone, hours off the UTC month, so the
+// first new one closes the gap or overlap and those after it are UTC months.
+// It returns false when nothing in the month is left uncovered.
+func eventSpan(start time.Time, have map[string]span) (from, to time.Time, ok bool) {
+	end := start.AddDate(0, 1, 0)
+	from = start
+	// No zone is more than a day off UTC: a partition ending within two days
+	// before start, or inside the month, is the one below.
+	found := false
+	for _, s := range have {
+		if s.to.After(start.Add(-48*time.Hour)) && !s.to.After(end) && (!found || s.to.After(from)) {
+			from, found = s.to, true
+		}
+	}
+	// A partition that holds from pushes it up, rather than overlap it.
+	for moved := true; moved; {
+		moved = false
+		for _, s := range have {
+			if !s.from.After(from) && s.to.After(from) {
+				from, moved = s.to, true
+			}
+		}
+	}
+	to = end
+	for _, s := range have {
+		if !s.from.Before(from) && s.from.Before(to) {
+			to = s.from
+		}
+	}
+	return from, to, from.Before(to)
 }
 
 const rollupStorage = ` WITH (fillfactor = 90, autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.02)`
@@ -529,11 +622,13 @@ func (w *PGWriter) maintain(ctx context.Context) {
 		}
 	}()
 
-	if err := w.EnsureIndexes(ctx); err != nil && ctx.Err() == nil {
-		slog.Error("usage indexes", "err", err)
-	}
+	// Prune first: it finishes detaching partitions, which index adoption
+	// would otherwise have to skip.
 	if err := w.Prune(ctx, time.Now()); err != nil && ctx.Err() == nil {
 		slog.Error("usage retention", "err", err)
+	}
+	if err := w.EnsureIndexes(ctx); err != nil && ctx.Err() == nil {
+		slog.Error("usage indexes", "err", err)
 	}
 	for _, fn := range w.Maintenance {
 		if err := fn(ctx); err != nil && ctx.Err() == nil {
@@ -545,65 +640,6 @@ func (w *PGWriter) maintain(ctx context.Context) {
 	if _, err := w.pool.Exec(ctx, `ANALYZE usage_hourly, usage_daily`); err != nil && ctx.Err() == nil {
 		slog.Error("analyze usage rollups", "err", err)
 	}
-}
-
-// partitionIndexes are the indexes every usage_events partition carries, as
-// name suffix and columns.
-var partitionIndexes = [][2]string{
-	{"_team_ts", "(team_id, ts)"},
-	{"_key_ts", "(api_key_id, ts)"},
-	{"_user_ts", "(user_id, ts)"},
-	// the Requests feed and other scans bounded only by time
-	{"_ts", "(ts DESC)"},
-	// finding one request by its id
-	{"_request", "(request_id)"},
-}
-
-// EnsureIndexes builds the indexes missing from any partition, old ones
-// included. It builds them CONCURRENTLY, so writes carry on while a large
-// partition is indexed, and so it must not run inside a transaction.
-func (w *PGWriter) EnsureIndexes(ctx context.Context) error {
-	if !w.indexing.TryLock() {
-		return nil // a pass is already running
-	}
-	defer w.indexing.Unlock()
-	rows, err := w.pool.Query(ctx, `SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
-		WHERE i.inhparent = 'usage_events'::regclass ORDER BY 1`)
-	if err != nil {
-		return err
-	}
-	parts, err := pgx.CollectRows(rows, pgx.RowTo[string])
-	if err != nil {
-		return err
-	}
-	var firstErr error
-	for _, part := range parts {
-		for _, idx := range partitionIndexes {
-			name := part + idx[0]
-			var valid *bool
-			if err := w.pool.QueryRow(ctx,
-				`SELECT (SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1))`, name).Scan(&valid); err != nil {
-				return err
-			}
-			if valid != nil && *valid {
-				continue
-			}
-			// An interrupted concurrent build leaves an invalid index behind.
-			// names are generated, not user input
-			if valid != nil {
-				if _, err := w.pool.Exec(ctx, `DROP INDEX CONCURRENTLY IF EXISTS `+name); err != nil {
-					slog.Error("drop invalid partition index failed", "index", name, "err", err)
-				}
-			}
-			if _, err := w.pool.Exec(ctx, `CREATE INDEX CONCURRENTLY IF NOT EXISTS `+name+` ON `+part+` `+idx[1]); err != nil {
-				slog.Error("create partition index failed", "index", name, "err", err)
-				if firstErr == nil {
-					firstErr = fmt.Errorf("create index %s: %w", name, err)
-				}
-			}
-		}
-	}
-	return firstErr
 }
 
 // zeroIfNil keeps NULL for unmeasured values, so a missing TTFT is not read as

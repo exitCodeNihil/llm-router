@@ -157,7 +157,7 @@ type Price struct {
 // usage its gateways upload.
 type built struct {
 	cfg  Config
-	keys map[string]*snapshot.Key // by id: keys the group serves
+	keys map[string]*snapshot.Key // by id: keys the group serves (never an OldHash copy when the key is there)
 	// unserved names the providers with models the group serves that this
 	// schema leaves out, sorted.
 	unserved []string
@@ -209,7 +209,11 @@ func buildConfig(s *snapshot.Snapshot, g *snapshot.GatewayGroup, schema int) bui
 		if t != nil {
 			teams[t.ID] = t
 		}
-		b.keys[k.ID] = k
+		// A rotated key has more than one entry: its current hash and the
+		// old ones still in their grace period, all with the key's id.
+		if !k.OldHash || b.keys[k.ID] == nil {
+			b.keys[k.ID] = k
+		}
 		ids = append(ids, &auth.Identity{Key: k, User: u, Team: t})
 		wk := Key{Hash: hex.EncodeToString(hash[:]), ID: k.ID, UserID: k.UserID, TeamID: k.TeamID,
 			AllowedModels: list(k.AllowedModels), BudgetUSD: k.BudgetUSD, RPMLimit: k.RPMLimit, TPMLimit: k.TPMLimit}
@@ -265,7 +269,7 @@ func buildConfig(s *snapshot.Snapshot, g *snapshot.GatewayGroup, schema int) bui
 	providers := map[string]*snapshot.Provider{}
 	unserved := map[string]bool{}
 	for _, name := range names {
-		for _, d := range routingOrder(s.DeploymentsByModel[name], g.Region) {
+		for _, d := range routingOrder(s.DeploymentsByModel[name], g.Region, g.StrictRegion) {
 			if !servable(d.Provider, schema) {
 				unserved[d.Provider.Name] = true
 				continue
@@ -293,7 +297,12 @@ func buildConfig(s *snapshot.Snapshot, g *snapshot.GatewayGroup, schema int) bui
 	}
 
 	// Stable order, so a config only changes when its content does.
-	sort.Slice(c.Keys, func(i, j int) bool { return c.Keys[i].ID < c.Keys[j].ID })
+	sort.Slice(c.Keys, func(i, j int) bool {
+		if c.Keys[i].ID != c.Keys[j].ID {
+			return c.Keys[i].ID < c.Keys[j].ID
+		}
+		return c.Keys[i].Hash < c.Keys[j].Hash
+	})
 	sort.Slice(c.Users, func(i, j int) bool { return c.Users[i].ID < c.Users[j].ID })
 	sort.Slice(c.Teams, func(i, j int) bool { return c.Teams[i].ID < c.Teams[j].ID })
 	sort.Slice(c.Providers, func(i, j int) bool { return c.Providers[i].ID < c.Providers[j].ID })
@@ -431,8 +440,10 @@ func addIdentityUsers(c *Config, s *snapshot.Snapshot, g *snapshot.GatewayGroup,
 }
 
 // routingOrder puts the deployments in the group's region first, keeping the
-// snapshot's priority-then-price order inside each part.
-func routingOrder(ds []*snapshot.Deployment, region string) []*snapshot.Deployment {
+// snapshot's priority-then-price order inside each part. A strict group gets
+// only those: a model with no deployment in the region is then not served by
+// its gateways at all, and neither are the other regions' credentials sent.
+func routingOrder(ds []*snapshot.Deployment, region string, strict bool) []*snapshot.Deployment {
 	if region == "" {
 		return ds
 	}
@@ -441,6 +452,9 @@ func routingOrder(ds []*snapshot.Deployment, region string) []*snapshot.Deployme
 		if d.Region == region {
 			out = append(out, d)
 		}
+	}
+	if strict {
+		return out
 	}
 	for _, d := range ds {
 		if d.Region != region {
