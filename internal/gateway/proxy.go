@@ -84,6 +84,17 @@ func (g *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// telemetry export decision computed once, now that identity is known
 	dec := telemetryDecision(snap, id, reqID, tr)
 
+	release, ok, msg := g.reserve(snap, id, deployments[0], body.Model, raw, maxTokensOf(body.fields),
+		strings.HasSuffix(r.URL.Path, "/embeddings"))
+	if !ok {
+		w.Header().Set("Retry-After", "1")
+		writeLimitError(w, http.StatusTooManyRequests, "budget_reserved", msg)
+		g.emit(snap, id, nil, body, reqID, usageCounts{}, http.StatusTooManyRequests, start, nil, "", dec,
+			emitExtra{Trace: tr, ErrorCode: "budget_reserved"})
+		return
+	}
+	defer release()
+
 	resp, chosen, attempts, err := tryDeployments(r.Context(), deployments, r.URL.Path[len("/v1"):], func(d *snapshot.Deployment) ([]byte, error) {
 		if d.APIFlavor == "anthropic" {
 			return oaiToAnthBody(body, d.UpstreamName)
@@ -142,6 +153,7 @@ func (g *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	e := g.emit(snap, id, chosen, body, reqID, counts, resp.StatusCode, start, input, output, dec,
 		emitExtra{Trace: tr, Attempts: attempts, ErrorCode: upstreamErrorCode(resp.StatusCode),
 			System: system, Truncated: cut})
+	g.outputs.add(body.Model, counts.Completion)
 	if g.Limits != nil {
 		g.Limits.RecordUsage(id, counts.Prompt+counts.Completion, e.CostUSD)
 	}

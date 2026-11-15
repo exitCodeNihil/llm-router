@@ -49,7 +49,7 @@ func readSSO(ctx context.Context, q db) (*storedSSO, error) {
 // LoadSSO reads the SSO configuration with its secret decrypted. With
 // ErrSSOSecret it still returns the rest of the configuration. Not configured
 // is pgx.ErrNoRows.
-func LoadSSO(ctx context.Context, q db, encryptionKey string) (*SSOConfig, error) {
+func LoadSSO(ctx context.Context, q db, keys snapshot.Keyring) (*SSOConfig, error) {
 	s, err := readSSO(ctx, q)
 	if err != nil {
 		return nil, err
@@ -57,7 +57,7 @@ func LoadSSO(ctx context.Context, q db, encryptionKey string) (*SSOConfig, error
 	cfg := &SSOConfig{IssuerURL: s.IssuerURL, ClientID: s.ClientID, ClientSecret: s.ClientSecret,
 		RedirectURL: s.RedirectURL, AutoCreateUsers: s.AutoCreateUsers}
 	if len(s.ClientSecretEnc) > 0 {
-		if cfg.ClientSecret, err = snapshot.Decrypt(encryptionKey, s.ClientSecretEnc); err != nil {
+		if cfg.ClientSecret, err = keys.Decrypt(s.ClientSecretEnc); err != nil {
 			return cfg, ErrSSOSecret
 		}
 	}

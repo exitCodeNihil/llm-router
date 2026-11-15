@@ -1,7 +1,7 @@
 # Monitoring
 
 llm-router has two kinds of process to watch: the control plane (the `llm-router` image, one
-replica) and the gateways (`llm-router-gateway`, as many as you run). Both serve Prometheus metrics
+replica or a few) and the gateways (`llm-router-gateway`, as many as you run). Both serve Prometheus metrics
 at `/metrics`, and the console's **Gateways** page shows each gateway's last hour without any of it.
 
 The number that matters most is a gateway's memory against its container's limit. Past saturation
@@ -52,6 +52,7 @@ Both runtimes write these with the same names, so a sum over every scraped targe
 | `llmr_snapshot_build_failures_total` | counter | | Control plane: rebuilds that failed; the previous config stays in use |
 | `llmr_db_pool_acquired_conns`, `llmr_db_pool_idle_conns`, `llmr_db_pool_max_conns` | gauge | `pool` (`main`, `console`) | Control plane: Postgres connections in use, idle, and the most the pool opens |
 | `llmr_db_pool_acquire_wait_seconds_total` | counter | `pool` | Control plane: time spent waiting for a free connection |
+| `llmr_secrets_old_key` | gauge | | Control plane: stored secrets still encrypted under a key in `LLMR_ENCRYPTION_KEYS_OLD` or `LLMR_ENCRYPTION_KEY_NEXT`, checked each minute. 0 on every control plane: the old key can be removed ([rotation](deploy.md#rotating-the-encryption-key)) |
 | `llmr_build_info` | gauge | `runtime` (`control_plane`, `gateway`), `version` | Always 1 |
 
 Gateways only:
@@ -197,5 +198,7 @@ low: scale on CPU and memory, and give gateways a memory limit, so the memory al
 to measure against. Memory and its limit are read from cgroup v2; on a cgroup v1 host memory is the
 process's resident size and there is no limit.
 
-The control plane doesn't scale out. It keeps rate limits, budget counters, live metrics and the
-gateway history in memory, so it runs as one replica (see [Kubernetes](deploy.md#kubernetes)).
+The control plane can run as several replicas for availability; they share rate limits and
+budgets through Postgres (see [Several control planes](deploy.md#several-control-planes)). Each
+replica reports a gateway's series only while that gateway syncs with it, so summing over all
+control planes counts each gateway once.

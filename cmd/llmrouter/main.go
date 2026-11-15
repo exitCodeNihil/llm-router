@@ -17,6 +17,7 @@ import (
 
 	"github.com/exitcodenihil/llm-router/internal/audit"
 	"github.com/exitcodenihil/llm-router/internal/auth"
+	"github.com/exitcodenihil/llm-router/internal/cluster"
 	"github.com/exitcodenihil/llm-router/internal/config"
 	"github.com/exitcodenihil/llm-router/internal/console"
 	"github.com/exitcodenihil/llm-router/internal/gateway"
@@ -25,6 +26,7 @@ import (
 	"github.com/exitcodenihil/llm-router/internal/metrics"
 	"github.com/exitcodenihil/llm-router/internal/mgmt"
 	"github.com/exitcodenihil/llm-router/internal/pricing"
+	"github.com/exitcodenihil/llm-router/internal/rekey"
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
 	"github.com/exitcodenihil/llm-router/internal/store"
 	"github.com/exitcodenihil/llm-router/internal/telemetry"
@@ -139,7 +141,10 @@ func run() error {
 		return fmt.Errorf("encrypt the SSO client secret: %w", err)
 	}
 
-	builder := &snapshot.Builder{Pool: st.Pool, EncryptionKey: cfg.EncryptionKey}
+	// The keys of an encryption-key rotation: written under Current, read
+	// and verified under all (docs/deploy.md).
+	keys := snapshot.Keyring{Current: cfg.EncryptionKey, Others: cfg.OtherKeys()}
+	builder := &snapshot.Builder{Pool: st.Pool, EncryptionKey: keys.Current, OtherKeys: keys.Others}
 	buildStart := time.Now()
 	first, err := builder.Build(ctx)
 	if err != nil {
@@ -150,6 +155,14 @@ func run() error {
 	go snapshot.Refresher(ctx, st.Pool, builder, holder, 30*time.Second)
 
 	writer := usage.NewPGWriter(st.Pool)
+	// Spend the limiter added when a request finished is in Postgres now.
+	writer.Committed = func(events []usage.Event) {
+		for _, e := range events {
+			for _, scope := range usage.ScopeKeys(e) {
+				lim.Committed(scope, e.CostUSD)
+			}
+		}
+	}
 	writer.Retention = usage.Retention{RawMonths: cfg.UsageRetentionMonths, RollupMonths: cfg.RollupRetentionMonths}
 	if err := writer.Retention.Validate(); err != nil {
 		return fmt.Errorf("LLMR_USAGE_RETENTION_MONTHS / LLMR_ROLLUP_RETENTION_MONTHS: %w", err)
@@ -213,13 +226,43 @@ func run() error {
 	if cfg.AdminToken == "" {
 		slog.Warn("LLMR_ADMIN_TOKEN is not set; bootstrap admin login is disabled")
 	}
-	mg := &mgmt.Server{Store: st, AdminToken: cfg.AdminToken, EncryptionKey: cfg.EncryptionKey,
+	mg := &mgmt.Server{Store: st, AdminToken: cfg.AdminToken, EncryptionKey: keys.Current, OtherKeys: keys.Others,
 		Snapshots: holder, Live: live, NodeStore: nodeStore, HTTP: httpm, Events: events, Recorder: recorder, Telemetry: exporter,
 		Gateway: gw, Version: version, Started: time.Now(), IDEOrigin: cfg.IDEOrigin,
 		UsageRetentionMonths: cfg.UsageRetentionMonths, Audit: auditRec, TrustedProxies: cfg.TrustedProxies,
 		CookieDomain: cfg.CookieDomain}
 	mg.Register(mux)
 	go mg.SyncWorkspaceModels(ctx)
+
+	// Other control planes on this database, if any: limits and budgets are
+	// shared with them, and each one's console shows all of them.
+	node := &cluster.Node{Pool: st.Pool, Limits: lim, Version: version, State: mg.ClusterState,
+		Spend: func(ctx context.Context, scopes []string) (map[string]float64, time.Time, error) {
+			return builder.SpendOf(ctx, holder.Get(), scopes)
+		}}
+	mg.Peers = node.Peers
+	node.KeyFP = snapshot.KeyFP(keys.Current)
+	// Secrets under an old key are rewritten only once every replica has
+	// this one's current key, and only once they have been looked up.
+	rk := &rekey.Rekeyer{Pool: st.Pool, Keys: keys, PeersAgree: func() bool {
+		for _, p := range node.Peers() {
+			if p.KeyFP != node.KeyFP {
+				return false
+			}
+		}
+		return node.Known()
+	}}
+	go rk.Run(ctx)
+	promReg.Register(rekeyMetrics(rk))
+	go node.Run(ctx)
+	promReg.Register(metrics.CollectorFunc(func(w *metrics.PromWriter) {
+		w.Family("llmr_control_planes", "gauge", "Control planes running on this database, this one included")
+		w.Sample("llmr_control_planes", float64(1+len(node.Peers())))
+		w.Family("llmr_cluster_sync_errors_total", "counter", "Rounds of sharing limits with the other control planes that failed")
+		w.Sample("llmr_cluster_sync_errors_total", float64(node.Errors.Load()))
+		w.Family("llmr_budget_reserved_usd", "gauge", "Expected cost of requests in flight, held against budgets")
+		w.Sample("llmr_budget_reserved_usd", lim.Held())
+	}))
 	if cfg.IDEListen != "" {
 		ideMux := http.NewServeMux()
 		mg.RegisterIDE(ideMux)
@@ -237,12 +280,13 @@ func run() error {
 	} else {
 		slog.Warn("LLMR_IDE_ORIGIN is not set: workspace IDEs share the console origin; set LLMR_IDE_LISTEN/LLMR_IDE_ORIGIN in production")
 	}
-	consoleAuth := &console.Auth{Store: st, EncryptionKey: cfg.EncryptionKey, CookieDomain: cfg.CookieDomain,
+	consoleAuth := &console.Auth{Store: st, EncryptionKey: keys.Current, OtherKeys: keys.Others, CookieDomain: cfg.CookieDomain,
 		TrustedProxies: cfg.TrustedProxies, Audit: auditRec.Record}
 	consoleAuth.Register(mux)
 	mg.TokenGuard = consoleAuth
 	gwSync := &gwsync.Server{Store: st, Snapshots: holder, Limits: lim, Export: usage.MultiWriter{exporter, live}, Nodes: nodeStore,
-		Key: auth.DeriveKey("llmr-gw-session", cfg.EncryptionKey), RecordClientIP: cfg.UsageClientIP}
+		Key: auth.DeriveKey("llmr-gw-session", keys.Current), VerifyKeys: auth.DeriveKeys("llmr-gw-session", keys.Others...),
+		RecordClientIP: cfg.UsageClientIP}
 	gwSync.Register(mux)
 	mg.GatewaySync = gwSync
 	mux.Handle("/", console.SPA())

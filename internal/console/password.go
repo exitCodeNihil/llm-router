@@ -42,7 +42,7 @@ func (a *Auth) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// An undecryptable secret hides the SSO button: sign-in cannot work.
-	_, ssoErr := LoadSSO(r.Context(), a.Store.Pool, a.EncryptionKey)
+	_, ssoErr := LoadSSO(r.Context(), a.Store.Pool, a.keys())
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"needed": needed, "sso": ssoErr == nil})
 }

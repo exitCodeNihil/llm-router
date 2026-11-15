@@ -30,6 +30,10 @@ type LimitChecker interface {
 	Check(id *auth.Identity, s *snapshot.Snapshot) (bool, int, string, string)
 	// RecordUsage feeds TPM buckets and budget deltas after a request completes.
 	RecordUsage(id *auth.Identity, tokens int, costUSD float64)
+	// Reserve holds a request's expected cost against its budgets until
+	// release is called; ok false means they are taken up by requests in
+	// progress.
+	Reserve(id *auth.Identity, usd float64) (release func(), ok bool, msg string)
 }
 
 // CloudTokenValidator is implemented by the auth package for Entra/GCP inbound
@@ -41,6 +45,7 @@ type Server struct {
 	Usage     usage.Writer
 	Limits    LimitChecker
 	CloudAuth CloudTokenValidator
+	outputs   outputStats // what requests usually produce, for budget reservations
 	// RecordClientIP stores each request's client address with its usage
 	// (LLMR_USAGE_CLIENT_IP); TrustedProxies name the proxies whose
 	// X-Forwarded-For is believed.

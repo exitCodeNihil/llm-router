@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,7 +20,11 @@ import (
 type Builder struct {
 	Pool          *pgxpool.Pool
 	EncryptionKey string
+	// OtherKeys open secrets sealed under a key being rotated in or out.
+	OtherKeys []string
 }
+
+func (b *Builder) keys() Keyring { return Keyring{Current: b.EncryptionKey, Others: b.OtherKeys} }
 
 func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 	s := &Snapshot{
@@ -36,6 +41,13 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 	if err := b.Pool.QueryRow(ctx,
 		`SELECT (value::text)::bigint FROM settings WHERE key='config_version'`).Scan(&s.Version); err != nil {
 		return nil, fmt.Errorf("config_version: %w", err)
+	}
+	// The cluster's identifier and timeline: a restore from a dump is another
+	// cluster, a point-in-time recovery or a failover another timeline.
+	var sysid, timeline int64
+	if err := b.Pool.QueryRow(ctx, `SELECT (pg_control_system()).system_identifier,
+		(pg_control_checkpoint()).timeline_id`).Scan(&sysid, &timeline); err == nil {
+		s.Epoch = strconv.FormatInt(sysid, 36) + "." + strconv.FormatInt(timeline, 36)
 	}
 
 	rows, err := b.Pool.Query(ctx, `SELECT id, email, role, budget_usd, budget_period, rpm_limit, tpm_limit, tags, allowed_models FROM users WHERE NOT disabled`)
@@ -173,7 +185,7 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 		// only decrypt when the auth mode actually uses the stored key —
 		// entra/none providers may carry stale ciphertext from an old key
 		if len(enc) > 0 && ProviderHasSecret(p.AuthMode) {
-			key, err := Decrypt(b.EncryptionKey, enc)
+			key, err := b.keys().Decrypt(enc)
 			if err != nil {
 				slog.Error("decrypt provider api key failed; provider disabled", "provider", p.Name, "err", err)
 				continue
@@ -321,7 +333,7 @@ func (b *Builder) loadDestinations(ctx context.Context, s *Snapshot) error {
 			return err
 		}
 		if len(enc) > 0 {
-			plain, err := Decrypt(b.EncryptionKey, enc)
+			plain, err := b.keys().Decrypt(enc)
 			if err == nil {
 				err = json.Unmarshal([]byte(plain), &d.Secrets)
 			}
@@ -379,11 +391,38 @@ func (b *Builder) loadOldHashes(ctx context.Context, s *Snapshot, keysByID map[s
 }
 
 func (b *Builder) loadSpend(ctx context.Context, s *Snapshot) error {
+	s.SpendAt = time.Now().UTC() // before the queries: a reading is never dated later than it was taken
+	return b.readSpend(ctx, s, nil, s.Spend)
+}
+
+// SpendOf reads the current-period spend of the given scopes ("key:<id>",
+// ...) of s from Postgres, and when the reading started. A scope with no row,
+// or no budget in s, is absent: it has spent nothing.
+func (b *Builder) SpendOf(ctx context.Context, s *Snapshot, scopes []string) (map[string]float64, time.Time, error) {
+	at := time.Now().UTC()
+	only := make(map[string]bool, len(scopes))
+	for _, sc := range scopes {
+		only[sc] = true
+	}
+	read := map[string]Spend{}
+	if err := b.readSpend(ctx, s, only, read); err != nil {
+		return nil, at, err
+	}
+	out := make(map[string]float64, len(read))
+	for k, v := range read {
+		out[k] = v.USD
+	}
+	return out, at, nil
+}
+
+// readSpend reads the spend of s's budgeted scopes, or of those in only,
+// into out.
+func (b *Builder) readSpend(ctx context.Context, s *Snapshot, only map[string]bool, out map[string]Spend) error {
 	// The budgeted scopes, by the period their budget runs over.
 	type scopes struct{ types, ids []string }
 	var daily, monthly, total scopes
 	add := func(scopeType, scopeID string, budget *float64, period string) {
-		if budget == nil {
+		if budget == nil || (only != nil && !only[scopeType+":"+scopeID]) {
 			return
 		}
 		var to *scopes
@@ -416,7 +455,6 @@ func (b *Builder) loadSpend(ctx context.Context, s *Snapshot) error {
 	}
 
 	now := time.Now().UTC()
-	s.SpendAt = now // before the queries: a reading is never dated later than it was taken
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
 
@@ -435,7 +473,7 @@ func (b *Builder) loadSpend(ctx context.Context, s *Snapshot) error {
 			if err := rows.Scan(&scopeType, &scopeID, &usd); err != nil {
 				return err
 			}
-			s.Spend[scopeType+":"+scopeID] = Spend{USD: usd}
+			out[scopeType+":"+scopeID] = Spend{USD: usd}
 		}
 		return rows.Err()
 	}

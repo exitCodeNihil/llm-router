@@ -38,7 +38,7 @@ func (m *Server) resolveCaller(r *http.Request) *Caller {
 		subtle.ConstantTimeCompare([]byte(token), []byte(m.AdminToken)) == 1 {
 		return &Caller{IsAdmin: true, Email: "bootstrap-admin"}
 	}
-	s, ok := console.RequestSession(m.EncryptionKey, r)
+	s, ok := console.RequestSession(m.keys(), r)
 	if !ok {
 		return nil
 	}

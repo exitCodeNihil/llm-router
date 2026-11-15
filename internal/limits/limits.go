@@ -349,7 +349,12 @@ func (r *Reservation) Release() {
 // budget, so parallel requests can't all pass on the same remaining dollars.
 // A scope with nothing else in flight never refuses here: one request can
 // always run. A refusal gives back the request's rate slot.
-func (c *Checker) Reserve(id *auth.Identity, usd float64) (*Reservation, bool, string) {
+func (c *Checker) Reserve(id *auth.Identity, usd float64) (release func(), ok bool, msg string) {
+	r, ok, msg := c.reserve(id, usd)
+	return r.Release, ok, msg
+}
+
+func (c *Checker) reserve(id *auth.Identity, usd float64) (*Reservation, bool, string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	scopes := scopesOf(id)

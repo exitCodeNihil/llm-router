@@ -239,7 +239,7 @@ func TestOIDCFlow(t *testing.T) {
 	cleared(w)
 	if s := session(w); s == nil {
 		t.Fatal("no session after a good callback")
-	} else if got, err := VerifySession(key, s.Value); err != nil || got.UserID != userID.String() || got.SID == "" {
+	} else if got, err := VerifySession(one(key), s.Value); err != nil || got.UserID != userID.String() || got.SID == "" {
 		t.Fatalf("session = %+v, %v", got, err)
 	}
 

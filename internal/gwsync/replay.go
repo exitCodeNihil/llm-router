@@ -22,6 +22,9 @@ import (
 // by its request id, however often it is sent and whichever instance sends it.
 type ReplayRequest struct {
 	Events []SyncEvent `json:"events"`
+	// Schema 3: the config the gateway runs on, as in SyncRequest.
+	ConfigVersion int64  `json:"config_version,omitempty"`
+	ConfigEpoch   string `json:"config_epoch,omitempty"`
 }
 
 // ReplayResponse counts what became of a replay's events. Dropped ones were
@@ -92,13 +95,6 @@ func (s *Server) replay(w http.ResponseWriter, r *http.Request, p peer) {
 		http.Error(w, "control plane starting", http.StatusServiceUnavailable)
 		return
 	}
-	g := snap.GatewayGroups[p.group]
-	if g == nil {
-		http.Error(w, "gateway group removed", http.StatusUnauthorized)
-		return
-	}
-	// As in sync: the stored events' spend is added on top of this snapshot.
-	s.Limits.Observe(snap)
 	body := io.Reader(r.Body)
 	if r.Header.Get("Content-Encoding") == "gzip" {
 		gz, err := gzip.NewReader(r.Body)
@@ -114,6 +110,16 @@ func (s *Server) replay(w http.ResponseWriter, r *http.Request, p peer) {
 		http.Error(w, "invalid replay request", http.StatusBadRequest)
 		return
 	}
+	if behind(w, snap, req.ConfigEpoch, req.ConfigVersion) {
+		return
+	}
+	g := snap.GatewayGroups[p.group]
+	if g == nil {
+		http.Error(w, "gateway group removed", http.StatusUnauthorized)
+		return
+	}
+	// As in sync: the stored events' spend is added on top of this snapshot.
+	s.Limits.Observe(snap)
 	enc := s.encoded(snap, p.group, p.schema)
 	events, dropped := s.accept(snap, g, enc, p, req.Events)
 	resp := ReplayResponse{Dropped: dropped}

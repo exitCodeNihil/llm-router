@@ -63,7 +63,7 @@ func TestMigrateSSOAgainstPostgres(t *testing.T) {
 	if row() != first {
 		t.Error("the second run changed the row")
 	}
-	cfg, err := LoadSSO(ctx, st.Pool, key)
+	cfg, err := LoadSSO(ctx, st.Pool, one(key))
 	if err != nil || cfg.ClientSecret != "plain-secret-1" || cfg.ClientID != "cid" || !cfg.AutoCreateUsers {
 		t.Fatalf("LoadSSO: %+v %v", cfg, err)
 	}
@@ -73,11 +73,11 @@ func TestMigrateSSOAgainstPostgres(t *testing.T) {
 	if err := SaveSSO(ctx, st.Pool, key, cfg); err != nil {
 		t.Fatal(err)
 	}
-	if cfg, err = LoadSSO(ctx, st.Pool, key); err != nil || cfg.ClientSecret != "plain-secret-1" || cfg.ClientID != "cid2" {
+	if cfg, err = LoadSSO(ctx, st.Pool, one(key)); err != nil || cfg.ClientSecret != "plain-secret-1" || cfg.ClientID != "cid2" {
 		t.Fatalf("after a save without a secret: %+v %v", cfg, err)
 	}
 
-	cfg, err = LoadSSO(ctx, st.Pool, "another-encryption-key-0123")
+	cfg, err = LoadSSO(ctx, st.Pool, one("another-encryption-key-0123"))
 	if !errors.Is(err, ErrSSOSecret) || cfg == nil || cfg.ClientID != "cid2" || cfg.ClientSecret != "" {
 		t.Errorf("with another key: %+v %v", cfg, err)
 	}

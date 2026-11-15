@@ -17,6 +17,10 @@ type Config struct {
 	DatabaseURL   string
 	AdminToken    string // bootstrap admin token for mgmt API
 	EncryptionKey string // hex/plain 32-byte key for provider secret encryption
+	// EncryptionKeysOld and EncryptionKeyNext are accepted besides
+	// EncryptionKey but never written with, for a rotation (docs/deploy.md).
+	EncryptionKeysOld []string
+	EncryptionKeyNext string
 
 	// IDEListen/IDEOrigin put the workspace IDE proxy on its own origin so
 	// content rendered by a container is never same-origin with the console.
@@ -82,6 +86,12 @@ func Load(args []string) (*Config, error) {
 	}
 	c.TrustedProxies = trusted
 	c.EncryptionKey = os.Getenv("LLMR_ENCRYPTION_KEY")
+	for _, k := range strings.Split(os.Getenv("LLMR_ENCRYPTION_KEYS_OLD"), ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			c.EncryptionKeysOld = append(c.EncryptionKeysOld, k)
+		}
+	}
+	c.EncryptionKeyNext = strings.TrimSpace(os.Getenv("LLMR_ENCRYPTION_KEY_NEXT"))
 	if c.DBMaxConns, err = envInt("LLMR_DB_MAX_CONNS"); err != nil {
 		return nil, err
 	}
@@ -146,6 +156,9 @@ func Load(args []string) (*Config, error) {
 	if err := checkSecret("LLMR_ENCRYPTION_KEY", c.EncryptionKey, true, 16); err != nil {
 		return nil, err
 	}
+	if err := c.checkOtherKeys(); err != nil {
+		return nil, err
+	}
 	if err := checkSecret("LLMR_ADMIN_TOKEN", c.AdminToken, false, 12); err != nil {
 		return nil, err
 	}
@@ -157,6 +170,39 @@ func Load(args []string) (*Config, error) {
 	}
 	c.IDEOrigin = strings.TrimSuffix(c.IDEOrigin, "/")
 	return c, nil
+}
+
+// OtherKeys are the keys accepted besides EncryptionKey: the old ones, then
+// the next.
+func (c *Config) OtherKeys() []string {
+	keys := append([]string{}, c.EncryptionKeysOld...)
+	if c.EncryptionKeyNext != "" {
+		keys = append(keys, c.EncryptionKeyNext)
+	}
+	return keys
+}
+
+// checkOtherKeys holds the rotation keys to the current key's standard, and
+// refuses a repeat: a key listed twice is a rotation step done wrong.
+func (c *Config) checkOtherKeys() error {
+	seen := map[string]string{c.EncryptionKey: "LLMR_ENCRYPTION_KEY"}
+	names := make([]string, 0, len(c.EncryptionKeysOld)+1)
+	for range c.EncryptionKeysOld {
+		names = append(names, "LLMR_ENCRYPTION_KEYS_OLD")
+	}
+	if c.EncryptionKeyNext != "" {
+		names = append(names, "LLMR_ENCRYPTION_KEY_NEXT")
+	}
+	for i, k := range c.OtherKeys() {
+		if err := checkSecret(names[i], k, true, 16); err != nil {
+			return err
+		}
+		if prev, ok := seen[k]; ok {
+			return fmt.Errorf("%s repeats a key already in %s", names[i], prev)
+		}
+		seen[k] = names[i]
+	}
+	return nil
 }
 
 // checkSecret refuses the values that ship in examples and anything too short

@@ -130,6 +130,9 @@ type PGWriter struct {
 	// Maintenance runs after Prune in each maintenance pass, under the same
 	// lock. Set before Run.
 	Maintenance []func(context.Context) error
+	// Committed is told of the events of each batch once Postgres holds
+	// them, and their spend with them. Set before Run.
+	Committed func([]Event)
 
 	indexing sync.Mutex // one EnsureIndexes pass at a time
 }
@@ -255,11 +258,19 @@ func (w *PGWriter) flush(ctx context.Context, events []Event) error {
 		// The connection can fail after Postgres committed. Writing the batch
 		// again would count its usage and spend twice, so look for it first.
 		if len(kept) > 0 && w.stored(kept[0]) {
+			w.committed(kept)
 			return nil
 		}
 		return err
 	}
+	w.committed(kept)
 	return nil
+}
+
+func (w *PGWriter) committed(events []Event) {
+	if w.Committed != nil && len(events) > 0 {
+		w.Committed(events)
+	}
 }
 
 // stored reports whether e is in usage_events.

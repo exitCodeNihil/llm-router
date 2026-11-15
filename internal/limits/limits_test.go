@@ -260,7 +260,7 @@ func TestReserve(t *testing.T) {
 		if ok, _, code, _ := c.Check(id, s); !ok {
 			t.Fatalf("check: %s", code)
 		}
-		r, ok, _ := c.Reserve(id, 0.3)
+		r, ok, _ := c.reserve(id, 0.3)
 		return r, ok
 	}
 	r1, ok := admit()
@@ -289,7 +289,7 @@ func TestReserve(t *testing.T) {
 	// Alone, a request runs however large its estimate.
 	c2 := New()
 	c2.Observe(s)
-	if _, ok, _ := c2.Reserve(id, 50); !ok {
+	if _, ok, _ := c2.reserve(id, 50); !ok {
 		t.Fatal("a lone request was refused")
 	}
 	var none *Reservation

@@ -264,7 +264,7 @@ func (m *Server) vertexPatchValid(w http.ResponseWriter, r *http.Request, id uui
 // --- SSO settings ---
 
 func (m *Server) getSSO(w http.ResponseWriter, r *http.Request) {
-	cfg, err := console.LoadSSO(r.Context(), m.Store.Pool, m.EncryptionKey)
+	cfg, err := console.LoadSSO(r.Context(), m.Store.Pool, m.keys())
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		writeJSON(w, http.StatusOK, map[string]any{"configured": false})

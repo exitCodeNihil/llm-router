@@ -51,6 +51,14 @@ with `budget_exceeded` or `rate_limit_exceeded`. Members can't change their own 
 across llm-router and every [gateway](deploy.md#gateways): gateways sync their counts every 2 seconds,
 and tokens are counted after the response, so a burst can overshoot a little.
 
+Cost is only known when a response ends, so while a request runs it holds its expected cost against
+its budgets: about a quarter of its text in input tokens, and twice the model's usual output (or
+`max_tokens`, if that is less). A request that would take a budget past its limit together with
+the ones already running gets `429` with `budget_reserved` and `Retry-After: 1`: the budget is not
+spent yet, and the request may pass once the others finish. A request with nothing else running on
+its budgets is never refused this way. The hold is kept by the process that admitted the request,
+so requests through different gateways can still overshoot by what they admit within a sync.
+
 ## Sign-in and SSO
 
 Create the first admin on the setup screen, or sign in with `LLMR_ADMIN_TOKEN`. For SSO, fill in

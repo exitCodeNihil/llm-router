@@ -20,6 +20,11 @@ SSO, cloud tokens), and the workspace isolation described in
 `LLMR_ENCRYPTION_KEY`, and the workspace container runtime socket being powerful (it is, and
 that is documented).
 
+`LLMR_ENCRYPTION_KEY` can be rotated without downtime or re-entering secrets
+([docs/deploy.md](docs/deploy.md#rotating-the-encryption-key)): the new key is announced, then
+made current while the old one is only read, and stored secrets are re-encrypted under it before
+the old key is removed. Rotate it when it may have leaked, and remove the old key soon after.
+
 ## Data at rest
 
 A gateway writes nothing to disk unless `LLMR_STATE_DIR` is set. With it, the directory holds these

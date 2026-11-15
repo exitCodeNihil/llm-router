@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,9 +17,16 @@ import (
 	"github.com/exitcodenihil/llm-router/internal/usage"
 )
 
-type captureWriter struct{ events []usage.Event }
+type captureWriter struct {
+	mu     sync.Mutex
+	events []usage.Event
+}
 
-func (c *captureWriter) Write(e usage.Event) { c.events = append(c.events, e) }
+func (c *captureWriter) Write(e usage.Event) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.events = append(c.events, e)
+}
 
 func newTestServer(t *testing.T, deployments map[string][]*snapshot.Deployment) (*Server, *captureWriter, string) {
 	t.Helper()

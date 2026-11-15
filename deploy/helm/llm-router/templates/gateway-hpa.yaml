@@ -8,7 +8,7 @@
 {{- fail "gateway.autoscaling.targetMemoryUtilizationPercentage needs gateway.resources.requests.memory" }}
 {{- end }}
 # Gateways scale horizontally: each one joins the group and shares limits
-# through the control plane, which stays a single replica.
+# through the control plane.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:

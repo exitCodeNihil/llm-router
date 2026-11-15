@@ -59,6 +59,7 @@ type Node struct {
 	ticks   int
 	peers   atomic.Pointer[[]Peer]
 	failing bool
+	known   atomic.Bool
 
 	// Errors counts ticks that failed, for /metrics.
 	Errors atomic.Int64
@@ -82,6 +83,10 @@ func (n *Node) Peers() []Peer {
 	}
 	return nil
 }
+
+// Known reports whether the other control planes have been looked up yet:
+// before that, Peers being empty says nothing.
+func (n *Node) Known() bool { return n.known.Load() }
 
 // Run registers and shares until ctx ends, then removes the registration.
 func (n *Node) Run(ctx context.Context) {
@@ -222,6 +227,7 @@ func (n *Node) register(ctx context.Context) error {
 		return err
 	}
 	n.peers.Store(&peers)
+	n.known.Store(true)
 	for id := range n.cursors {
 		gone := true
 		for _, p := range peers {

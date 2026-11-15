@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/exitcodenihil/llm-router/internal/auth"
+	"github.com/exitcodenihil/llm-router/internal/snapshot"
 )
 
 const sessionCookie = "llmr_session"
@@ -45,6 +46,12 @@ func SessionLiveSQL(epoch, sid string) string {
 
 func sessionKey(encryptionKey string) []byte { return auth.DeriveKey("llmr-session", encryptionKey) }
 
+// sessionKeys verify cookies: signed under the current key or one being
+// rotated, so a rotation signs nobody out.
+func sessionKeys(keys snapshot.Keyring) [][]byte {
+	return auth.DeriveKeys("llmr-session", keys.All()...)
+}
+
 func newSID() string {
 	b := make([]byte, 16)
 	rand.Read(b)
@@ -57,8 +64,8 @@ func signSession(key []byte, s Session) string {
 
 // VerifySession returns the session in a valid, unexpired cookie value. It
 // checks the signature only; revocation is the database's (SessionLiveSQL).
-func VerifySession(encryptionKey, value string) (Session, error) {
-	subject, exp, err := auth.VerifyTokenExpiry(sessionKey(encryptionKey), value)
+func VerifySession(keys snapshot.Keyring, value string) (Session, error) {
+	subject, exp, err := auth.VerifyTokenExpiryAny(sessionKeys(keys), value)
 	if err != nil {
 		return Session{}, err
 	}
@@ -109,12 +116,12 @@ func secureRequest(r *http.Request) bool {
 
 // RequestSession returns the request's session cookie when its signature is
 // valid and it has not expired. The caller still checks revocation.
-func RequestSession(encryptionKey string, r *http.Request) (Session, bool) {
+func RequestSession(keys snapshot.Keyring, r *http.Request) (Session, bool) {
 	c, err := r.Cookie(sessionCookie)
 	if err != nil {
 		return Session{}, false
 	}
-	s, err := VerifySession(encryptionKey, c.Value)
+	s, err := VerifySession(keys, c.Value)
 	return s, err == nil
 }
 

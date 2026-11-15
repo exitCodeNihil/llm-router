@@ -3,13 +3,18 @@ image:
   tag: ""            # defaults to appVersion
   pullPolicy: IfNotPresent
 
-# The control plane keeps rate limits, budget counters, live metrics and
-# telemetry export queues in memory, so it runs as one replica. Scale request
-# traffic with gateways (gateway.replicas), which share those limits through
-# it. More than one replica is refused unless allowMultipleReplicas is set,
-# and then each replica enforces limits on its own traffic only.
+# Control planes. One is enough for most installs: gateways (gateway.replicas)
+# carry the traffic and keep serving while it restarts. Run two or more so the
+# console, the API and config changes stay up through a node failure; they
+# share rate limits and budgets through Postgres to within a second or two.
+# Each needs its own Postgres connections (database.maxConns + consoleMaxConns).
 replicas: 1
-allowMultipleReplicas: false
+# false replaces every pod at once on an upgrade (a short gap for the console
+# and for /v1 on the control plane; gateways keep serving). Needed whenever a
+# release changes the database in a way the release before it can't run on,
+# as 0.4 does. true replaces pods one at a time: for restarts, configuration
+# changes and upgrades whose notes say they allow it.
+rollingUpdate: false
 
 # Proxies in front of the console (addresses or CIDR ranges, e.g. your ingress
 # controller's pod range) whose X-Forwarded-For header names the client. Sign-in
@@ -20,7 +25,12 @@ trustedProxies: []
 databaseUrl: ""      # postgres://user:pass@host:5432/db — or use existingSecret
 adminToken: ""
 encryptionKey: ""
-# name of an existing Secret with keys: database-url, admin-token, encryption-key
+# Rotating encryptionKey (docs/deploy.md, "Rotating the encryption key"):
+# keys still read and verified but never written with.
+encryptionKeysOld: []
+encryptionKeyNext: ""
+# name of an existing Secret with keys: database-url, admin-token, encryption-key,
+# and optionally encryption-keys-old (comma-separated) and encryption-key-next
 existingSecret: ""
 
 # debug, info, warn or error; and text or json (one object per line).

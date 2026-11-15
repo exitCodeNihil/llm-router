@@ -20,6 +20,7 @@ import (
 
 	"github.com/exitcodenihil/llm-router/internal/audit"
 	"github.com/exitcodenihil/llm-router/internal/auth"
+	"github.com/exitcodenihil/llm-router/internal/cluster"
 	"github.com/exitcodenihil/llm-router/internal/console"
 	"github.com/exitcodenihil/llm-router/internal/gateway"
 	"github.com/exitcodenihil/llm-router/internal/metrics"
@@ -34,6 +35,8 @@ type Server struct {
 	Store         *store.Store
 	AdminToken    string
 	EncryptionKey string
+	// OtherKeys open secrets sealed under a key being rotated in or out.
+	OtherKeys []string
 
 	// Live console surfaces. All optional; nil-safe handlers.
 	Snapshots *snapshot.Holder
@@ -62,8 +65,10 @@ type Server struct {
 	GatewaySync interface {
 		UnservedProviders(group string, schema int) []string
 	}
-	HTTP     *metrics.HTTP // the control plane's own listener
-	Events   *metrics.Events
+	HTTP   *metrics.HTTP // the control plane's own listener
+	Events *metrics.Events
+	// Peers is the other control planes, when there are any; nil for none.
+	Peers    func() []cluster.Peer
 	Recorder *telemetry.Recorder
 	// Telemetry reports destination health and trace links; nil when no
 	// exporter runs in-process.
@@ -78,6 +83,10 @@ type Server struct {
 }
 
 func (m *Server) Register(mux *http.ServeMux) { m.routes(mux.Handle) }
+
+func (m *Server) keys() snapshot.Keyring {
+	return snapshot.Keyring{Current: m.EncryptionKey, Others: m.OtherKeys}
+}
 
 // routes hands every management route to handle. Each wrapper authenticates,
 // then audits (audit.go), then checks the caller's role.
@@ -922,7 +931,7 @@ func (m *Server) providerModels(w http.ResponseWriter, r *http.Request) {
 	}
 	p.ApplyConfig(cfg)
 	if len(enc) > 0 && snapshot.ProviderHasSecret(p.AuthMode) {
-		if p.APIKey, err = snapshot.Decrypt(m.EncryptionKey, enc); err != nil {
+		if p.APIKey, err = m.keys().Decrypt(enc); err != nil {
 			httpError(w, http.StatusInternalServerError,
 				"cannot decrypt provider credentials — LLMR_ENCRYPTION_KEY changed since the key was saved; re-enter the provider API key")
 			return
@@ -992,7 +1001,7 @@ func (m *Server) syncPrices(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(enc) > 0 && snapshot.ProviderHasSecret(p.AuthMode) {
-			if p.APIKey, err = snapshot.Decrypt(m.EncryptionKey, enc); err != nil {
+			if p.APIKey, err = m.keys().Decrypt(enc); err != nil {
 				rows.Close()
 				httpError(w, http.StatusInternalServerError, "cannot decrypt provider credentials for "+p.Name)
 				return

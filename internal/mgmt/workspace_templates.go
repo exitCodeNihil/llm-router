@@ -261,7 +261,7 @@ func (m *Server) userFiles(r *http.Request, userID uuid.UUID) ([]workspace.File,
 		if err := rows.Scan(&path, &mode, &enc); err != nil {
 			return nil, err
 		}
-		data, err := snapshot.Decrypt(m.EncryptionKey, enc)
+		data, err := m.keys().Decrypt(enc)
 		if err != nil {
 			return nil, err
 		}

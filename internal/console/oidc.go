@@ -15,6 +15,7 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/exitcodenihil/llm-router/internal/audit"
+	"github.com/exitcodenihil/llm-router/internal/snapshot"
 	"github.com/exitcodenihil/llm-router/internal/store"
 )
 
@@ -33,7 +34,9 @@ type SSOConfig struct {
 type Auth struct {
 	Store         *store.Store
 	EncryptionKey string
-	CookieDomain  string
+	// OtherKeys are accepted besides EncryptionKey during a key rotation.
+	OtherKeys    []string
+	CookieDomain string
 	// TrustedProxies are the proxies whose X-Forwarded-For names the client
 	// for sign-in rate limits (LLMR_TRUSTED_PROXIES).
 	TrustedProxies []netip.Prefix
@@ -46,6 +49,10 @@ type Auth struct {
 	mu       sync.Mutex
 	provider *oidc.Provider
 	issuer   string // issuer the cached provider was built for
+}
+
+func (a *Auth) keys() snapshot.Keyring {
+	return snapshot.Keyring{Current: a.EncryptionKey, Others: a.OtherKeys}
 }
 
 func (a *Auth) Register(mux *http.ServeMux) {
@@ -61,7 +68,7 @@ func (a *Auth) Register(mux *http.ServeMux) {
 // everywhere instead.
 func (a *Auth) handleLogout(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if s, ok := RequestSession(a.EncryptionKey, r); ok {
+	if s, ok := RequestSession(a.keys(), r); ok {
 		var email string
 		// Only a live session is recorded: a bare GET from anyone, or a
 		// replayed cookie already signed out, is not an event.
@@ -89,7 +96,7 @@ func (a *Auth) handleLogout(w http.ResponseWriter, r *http.Request) {
 // loadSSO is LoadSSO for sign-in. A secret it cannot decrypt is logged for
 // the admin and fails like a missing configuration.
 func (a *Auth) loadSSO(ctx context.Context) (*SSOConfig, error) {
-	cfg, err := LoadSSO(ctx, a.Store.Pool, a.EncryptionKey)
+	cfg, err := LoadSSO(ctx, a.Store.Pool, a.keys())
 	if errors.Is(err, ErrSSOSecret) {
 		slog.Error("sso sign-in unavailable", "err", err)
 	}

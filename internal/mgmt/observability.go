@@ -39,12 +39,13 @@ func (m *Server) observabilityExported(w http.ResponseWriter, r *http.Request) {
 // optional "would this rule match now" preview for ?scope_type=&scope_value=.
 func (m *Server) observabilityRulesStats(w http.ResponseWriter, r *http.Request) {
 	rules := []map[string]any{}
+	live := m.liveSummary()
 	if m.Snapshots != nil && m.Live != nil {
 		if s := m.Snapshots.Get(); s != nil {
 			for _, rule := range s.Telemetry.Rules {
 				rules = append(rules, map[string]any{
 					"rule_id": rule.ID, "scope_type": rule.ScopeType, "scope_value": rule.ScopeValue,
-					"enabled": rule.Enabled, "matching_rpm": m.Live.ScopeRPM(rule.ScopeType, rule.ScopeValue),
+					"enabled": rule.Enabled, "matching_rpm": live.Scopes[rule.ScopeType+":"+rule.ScopeValue],
 				})
 			}
 		}
@@ -52,11 +53,11 @@ func (m *Server) observabilityRulesStats(w http.ResponseWriter, r *http.Request)
 	// total_rpm sizes the blast radius of "everything" mode in the console.
 	resp := map[string]any{"rules": rules}
 	if m.Live != nil {
-		resp["total_rpm"] = m.Live.TotalRPM()
+		resp["total_rpm"] = live.TotalRPM()
 	}
 	st, sv := r.URL.Query().Get("scope_type"), r.URL.Query().Get("scope_value")
 	if st != "" && sv != "" && m.Live != nil {
-		resp["preview"] = map[string]any{"scope_type": st, "scope_value": sv, "matching_rpm": m.Live.ScopeRPM(st, sv)}
+		resp["preview"] = map[string]any{"scope_type": st, "scope_value": sv, "matching_rpm": live.Scopes[st+":"+sv]}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

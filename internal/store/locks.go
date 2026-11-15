@@ -14,4 +14,7 @@ const (
 	// LockSSOSecret is a transaction lock, for the one-time encryption of the
 	// SSO client secret.
 	LockSSOSecret int64 = 0x6c6c6d72737363 // "llmrssc"
+	// LockRekey keeps re-encryption after a key rotation to one control
+	// plane at a time.
+	LockRekey int64 = 0x6c6c6d72726b79 // "llmrrky"
 )

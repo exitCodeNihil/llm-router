@@ -17,7 +17,9 @@ import (
 // half-serves it. Older gateways get the schema they speak: 1 is 0.2.x.
 // Schema 2 adds Vertex and Entra credentials, identity-token issuers and the
 // telemetry policy, which a schema 1 gateway can't use and so never receives.
-const schemaVersion = 2
+// Schema 3 adds entry hashes and a digest, so a gateway can take a change as
+// a delta (delta.go), and tells syncs which config the gateway runs on.
+const schemaVersion = 3
 
 // Config is what a gateway runs on: the keys, users and teams its group
 // serves, the deployments they can reach in the group's routing order, and the
@@ -41,6 +43,11 @@ type Config struct {
 	// Schema 2: the capture policy and what content the group's gateways
 	// capture. Destinations and their credentials stay on the control plane.
 	Telemetry *Telemetry `json:"telemetry,omitempty"`
+	// Schema 3: the database the version counts in, the hash of everything
+	// that is not a key, user, team or email, and the digest of the whole.
+	Epoch    string `json:"epoch,omitempty"`
+	RestHash string `json:"rest_hash,omitempty"`
+	Digest   string `json:"digest,omitempty"`
 }
 
 // Telemetry is the capture policy (snapshot.Telemetry) plus Content: the
@@ -95,6 +102,7 @@ type Key struct {
 	TPMLimit      *int     `json:"tpm_limit,omitempty"`
 	ExpiresAt     int64    `json:"expires_at,omitempty"` // unix seconds
 	Tags          []string `json:"tags,omitempty"`
+	H             string   `json:"h,omitempty"` // schema 3: content hash
 }
 
 type User struct {
@@ -107,6 +115,7 @@ type User struct {
 	TPMLimit      *int                `json:"tpm_limit,omitempty"`
 	TeamIDs       []string            `json:"team_ids,omitempty"` // schema 2
 	Tags          []string            `json:"tags,omitempty"`     // schema 2
+	H             string              `json:"h,omitempty"`        // schema 3: content hash
 }
 
 type Team struct {
@@ -116,6 +125,7 @@ type Team struct {
 	RPMLimit      *int     `json:"rpm_limit,omitempty"`
 	TPMLimit      *int     `json:"tpm_limit,omitempty"`
 	Tags          []string `json:"tags,omitempty"` // schema 2
+	H             string   `json:"h,omitempty"`    // schema 3: content hash
 }
 
 type Provider struct {

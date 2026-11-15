@@ -410,7 +410,7 @@ func (m *Server) loadDestination(ctx context.Context, id uuid.UUID) (*snapshot.D
 	}
 	d.Secrets = map[string]string{}
 	if len(enc) > 0 {
-		plain, err := snapshot.Decrypt(m.EncryptionKey, enc)
+		plain, err := m.keys().Decrypt(enc)
 		if err == nil {
 			err = json.Unmarshal([]byte(plain), &d.Secrets)
 		}

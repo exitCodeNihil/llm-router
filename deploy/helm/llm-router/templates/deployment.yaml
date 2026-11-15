@@ -1,6 +1,3 @@
-{{- if and (gt (int .Values.replicas) 1) (not .Values.allowMultipleReplicas) }}
-{{- fail "replicas > 1 splits rate limits, budgets, live metrics and telemetry queues across processes, so each replica enforces only part of them. Scale traffic with gateway groups (gateway.replicas) instead, or set allowMultipleReplicas=true to accept that." }}
-{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -10,9 +7,9 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
   replicas: {{ .Values.replicas }}
-  {{- if not .Values.allowMultipleReplicas }}
-  # The old pod stops before the new one starts: two at once would each hold
-  # half the limits, and a migration must not run under a pod still writing.
+  {{- if not .Values.rollingUpdate }}
+  # Every pod stops before a new one starts: a release's migrations must not
+  # run under pods of the release before it that are still writing.
   strategy:
     type: Recreate
   {{- end }}
@@ -62,6 +59,10 @@ spec:
               valueFrom: {secretKeyRef: {name: {{ $secret }}, key: admin-token, optional: true}}
             - name: LLMR_ENCRYPTION_KEY
               valueFrom: {secretKeyRef: {name: {{ $secret }}, key: encryption-key}}
+            - name: LLMR_ENCRYPTION_KEYS_OLD
+              valueFrom: {secretKeyRef: {name: {{ $secret }}, key: encryption-keys-old, optional: true}}
+            - name: LLMR_ENCRYPTION_KEY_NEXT
+              valueFrom: {secretKeyRef: {name: {{ $secret }}, key: encryption-key-next, optional: true}}
             {{- if $ws }}
             - name: LLMR_IDE_LISTEN
               value: ":8081"

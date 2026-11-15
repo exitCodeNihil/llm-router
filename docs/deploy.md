@@ -61,9 +61,9 @@ helm install llm-router ./deploy/helm/llm-router --set existingSecret=llm-router
 Add `ingress.tls` for HTTPS. Set `trustedProxies` to your ingress controller's addresses, so sign-in
 limits count each client rather than the ingress (`--set 'trustedProxies={10.0.0.0/8}'`).
 
-Keep one control-plane replica and scale with [gateways](#gateways). Rate limits, budget counters,
-live metrics and telemetry queues live in its memory, so the chart refuses `replicas` above 1 unless
-you set `allowMultipleReplicas=true`, and then each replica enforces limits on its own traffic only. For
+One control plane is enough for most installs: [gateways](#gateways) carry the traffic and keep
+serving while it restarts. To keep the console, the API and config changes up through a node
+failure, run more with `--set replicas=2` (see [Several control planes](#several-control-planes)). For
 [workspaces](workspaces.md#kubernetes) add `--set workspaces.enabled=true,workspaces.ideOrigin=https://ide.example.com`.
 
 The pods run as a non-root user with a read-only root filesystem, no added capabilities and the
@@ -240,6 +240,7 @@ For llm-router itself (the gateways have [their own](#gateways)):
 |---|---|
 | `LLMR_DATABASE_URL` | Postgres URL (required) |
 | `LLMR_ENCRYPTION_KEY` | Encrypts provider keys and signs sessions; 16+ characters, required |
+| `LLMR_ENCRYPTION_KEYS_OLD`, `LLMR_ENCRYPTION_KEY_NEXT` | Comma-separated keys, and one key, that are still read and verified but never written with: for [rotating the encryption key](#rotating-the-encryption-key) |
 | `LLMR_ADMIN_TOKEN` | Bootstrap admin token, 12+ characters (optional) |
 | `LLMR_LISTEN` | Listen address, default `:8080` |
 | `LLMR_TRUSTED_PROXIES` | Comma-separated addresses or CIDR ranges of proxies whose `X-Forwarded-For` names the client. Console sign-in is limited to 20 attempts a minute per client address (IPv6 per /64) and 5 failures per 15 minutes per email and address; wrong admin tokens on the API to 5 per 15 minutes per address. Each proxy must append to `X-Forwarded-For` |
@@ -264,7 +265,8 @@ Placeholder secrets such as `change-me` are refused. Generate them with `openssl
 
 - **Monitoring**: both the control plane and the gateways serve Prometheus metrics, the chart
   can add PodMonitors, alert rules and a gateway autoscaler, and there is a Grafana dashboard.
-  Gateways scale horizontally; the control plane doesn't. See [Monitoring](monitoring.md).
+  Gateways scale horizontally; the control plane can run as several replicas. See
+  [Monitoring](monitoring.md).
 - **Traces**: **Observability** exports a trace of each request to OTLP backends and Langfuse. A
   capture policy chooses which traffic is exported and whether prompts leave (off by default), and
   each destination takes its teams, gateway groups and content mode. See
@@ -276,6 +278,58 @@ Placeholder secrets such as `change-me` are refused. Generate them with `openssl
   key those describe that key's quota, not the caller's.
 - **Upgrades**: pull the new tag and restart. Migrations apply on start and only go forward, so
   back up Postgres first. Upgrade the control plane before the gateways.
+
+### Several control planes
+
+Any number of control planes can run on one database. Each registers in Postgres every second.
+
+- **Limits and budgets** hold across all of them: each hands the others the requests and tokens it
+  counted, and they read spend from the same tables. A limit can be passed by what all of them
+  admit within a second or two, the same margin gateways have.
+- **Gateways** can reach any of them through one Service. A control plane that is a few seconds
+  behind on a config change asks the gateway to try again instead of answering with old data.
+- **The console** shows the same thing on each: live traffic, gateways and events are put together
+  from all of them. Latency figures on the live pages are then averages of each one's median.
+- **Per control plane**, not shared: sign-in attempt limits and the list of recently exported
+  traces. Each also exports the telemetry of the requests and gateway syncs it handled.
+- **Connections**: each opens its own pools, so the database needs room for
+  `replicas × (LLMR_DB_MAX_CONNS + LLMR_DB_CONSOLE_MAX_CONNS)`. Use a direct connection or a
+  session-mode pooler; a transaction-mode pooler breaks the locks that keep maintenance to one
+  control plane at a time.
+- **Upgrades**: stop every control plane before starting a new release, unless that release's notes
+  say it can run beside the one before. The chart does this by default (`rollingUpdate: false`).
+  Set `rollingUpdate: true` for one-at-a-time restarts and configuration changes.
+- `/metrics` has `llmr_control_planes` (how many are running) and
+  `llmr_cluster_sync_errors_total` (rounds of sharing that failed; while they fail each control
+  plane enforces limits on what it sees itself).
+
+### Rotating the encryption key
+
+`LLMR_ENCRYPTION_KEY` encrypts provider keys, telemetry destination secrets, the SSO client secret
+and workspace files, and signs console sessions and gateway sessions. It can be replaced without
+re-entering any of them or signing anyone out, in three rollouts. Do each on every control plane
+before starting the next.
+
+1. **Announce the new key.** Set it as `LLMR_ENCRYPTION_KEY_NEXT` (chart: `encryptionKeyNext`) and
+   roll out. Nothing is re-encrypted and everything is still written under the current key, but
+   each control plane can now read and verify what one with the new key writes.
+2. **Make it current.** Set the new key as `LLMR_ENCRYPTION_KEY`, move the previous one to
+   `LLMR_ENCRYPTION_KEYS_OLD` (chart: `encryptionKeysOld: [...]`), clear `NEXT`, and roll out.
+   Control planes now encrypt and sign with the new key and still read and verify under the old.
+   Once every running control plane has the new key, one of them re-encrypts the stored secrets
+   under it, within a minute and again each minute while any are left. A secret edited meanwhile
+   keeps the edit.
+3. **Drop the old key.** When `llmr_secrets_old_key` reads 0 on every control plane, remove
+   `LLMR_ENCRYPTION_KEYS_OLD` and roll out. Console sessions signed with the old key end then, so
+   wait 12 hours after step 2 (the longest a session lasts) to sign nobody out. Gateway sessions
+   are renewed under the new key within 15 minutes.
+
+With `existingSecret`, put the keys in that Secret as `encryption-key-next` and
+`encryption-keys-old` (comma-separated). The pods read the Secret only when they start: after
+changing it, restart them (`kubectl rollout restart deployment/<release>-llm-router`). Do not
+rotate during an upgrade from a release without key rotation: it cannot read what the new key
+writes. Until step 3, a rollback to the previous step's configuration reads everything; a
+secret that no configured key opens is left as it is and logged once.
 
 ### Upgrading to 0.4
 
@@ -295,6 +349,9 @@ Placeholder secrets such as `change-me` are refused. Generate them with `openssl
   migrations and maintenance. Connect it to Postgres directly, or to a pooler in session mode. Behind
   PgBouncer add both parameters to `ignore_startup_parameters`; in transaction mode the locks do
   nothing, so run one control plane only.
+- **Several control planes** can now run at once and share limits
+  ([Several control planes](#several-control-planes)). The upgrade to 0.4 itself must not mix
+  releases: stop every 0.3 control plane first.
 - **Health checks**: `/readyz` is the readiness check (config loaded, not shutting down) and
   `/healthz` the liveness check. Neither depends on Postgres: with the database away llm-router
   keeps serving from memory and queues usage. The chart uses both.
@@ -316,8 +373,8 @@ Placeholder secrets such as `change-me` are refused. Generate them with `openssl
   they don't expose). See [Monitoring](monitoring.md).
 - **Identity token issuers** must use https (http only on localhost). An existing http issuer keeps
   working on the control plane but is refused by 0.3 gateways: change it to https.
-- **Helm**: more than one control-plane replica is refused unless `allowMultipleReplicas=true`, and
-  gateways now get a 50-second termination grace period and, on Kubernetes 1.30 or later, a 5-second
+- **Helm**: more than one control-plane replica was refused unless `allowMultipleReplicas=true`
+  (0.4 removes that value and the limit), and gateways now get a 50-second termination grace period and, on Kubernetes 1.30 or later, a 5-second
   pre-stop sleep (`gateway.terminationGracePeriodSeconds`, `gateway.preStopSleepSeconds`).
 - **Sign-in limits** count per client address. Behind a proxy or ingress set `LLMR_TRUSTED_PROXIES`
   (chart: `trustedProxies`), or every client shares the proxy's limit.
@@ -366,8 +423,9 @@ Old months are dropped twice a day and at start, a partition at a time, without 
 ## Production checklist
 
 - Managed Postgres (15 or later) with backups, and a [retention](#usage-data) that fits its disk.
-- `LLMR_ENCRYPTION_KEY` in a secret manager and backed up. Rotating it means re-entering provider
-  keys, telemetry destination secrets and the SSO client secret, and signing everyone out.
+- `LLMR_ENCRYPTION_KEY` in a secret manager and backed up. Replace it with the
+  [three-step rotation](#rotating-the-encryption-key); changing it in one step makes every stored
+  secret unreadable and signs everyone out.
 - TLS in front of 8080.
 - `/metrics` off the public listener (`LLMR_METRICS_LISTEN`; the chart does it), and the
   [alerts](monitoring.md#alerts) wired to someone. Give gateways a memory limit.

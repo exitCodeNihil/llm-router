@@ -100,7 +100,7 @@ func (m *Server) changeOwnPassword(w http.ResponseWriter, r *http.Request) {
 // reissueSession replaces the caller's session cookie with one at epoch, when
 // they came in with one (the admin token has none).
 func (m *Server) reissueSession(w http.ResponseWriter, r *http.Request, userID string, epoch int) {
-	if s, ok := console.RequestSession(m.EncryptionKey, r); ok && s.UserID == userID {
+	if s, ok := console.RequestSession(m.keys(), r); ok && s.UserID == userID {
 		console.SetSessionCookie(w, r, m.EncryptionKey, m.CookieDomain, userID, epoch)
 	}
 }

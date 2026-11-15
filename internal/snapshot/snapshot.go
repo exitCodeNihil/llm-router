@@ -160,7 +160,11 @@ type Spend struct {
 }
 
 type Snapshot struct {
-	Version            int64
+	Version int64
+	// Epoch names the database the version counts in: it changes when the
+	// database is restored or replaced, where the version can go backwards.
+	// Empty when Postgres won't say.
+	Epoch              string
 	KeysByHash         map[[32]byte]*Key
 	UsersByID          map[string]*User
 	UsersByEmail       map[string]*User
@@ -180,6 +184,8 @@ type Snapshot struct {
 // Holder is the atomic snapshot pointer the hot path reads through.
 type Holder struct {
 	p atomic.Pointer[Snapshot]
+	// changed is closed, and replaced, on every Set.
+	changed atomic.Pointer[chan struct{}]
 	// For /metrics: when the snapshot in use was built, how long that took,
 	// and how many rebuilds have failed.
 	builtAt, buildNanos, failures atomic.Int64
@@ -190,6 +196,24 @@ func (h *Holder) Get() *Snapshot { return h.p.Load() }
 func (h *Holder) Set(s *Snapshot) {
 	h.p.Store(s)
 	h.builtAt.Store(time.Now().UnixNano())
+	next := make(chan struct{})
+	if old := h.changed.Swap(&next); old != nil {
+		close(*old)
+	}
+}
+
+// Changed returns a channel that is closed at the next Set. Take it before
+// reading the snapshot you will wait on, or a Set in between is missed.
+func (h *Holder) Changed() <-chan struct{} {
+	for {
+		if c := h.changed.Load(); c != nil {
+			return *c
+		}
+		first := make(chan struct{})
+		if h.changed.CompareAndSwap(nil, &first) {
+			return first
+		}
+	}
 }
 
 // Built records how long the latest rebuild took; Failed counts one that failed.

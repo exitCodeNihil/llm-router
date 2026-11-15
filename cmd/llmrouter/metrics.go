@@ -14,6 +14,7 @@ import (
 	"github.com/exitcodenihil/llm-router/internal/audit"
 	"github.com/exitcodenihil/llm-router/internal/metrics"
 	"github.com/exitcodenihil/llm-router/internal/redact"
+	"github.com/exitcodenihil/llm-router/internal/rekey"
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
 	"github.com/exitcodenihil/llm-router/internal/store"
 	"github.com/exitcodenihil/llm-router/internal/telemetry"
@@ -66,6 +67,14 @@ func newMetrics(httpm *metrics.HTTP, nodes *metrics.NodeStore, writer *usage.PGW
 	reg.Register(nodes)
 	reg.Register(metrics.CollectorFunc(func(w *metrics.PromWriter) { destinationMetrics(w, exporter.Health()) }))
 	return reg
+}
+
+// rekeyMetrics reports the secrets still under an encryption key being
+// rotated out: 0 means the old key can be removed.
+func rekeyMetrics(rk *rekey.Rekeyer) metrics.Collector {
+	return metrics.CollectorFunc(func(w *metrics.PromWriter) {
+		w.Gauge("llmr_secrets_old_key", "Stored secrets still encrypted under a key other than LLMR_ENCRYPTION_KEY", float64(rk.OldKeyCount()))
+	})
 }
 
 // destinationMetrics reports each telemetry destination's delivery, labelled
