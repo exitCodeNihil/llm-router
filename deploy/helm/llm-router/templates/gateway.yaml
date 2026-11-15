@@ -34,6 +34,9 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "llm-router.gatewayServiceAccountName" . }}
+      {{- with .Values.podSecurityContext }}
+      securityContext: {{- toYaml . | nindent 8 }}
+      {{- end }}
       # Long enough to wait out endpoint removal, finish requests in flight
       # (LLMR_SHUTDOWN_TIMEOUT) and upload the last usage.
       terminationGracePeriodSeconds: {{ .Values.gateway.terminationGracePeriodSeconds }}
@@ -41,6 +44,9 @@ spec:
         - name: gateway
           image: "{{ .Values.gateway.image.repository }}:{{ .Values.gateway.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext: {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - name: http
               containerPort: 8080

@@ -66,6 +66,24 @@ live metrics and telemetry queues live in its memory, so the chart refuses `repl
 you set `allowMultipleReplicas=true`, and then each replica enforces limits on its own traffic only. For
 [workspaces](workspaces.md#kubernetes) add `--set workspaces.enabled=true,workspaces.ideOrigin=https://ide.example.com`.
 
+The pods run as a non-root user with a read-only root filesystem, no added capabilities and the
+runtime's default seccomp profile (`podSecurityContext`, `securityContext`; set either to `{}` where
+the cluster assigns its own, as OpenShift does). Gateways get a PodDisruptionBudget when there is
+more than one, so a node drain takes them one at a time.
+
+`networkPolicy.enabled=true` adds NetworkPolicies, which need a network plugin that enforces them.
+Incoming traffic: `networkPolicy.from` lists who may reach llm-router and the gateways on 8080 besides
+pods in the release's namespace (your ingress controller, apps in other namespaces), and
+`networkPolicy.metricsFrom` who may scrape. An empty list allows every source. Outgoing traffic is
+left open unless `networkPolicy.egress.enabled=true`; DNS and the release's namespace are then
+allowed, and `networkPolicy.egress.rules` must cover the rest:
+
+- Postgres, and each provider's port (usually 443)
+- telemetry destinations (OTLP is often 4317 or 4318)
+- for workspaces or `anthropicIdentity.source=kubernetes`, the Kubernetes API server at its real
+  address and port (often 6443: policies apply after the Service address is translated)
+- for cloud identity, the metadata address `169.254.169.254` on port 80
+
 ## Gateways
 
 Gateways serve your traffic where it is: behind a load balancer for throughput, in another region,

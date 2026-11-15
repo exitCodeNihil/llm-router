@@ -162,6 +162,53 @@ metrics:
     errorRatio: 0.05           # 5xx share of /v1 requests
     notSyncingSeconds: 30
 
+# Security settings for the llm-router and gateway pods and containers. Both
+# images run as a non-root user and write only to mounted volumes. Set either
+# to {} to leave it to the cluster (OpenShift assigns its own user ids).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# Room for file uploads in transit (workspace files and templates).
+tmpSizeLimit: 64Mi
+
+# On a restart: keep accepting for preStopSleepSeconds while the pod leaves the
+# Service (0 turns this off; left out before Kubernetes 1.30), then finish
+# requests and flush usage and telemetry.
+preStopSleepSeconds: 5
+terminationGracePeriodSeconds: 45
+
+# PodDisruptionBudgets, so a node drain takes one pod at a time: for gateways
+# when there is more than one, for llm-router only when replicas > 1 (with one
+# replica a budget would block the drain).
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# NetworkPolicies (your cluster's network plugin must enforce them). Ingress:
+# llm-router's port 8080 stays open to the namespace's pods and to `from`
+# (apps, the ingress controller and workspaces call it); the metrics port is
+# open to `metricsFrom`; gateways accept `from` on 8080. An empty list allows
+# every source. Outgoing traffic is not restricted unless egress.enabled, which
+# then allows DNS, traffic inside the namespace and the rules you list
+# (docs/deploy.md names what llm-router needs to reach).
+networkPolicy:
+  enabled: false
+  from: []           # e.g. [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress-nginx}}}]
+  metricsFrom: []    # e.g. [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}}]
+  egress:
+    enabled: false
+    rules: []        # NetworkPolicy egress rules, e.g. [{ports: [{port: 443}, {port: 5432}]}]
+
 # Extra env and volumes for the llm-router container.
 extraEnv: []
 extraVolumes: []

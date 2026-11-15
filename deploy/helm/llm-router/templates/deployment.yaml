@@ -30,13 +30,19 @@ spec:
     spec:
       {{- $ws := .Values.workspaces.enabled }}
       serviceAccountName: {{ include "llm-router.serviceAccountName" . }}
-      # Longer than a shutdown takes: 10 s to finish requests, then the usage
-      # and telemetry queues flush.
-      terminationGracePeriodSeconds: 40
+      {{- with .Values.podSecurityContext }}
+      securityContext: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Longer than a shutdown takes: the preStop wait, 10 s to finish
+      # requests, then the usage and telemetry queues flush.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       containers:
         - name: llm-router
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext: {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - name: http
               containerPort: 8080
@@ -96,15 +102,16 @@ spec:
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          {{- if or .Values.anthropicIdentity.enabled .Values.extraVolumeMounts }}
           volumeMounts:
+            # The root filesystem is read-only; file uploads spill here.
+            - name: tmp
+              mountPath: /tmp
             {{- if .Values.anthropicIdentity.enabled }}
             {{- include "llm-router.anthropicIdentityMount" . | nindent 12 }}
             {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          {{- end }}
           # Migrations run before the listener starts, and on a large
           # database the first start of a release can take minutes.
           startupProbe:
@@ -118,16 +125,24 @@ spec:
           readinessProbe:
             httpGet: {path: /readyz, port: 8080}
             timeoutSeconds: 3
+          {{- if and .Values.preStopSleepSeconds (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) }}
+          # Keep accepting while the endpoint is removed from Services, so a
+          # restart refuses no connections.
+          lifecycle:
+            preStop:
+              sleep: {seconds: {{ .Values.preStopSleepSeconds }}}
+          {{- end }}
           resources: {{- toYaml .Values.resources | nindent 12 }}
-      {{- if or .Values.anthropicIdentity.enabled .Values.extraVolumes }}
       volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.tmpSizeLimit }}
         {{- if .Values.anthropicIdentity.enabled }}
         {{- include "llm-router.anthropicIdentityVolume" . | nindent 8 }}
         {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}
