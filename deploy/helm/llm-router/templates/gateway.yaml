@@ -55,6 +55,14 @@ spec:
               value: {{ .Values.gateway.controlPlaneUrl | default (printf "http://%s-llm-router:%v" .Release.Name .Values.service.port) | quote }}
             - name: LLMR_JOIN_TOKEN
               valueFrom: {secretKeyRef: {name: {{ .Values.gateway.existingSecret | default $fullname }}, key: join-token}}
+            {{- if .Values.usageClientIP }}
+            - name: LLMR_USAGE_CLIENT_IP
+              value: "true"
+            {{- with .Values.trustedProxies }}
+            - name: LLMR_TRUSTED_PROXIES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- end }}
             - name: LLMR_LOG_LEVEL
               value: {{ .Values.gateway.logLevel | quote }}
             - name: LLMR_LOG_FORMAT

@@ -45,6 +45,19 @@ fn main() {
         Some(Ok(n)) => n,
         Some(Err(_)) => refuse("LLMR_SPOOL_MAX_BYTES is a number of bytes: 0 keeps no usage on disk"),
     };
+    // Off unless asked for: an address is personal data.
+    match env("LLMR_USAGE_CLIENT_IP").map(|v| v.to_ascii_lowercase()).as_deref() {
+        None | Some("false" | "0") => {}
+        Some("true" | "1") => {
+            match llmr_gateway::clientip::parse_trusted(&env("LLMR_TRUSTED_PROXIES").unwrap_or_default()) {
+                Ok(trusted) => llmr_gateway::clientip::enable(trusted),
+                Err(e) => {
+                    refuse(&format!("LLMR_TRUSTED_PROXIES is a comma-separated list of addresses and CIDR blocks: {e}"))
+                }
+            }
+        }
+        Some(_) => refuse("LLMR_USAGE_CLIENT_IP is true or false"),
+    }
     let listen = env("LLMR_LISTEN").unwrap_or_else(|| "0.0.0.0:8080".into());
     // available_parallelism honours the container's CPU quota.
     let workers = env("LLMR_WORKERS")

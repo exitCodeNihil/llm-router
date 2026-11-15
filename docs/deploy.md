@@ -187,6 +187,8 @@ A gateway logs why it refuses them, and requests to those providers fail with th
 | `LLMR_GATEWAY_NAME` | Name on the Gateways page (default: the hostname) |
 | `LLMR_MAX_CONFIG_AGE` | Seconds a gateway serves after the control plane last confirmed its config; unset or 0: no limit. At least 120 |
 | `LLMR_STATE_DIR` | Directory for [state on disk](#gateway-state-on-disk); unset: nothing is written |
+| `LLMR_USAGE_CLIENT_IP` | `true` reports each request's client address with its usage; the control plane stores it only when its own `LLMR_USAGE_CLIENT_IP` is on. Default `false` |
+| `LLMR_TRUSTED_PROXIES` | With the above: addresses or CIDR ranges of the proxies in front of the gateway whose `X-Forwarded-For` names the client. Empty: the connecting address is the client |
 | `LLMR_SPOOL_MAX_BYTES` | With `LLMR_STATE_DIR`: the most bytes of unsent usage kept on disk (default 268435456, 256 MiB); 0 keeps none |
 | `LLMR_LOG_LEVEL` | `debug`, `info` (default), `warn` or `error` |
 | `LLMR_LOG_FORMAT` | `text` (default) or `json`, one object per line with `ts`, `level` and `msg`. Logs go to stderr |

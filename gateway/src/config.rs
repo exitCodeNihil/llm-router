@@ -15,7 +15,7 @@ use crate::health::{self, Health};
 use crate::limits::{self, Scope};
 
 /// The wire schema this gateway speaks (gwsync.schemaVersion).
-pub const SCHEMA: i64 = 2;
+pub const SCHEMA: i64 = 3;
 
 // ---- wire ---------------------------------------------------------------------------------
 
@@ -23,6 +23,16 @@ pub const SCHEMA: i64 = 2;
 pub struct Wire {
     pub schema: i64,
     pub version: i64,
+    /// Which run of version numbers `version` belongs to (schema 3): a
+    /// control plane whose numbering starts over names a new one.
+    #[serde(default)]
+    pub epoch: String,
+    /// The digest of the entry hashes below (schema 3): see `delta`.
+    #[serde(default)]
+    pub digest: String,
+    /// The hash of everything but keys, users, teams and emails (schema 3).
+    #[serde(default)]
+    pub rest_hash: String,
     pub group: WireGroup,
     #[serde(default)]
     pub keys: Vec<WireKey>,
@@ -78,6 +88,10 @@ pub struct WireGroup {
 pub struct WireKey {
     pub hash: String,
     pub id: String,
+    /// The control plane's hash of this entry (schema 3), for the config
+    /// digest: opaque here.
+    #[serde(default)]
+    pub h: String,
     #[serde(default)]
     pub user_id: String,
     #[serde(default)]
@@ -95,6 +109,8 @@ pub struct WireKey {
 #[derive(Debug, Deserialize)]
 pub struct WireUser {
     pub id: String,
+    #[serde(default)]
+    pub h: String,
     pub allowed_models: Option<Vec<String>>,
     pub team_models: Option<Vec<String>>,
     #[serde(default)]
@@ -111,6 +127,8 @@ pub struct WireUser {
 #[derive(Debug, Deserialize)]
 pub struct WireTeam {
     pub id: String,
+    #[serde(default)]
+    pub h: String,
     pub allowed_models: Option<Vec<String>>,
     pub budget_usd: Option<f64>,
     pub rpm_limit: Option<i64>,

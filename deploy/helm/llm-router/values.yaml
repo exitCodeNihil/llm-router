@@ -22,6 +22,12 @@ rollingUpdate: false
 # ingress shares one limit. Each proxy must append to X-Forwarded-For.
 trustedProxies: []
 
+# Store each request's client address with its usage, for admins on the
+# Requests page (LLMR_USAGE_CLIENT_IP, on llm-router and the gateways). Off by
+# default: the address is personal data. Behind a load balancer or ingress the
+# address is only right with trustedProxies set.
+usageClientIP: false
+
 databaseUrl: ""      # postgres://user:pass@host:5432/db — or use existingSecret
 adminToken: ""
 encryptionKey: ""

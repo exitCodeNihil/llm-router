@@ -2,7 +2,7 @@
 //! here and the sync loop uploads them; the control plane writes them to
 //! Postgres and decides what telemetry to export.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -24,13 +24,13 @@ pub struct Event {
     pub api_key_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub user_id: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub team_id: String,
+    /// Boxed strs, each a word less than a String: with `seq` and
+    /// `client_ip` an event is no larger than it was without.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub team_id: Box<str>,
     pub model_name: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub deployment_id: String,
-    /// A boxed str, a word less than a String: with `seq` an event is no
-    /// larger than it was without.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub deployment_id: Box<str>,
     #[serde(skip_serializing_if = "str::is_empty")]
     pub provider_id: Box<str>,
     pub prompt_tokens: i64,
@@ -77,6 +77,9 @@ pub struct Event {
     /// alone counts.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub content: Option<Box<Content>>,
+    /// The client's address, when the gateway records it (LLMR_USAGE_CLIENT_IP).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_ip: Option<Box<str>>,
     /// Its place in the order events were queued, given under the queue's
     /// lock. The batch being sent and the queue behind it stay sorted by it,
     /// so once a batch is settled everything up to its last event is.
@@ -478,21 +481,25 @@ const CACHE_WRITE_1H: f64 = 2.0;
 const US_INFERENCE: f64 = 1.1;
 const FAST_MODE: f64 = 2.0;
 
-/// Price a request (pricing.price): the deployment's own price, else the
-/// catalog's, else unpriced.
-fn price(cfg: &Config, d: &Deployment, u: Usage) -> Option<f64> {
-    let p = match (d.input_per_1m, d.output_per_1m) {
-        (Some(input_per_1m), Some(output_per_1m)) => Price {
+/// The rates a deployment's requests are priced at (pricing.price): its
+/// own, else the catalog's, else none.
+fn rates(cfg: &Config, d: &Deployment) -> Option<Price> {
+    match (d.input_per_1m, d.output_per_1m) {
+        (Some(input_per_1m), Some(output_per_1m)) => Some(Price {
             input_per_1m,
             output_per_1m,
             cached_input_per_1m: d.cached_input_per_1m,
             long_prompt_tokens: 0,
             long_prompt_multiplier: 1.0,
-        },
-        _ if !d.catalog_model_id.is_empty() => *cfg.prices.get(&d.catalog_model_id)?,
-        _ => return None,
-    };
-    Some(cost(p, u))
+        }),
+        _ if !d.catalog_model_id.is_empty() => cfg.prices.get(&d.catalog_model_id).copied(),
+        _ => None,
+    }
+}
+
+/// Price a request: None when the deployment is unpriced.
+fn price(cfg: &Config, d: &Deployment, u: Usage) -> Option<f64> {
+    Some(cost(rates(cfg, d)?, u))
 }
 
 /// Go: pricing.priceCost. Shared fixtures in internal/pricing/testdata/cost.json.
@@ -522,6 +529,110 @@ fn cost(p: Price, u: Usage) -> f64 {
     usd / 1e6
 }
 
+/// Completion tokens this process has seen per model: (responses, tokens).
+fn completions() -> &'static Mutex<HashMap<String, (u64, u64)>> {
+    static C: OnceLock<Mutex<HashMap<String, (u64, u64)>>> = OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+/// Models tracked at most: a pattern admits any name a caller makes up.
+const MAX_TRACKED_MODELS: usize = 4096;
+/// Responses before a model's mean is trusted, and the guess until then.
+const MEAN_AFTER: u64 = 20;
+const DEFAULT_COMPLETION: u64 = 1024;
+
+fn saw_completion(model: &str, tokens: i64) {
+    let mut seen = completions().lock().unwrap();
+    if !seen.contains_key(model) {
+        if seen.len() >= MAX_TRACKED_MODELS {
+            return;
+        }
+        seen.insert(model.to_string(), (0, 0));
+    }
+    if let Some((n, sum)) = seen.get_mut(model) {
+        *n += 1;
+        *sum += tokens.max(0) as u64;
+        // the mean follows a model whose answers change over time
+        if *n >= 1 << 20 {
+            (*n, *sum) = (*n / 2, *sum / 2);
+        }
+    }
+}
+
+/// The completion tokens a request for `model` is expected to use: twice
+/// the mean seen so far, within the request's own max_tokens.
+fn expected_completion(model: &str, max_tokens: Option<u64>) -> u64 {
+    let seen = completions().lock().unwrap().get(model).copied();
+    let usual = match seen {
+        Some((n, sum)) if n >= MEAN_AFTER => (2 * sum).div_ceil(n),
+        _ => DEFAULT_COMPLETION,
+    };
+    max_tokens.map_or(usual, |max| max.min(usual))
+}
+
+/// The bytes of a JSON request body that are text: all of it but base64
+/// payloads (images, documents, audio), which are not billed by their length.
+/// A payload is a long string that is a base64 data URL, or nothing but
+/// base64 characters, which prose never is.
+pub fn text_bytes(body: &[u8]) -> usize {
+    const LONG: usize = 256;
+    let base64 =
+        |s: &[u8]| s.iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'));
+    let payload = |s: &[u8]| {
+        if s.len() < LONG {
+            0
+        } else if s.starts_with(b"data:") {
+            let head = &s[..s.len().min(128)];
+            memchr::memmem::find(head, b";base64,").map_or(0, |at| s.len() - at - 8)
+        } else if base64(s) {
+            s.len()
+        } else {
+            0
+        }
+    };
+    let mut skipped = 0;
+    let mut at = 0;
+    while let Some(open) = memchr::memchr(b'"', &body[at..]) {
+        let start = at + open + 1;
+        let mut end = start;
+        loop {
+            match memchr::memchr2(b'"', b'\\', &body[end.min(body.len())..]) {
+                Some(i) if body[end + i] == b'\\' => end += i + 2,
+                Some(i) => {
+                    end += i;
+                    break;
+                }
+                None => return body.len() - skipped,
+            }
+        }
+        skipped += payload(&body[start..end]);
+        at = end + 1;
+    }
+    body.len() - skipped
+}
+
+/// What a request is expected to cost, for its budget reservation: the
+/// body's text at four bytes a token, and `expected_completion` output tokens
+/// (none when `output` is false: embeddings), at the price `d` bills at.
+/// Zero for a deployment without a price of its own to bill.
+pub fn expected_cost(
+    cfg: &Config,
+    d: &Deployment,
+    model: &str,
+    body: &[u8],
+    max_tokens: Option<u64>,
+    output: bool,
+) -> f64 {
+    // Billed to the caller's own plan: nothing counts against a budget.
+    if d.provider.auth_mode == AuthMode::OAuthPassthrough {
+        return 0.0;
+    }
+    let Some(p) = rates(cfg, d) else { return 0.0 };
+    let prompt = (text_bytes(body) / 4) as i64;
+    let completion = if output { expected_completion(model, max_tokens) as i64 } else { 0 };
+    cost(p, Usage { prompt, completion, ..Usage::default() })
+}
+
 /// Everything known about a request before its outcome, to emit its event once.
 pub struct Emit {
     pub cfg: Arc<Config>,
@@ -541,6 +652,10 @@ pub struct Emit {
     pub output: Capture,
     /// The content budget the capture holds until the event is queued.
     pub reserved: Reservation,
+    /// What the request holds of its budgets until its cost is recorded;
+    /// dropped with the request when it ends without an event.
+    pub budget: limits::Reservation,
+    pub client_ip: Option<Box<str>>,
 }
 
 /// The fields of a request body whose content is captured, the last of each
@@ -842,14 +957,18 @@ impl Emit {
     pub fn send(mut self, status: u16, error_code: &'static str, u: Usage, ttft_ms: i64) {
         let content = self.take_content();
         let reserved = std::mem::take(&mut self.reserved);
+        let budget = std::mem::take(&mut self.budget);
+        if status == 200 && self.deployment.is_some() && u.completion > 0 {
+            saw_completion(&self.model, u.completion);
+        }
         let mut e = Event {
             ts_ms: self.ts_ms,
             request_id: self.request_id,
             api_key_id: self.key.id.clone(),
             user_id: self.key.user.as_ref().map(|u| u.id.clone()).unwrap_or_default(),
-            team_id: self.key.team.as_ref().map(|t| t.id.clone()).unwrap_or_default(),
+            team_id: self.key.team.as_ref().map(|t| t.id.as_str().into()).unwrap_or_default(),
             model_name: self.model,
-            deployment_id: String::new(),
+            deployment_id: Box::default(),
             provider_id: Box::default(),
             prompt_tokens: u.prompt,
             completion_tokens: u.completion,
@@ -872,10 +991,11 @@ impl Emit {
                 .then(|| Box::new(Reported { inference_geo: u.geo, speed: u.speed })),
             cost_basis: 0,
             content,
+            client_ip: self.client_ip.take(),
             seq: 0,
         };
         if let Some(d) = &self.deployment {
-            e.deployment_id = d.id.clone();
+            e.deployment_id = d.id.as_str().into();
             e.provider_id = d.provider.id.as_str().into();
             e.cost_basis = 1;
             let listed = price(&self.cfg, d, u);
@@ -894,7 +1014,7 @@ impl Emit {
         metrics::latency(e.latency_ms);
         push(e);
         drop(reserved); // the queue counts the content now
-        limits::record(&self.key, tokens, cost);
+        limits::settle(&self.key, tokens, cost, budget);
     }
 }
 
@@ -1154,6 +1274,110 @@ pub(crate) mod tests {
         assert_eq!(mine[0].content.as_ref().unwrap().encoded, measured);
     }
 
+    // The client address travels only when the gateway records it, and is
+    // in the spool's record of the event like every other field.
+    #[test]
+    fn the_client_address_is_sent_when_recorded() {
+        let _q = hold_queue();
+        drop(take(usize::MAX, usize::MAX));
+        let mut em = emit_capturing("ip-test", 0);
+        em.client_ip = Some("2001:db8::7".into());
+        em.send(200, "", Usage::default(), 0);
+        emit_capturing("ip-test", 0).send(200, "", Usage::default(), 0);
+        let mut spooled = Vec::new();
+        encode_after(0, 10, |json| spooled.push(serde_json::from_slice::<serde_json::Value>(json).unwrap()));
+        let sent: Vec<serde_json::Value> =
+            take(usize::MAX, usize::MAX).iter().map(|e| serde_json::to_value(e).unwrap()).collect();
+        assert_eq!(sent[0]["client_ip"], "2001:db8::7");
+        assert!(sent[1].get("client_ip").is_none(), "{}", sent[1]);
+        assert_eq!(spooled[0]["client_ip"], "2001:db8::7");
+        assert!(spooled[1].get("client_ip").is_none());
+    }
+
+    #[test]
+    fn base64_payloads_are_not_text() {
+        let image = "iVBORw0KGgo".repeat(100);
+        let text = "a question, in words. ".repeat(40);
+        let plain = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": text}]}).to_string();
+        assert_eq!(text_bytes(plain.as_bytes()), plain.len());
+        for body in [
+            // OpenAI: a data URL
+            serde_json::json!({"model": "m", "messages": [{"role": "user", "content": [
+                {"type": "text", "text": text},
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{image}")}}]}]}),
+            // Anthropic: a base64 source
+            serde_json::json!({"model": "m", "messages": [{"role": "user", "content": [
+                {"type": "text", "text": text},
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": image}}]}]}),
+        ] {
+            let body = body.to_string();
+            assert_eq!(text_bytes(body.as_bytes()), body.len() - image.len(), "{body}");
+        }
+        // short strings, words, and escapes are text; a string cut short ends the scan
+        let short = r#"{"id":"QUJDREVGRw==","note":"a \"quoted\" word \\","url":"data:text/plain,hello"}"#;
+        assert_eq!(text_bytes(short.as_bytes()), short.len());
+        let words = format!(r#"{{"text":"{}"}}"#, "word ".repeat(200));
+        assert_eq!(text_bytes(words.as_bytes()), words.len());
+        for cut in [&br#"{"a":"unterminated"#[..], br#"{"a":"ends in a backslash\"#, b"", b"\""] {
+            assert_eq!(text_bytes(cut), cut.len());
+        }
+    }
+
+    #[test]
+    fn a_request_is_expected_to_cost_its_text_and_its_usual_output() {
+        let _q = hold_queue();
+        let w: Wire = serde_json::from_str(
+            r#"{"schema":3,"version":1,"group":{"id":"g","name":"g"},
+            "providers":[{"id":"p","name":"p","type":"openai_compatible","auth_mode":"none"},
+                         {"id":"own","name":"own","type":"openai_compatible","auth_mode":"oauth_passthrough"}],
+            "deployments":[
+              {"id":"e-priced","provider_id":"p","model_name":"expect-priced","upstream_name":"a","input_per_1m":2,"output_per_1m":10},
+              {"id":"e-free","provider_id":"p","model_name":"expect-free","upstream_name":"c"},
+              {"id":"e-own","provider_id":"own","model_name":"expect-own","upstream_name":"d","input_per_1m":2,"output_per_1m":10}
+            ]}"#,
+        )
+        .unwrap();
+        let cfg = Arc::new(Config::build(w).unwrap());
+        let d = |m: &str| cfg.resolve(m).unwrap().deployments[0].clone();
+        let mut body = format!(r#"{{"model":"expect-priced","prompt":"{}"#, "some words ".repeat(400));
+        body.truncate(3998);
+        body.push_str("\"}");
+        assert_eq!(text_bytes(body.as_bytes()), 4000);
+        let expect = |model: &str, max, output| expected_cost(&cfg, &d(model), model, body.as_bytes(), max, output);
+        let usd = |prompt: f64, completion: f64| (prompt * 2.0 + completion * 10.0) / 1e6;
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
+        // 1000 tokens of text; no history of the model yet: 1024 out, or the request's own cap
+        assert!(close(expect("expect-priced", None, true), usd(1000.0, 1024.0)));
+        assert!(close(expect("expect-priced", Some(100), true), usd(1000.0, 100.0)));
+        assert!(close(expect("expect-priced", Some(1 << 20), true), usd(1000.0, 1024.0)));
+        // embeddings have no output
+        assert!(close(expect("expect-priced", Some(100), false), usd(1000.0, 0.0)));
+        // no price, or billed to the caller's own plan: nothing to hold
+        assert_eq!(expect("expect-free", None, true), 0.0);
+        assert_eq!(expect("expect-own", None, true), 0.0);
+
+        // after 20 responses: twice their mean
+        for _ in 0..19 {
+            saw_completion("expect-priced", 300);
+        }
+        assert!(close(expect("expect-priced", None, true), usd(1000.0, 1024.0)), "19 are not enough");
+        saw_completion("expect-priced", 300);
+        assert!(close(expect("expect-priced", None, true), usd(1000.0, 600.0)));
+        assert!(close(expect("expect-priced", Some(100), true), usd(1000.0, 100.0)));
+        assert!(close(expect("expect-priced", Some(5000), true), usd(1000.0, 600.0)));
+        // a finished request counts towards its model's mean
+        let mut em = emit_capturing("expect-priced", 0);
+        em.deployment = Some(d("expect-priced"));
+        em.send(200, "", Usage { prompt: 10, completion: 2400, ..Usage::default() }, 0);
+        assert!(close(expect("expect-priced", None, true), usd(1000.0, 800.0)), "21 responses, 8400 tokens");
+        // one that failed does not
+        let mut em = emit_capturing("expect-priced", 0);
+        em.deployment = Some(d("expect-priced"));
+        em.send(500, "upstream_error", Usage { completion: 100_000, ..Usage::default() }, 0);
+        assert!(close(expect("expect-priced", None, true), usd(1000.0, 800.0)));
+        drop(take(usize::MAX, usize::MAX));
+    }
+
     /// The queue holds up to 200,000 of them.
     #[test]
     fn events_stay_small() {
@@ -1275,6 +1499,8 @@ pub(crate) mod tests {
             content: None,
             output: Capture::default(),
             reserved: Reservation::default(),
+            budget: Default::default(),
+            client_ip: None,
         }
     }
 

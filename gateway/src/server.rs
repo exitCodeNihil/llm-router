@@ -8,6 +8,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::convert::Infallible;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -159,14 +160,14 @@ pub async fn run(
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let Ok((stream, _)) = accepted else { continue };
+                let Ok((stream, peer)) = accepted else { continue };
                 let _ = stream.set_nodelay(true);
                 let builder = builder.clone();
                 let watcher = graceful.watcher();
                 let conn = metrics::Connection::open();
                 tokio::spawn(async move {
                     let _conn = conn;
-                    let svc = service_fn(move |req| handle(st, req));
+                    let svc = service_fn(move |req| handle_from(st, req, Some(peer.ip())));
                     let _ = watcher.watch(builder.serve_connection(TokioIo::new(stream), svc)).await;
                 });
             }
@@ -224,6 +225,15 @@ pub(crate) fn upstream_client() -> HttpsClient {
 }
 
 pub async fn handle(st: &'static State, req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
+    handle_from(st, req, None).await
+}
+
+/// As `handle`, for a request from the connection whose other end is `peer`.
+pub async fn handle_from(
+    st: &'static State,
+    req: Request<Incoming>,
+    peer: Option<IpAddr>,
+) -> Result<Response<Body>, Infallible> {
     let (slot, n) = InFlight::take();
     let route = route_of(req.method(), req.uri().path());
     let resp = if n > st.max_in_flight {
@@ -237,7 +247,7 @@ pub async fn handle(st: &'static State, req: Request<Incoming>) -> Result<Respon
         r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         r
     } else {
-        dispatch(st, req).await
+        dispatch(st, req, peer).await
     };
     metrics::request(route, resp.status().as_u16());
     let (parts, body) = resp.into_parts();
@@ -256,7 +266,7 @@ fn route_of(m: &Method, path: &str) -> Route {
     }
 }
 
-async fn dispatch(st: &'static State, req: Request<Incoming>) -> Response<Body> {
+async fn dispatch(st: &'static State, req: Request<Incoming>, peer: Option<IpAddr>) -> Response<Body> {
     let path = req.uri().path();
     match (req.method(), path) {
         (&Method::GET, "/healthz") => {
@@ -329,7 +339,8 @@ async fn dispatch(st: &'static State, req: Request<Incoming>) -> Response<Body> 
             // Every authenticated response names its trace, so a caller can
             // find it whether or not it sent a traceparent.
             let trace = Trace::read(req.headers());
-            let mut resp = serve(cfg, key, inbound, req, trace).await;
+            let client_ip = crate::clientip::of(peer, req.headers());
+            let mut resp = serve(cfg, key, inbound, req, trace, client_ip).await;
             if let Ok(v) = HeaderValue::from_bytes(&trace.hex()) {
                 resp.headers_mut().insert("x-llmr-trace-id", v);
             }
@@ -345,37 +356,122 @@ async fn serve(
     inbound: Inbound,
     req: Request<Incoming>,
     trace: Trace,
+    client_ip: Option<Box<str>>,
 ) -> Response<Body> {
     let path = req.uri().path();
     let route = route_of(req.method(), path);
-    let rq = Rq { trace, operation: telemetry::operation(path) };
-    if let Err(d) = limits::check(&key) {
-        metrics::denial(d.code);
-        let mut r = oai_error(StatusCode::TOO_MANY_REQUESTS, "insufficient_quota", d.code, &d.message);
-        if let Some(s) = d.retry_after_s {
-            r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(s));
-        }
-        // Recorded, so "how often is this key throttled" has an answer;
-        // the body isn't read yet, so the model is blank.
-        emit(&cfg, &key, String::new(), false, rq).send(429, d.code, Default::default(), 0);
-        return r;
-    }
+    let rq = Rq { trace, operation: telemetry::operation(path), client_ip };
     match route {
+        // These check their limits themselves, once the body says which
+        // model: what the request may cost is held against its budgets.
         Route::Chat => proxy_openai(cfg, key, inbound, req, "/chat/completions", rq).await,
         Route::Completions => proxy_openai(cfg, key, inbound, req, "/completions", rq).await,
         Route::Embeddings => proxy_openai(cfg, key, inbound, req, "/embeddings", rq).await,
         Route::Messages => proxy_anthropic(cfg, key, inbound, req, rq).await,
-        Route::Models => models(&cfg, &key, &inbound),
-        Route::CountTokens => count_tokens(req).await,
-        Route::Other => not_found(),
+        Route::Models | Route::CountTokens | Route::Other => {
+            if let Err(d) = limits::check(&key) {
+                return denied(&cfg, &key, String::new(), false, &rq, d);
+            }
+            match route {
+                Route::Models => models(&cfg, &key, &inbound),
+                Route::CountTokens => count_tokens(req).await,
+                _ => not_found(),
+            }
+        }
     }
 }
 
+/// The answer to a request a budget or rate limit refuses. Recorded, so "how
+/// often is this key throttled" has an answer.
+fn denied(
+    cfg: &Arc<Config>,
+    key: &Arc<Key>,
+    model: String,
+    stream: bool,
+    rq: &Rq,
+    d: limits::Denial,
+) -> Response<Body> {
+    metrics::denial(d.code);
+    let mut r = oai_error(StatusCode::TOO_MANY_REQUESTS, "insufficient_quota", d.code, &d.message);
+    if let Some(s) = d.retry_after_s {
+        r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(s));
+    }
+    emit(cfg, key, model, stream, rq).send(429, d.code, Default::default(), 0);
+    r
+}
+
+/// Admit a request for a model: hold what it is expected to cost against its
+/// key's budgets, then take its rate-limit slot. In that order, so a request
+/// a budget refuses uses no slot. The reservation lives in the request's
+/// `Emit` from here on, and is given back when that sends its event or is
+/// dropped.
+fn admit(
+    cfg: &Arc<Config>,
+    key: &Arc<Key>,
+    resolved: Option<&crate::config::Resolved>,
+    p: &Parsed,
+    body: &[u8],
+    output: bool,
+    rq: &Rq,
+) -> Result<limits::Reservation, Response<Body>> {
+    // Priced as the first deployment in routing order would bill it; a
+    // model that resolves to nothing costs nothing.
+    let expected = match resolved.and_then(|r| r.deployments.first()) {
+        Some(d) if limits::budgeted(key) => {
+            crate::usage::expected_cost(cfg, d, &p.model, body, max_tokens(body), output)
+        }
+        _ => 0.0,
+    };
+    limits::admit(key, expected)
+        .and_then(|held| limits::take_rates(key).map(|()| held))
+        .map_err(|d| denied(cfg, key, p.model.clone(), p.stream, rq, d))
+}
+
+/// The most output tokens a request allows: max_completion_tokens, else
+/// max_tokens, the last of each as the upstream reads it.
+fn max_tokens(body: &[u8]) -> Option<u64> {
+    #[derive(Default)]
+    struct Caps {
+        max_tokens: Option<u64>,
+        max_completion_tokens: Option<u64>,
+    }
+    impl<'de> Deserialize<'de> for Caps {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> serde::de::Visitor<'de> for V {
+                type Value = Caps;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("an object")
+                }
+                fn visit_map<M: serde::de::MapAccess<'de>>(self, mut m: M) -> Result<Caps, M::Error> {
+                    // A cap that is not a whole number is no cap here.
+                    let cap = |v: serde_json::Value| v.as_u64();
+                    let mut c = Caps::default();
+                    while let Some(k) = m.next_key::<Cow<str>>()? {
+                        match k.as_ref() {
+                            "max_tokens" => c.max_tokens = cap(m.next_value()?),
+                            "max_completion_tokens" => c.max_completion_tokens = cap(m.next_value()?),
+                            _ => {
+                                m.next_value::<serde::de::IgnoredAny>()?;
+                            }
+                        }
+                    }
+                    Ok(c)
+                }
+            }
+            d.deserialize_map(V)
+        }
+    }
+    let c: Caps = serde_json::from_slice(body).ok()?;
+    c.max_completion_tokens.or(c.max_tokens)
+}
+
 /// A request's trace and operation, for its usage event.
-#[derive(Clone, Copy)]
 struct Rq {
     trace: Trace,
     operation: telemetry::Operation,
+    /// The client's address, when the gateway records it.
+    client_ip: Option<Box<str>>,
 }
 
 /// Who a request says it is: a gateway key, resolved, or an identity token,
@@ -428,7 +524,7 @@ fn authenticate(cfg: &Config, h: &HeaderMap) -> Result<(Caller, Inbound), Respon
     Ok((caller, inbound))
 }
 
-fn emit(cfg: &Arc<Config>, key: &Arc<Key>, model: String, stream: bool, rq: Rq) -> Emit {
+fn emit(cfg: &Arc<Config>, key: &Arc<Key>, model: String, stream: bool, rq: &Rq) -> Emit {
     let request_id = format!("req_{:016x}", fastrand::u64(..));
     let verdict = telemetry::decide(&cfg.telemetry, cfg.data_rule, key, &request_id);
     Emit {
@@ -449,6 +545,8 @@ fn emit(cfg: &Arc<Config>, key: &Arc<Key>, model: String, stream: bool, rq: Rq) 
         content: None,
         output: Default::default(),
         reserved: Default::default(),
+        budget: Default::default(),
+        client_ip: rq.client_ip.clone(),
     }
 }
 
@@ -581,8 +679,14 @@ async fn proxy_openai(
     if p.model.is_empty() {
         return oai_error(StatusCode::BAD_REQUEST, "invalid_request_error", "missing_model", "model field is required");
     }
-    let mut em = emit(&cfg, &key, p.model.clone(), p.stream, rq);
-    let Some(resolved) = cfg.resolve(&p.model) else {
+    let resolved = cfg.resolve(&p.model);
+    let held = match admit(&cfg, &key, resolved.as_ref(), &p, &body, path != "/embeddings", &rq) {
+        Ok(held) => held,
+        Err(r) => return r,
+    };
+    let mut em = emit(&cfg, &key, p.model.clone(), p.stream, &rq);
+    em.budget = held;
+    let Some(resolved) = resolved else {
         if !key.model_allowed(&[&p.model]) {
             return refuse_oai(em, "model_not_allowed");
         }
@@ -697,13 +801,19 @@ async fn proxy_anthropic(
     if p.model.is_empty() {
         return anth_error(StatusCode::BAD_REQUEST, "invalid_request_error", "model is required");
     }
-    let mut em = emit(&cfg, &key, p.model.clone(), p.stream, rq);
+    let resolved = cfg.resolve(&p.model);
+    let held = match admit(&cfg, &key, resolved.as_ref(), &p, &body, true, &rq) {
+        Ok(held) => held,
+        Err(r) => return r,
+    };
+    let mut em = emit(&cfg, &key, p.model.clone(), p.stream, &rq);
+    em.budget = held;
     let refuse = |em: Emit, code: &'static str| {
         let why = if code == "model_not_allowed" { "is not available for this API key" } else { "does not exist" };
         em.send(404, code, Default::default(), 0);
         anth_error(StatusCode::NOT_FOUND, "not_found_error", &format!("model {} {why}", p.model))
     };
-    let Some(resolved) = cfg.resolve(&p.model) else {
+    let Some(resolved) = resolved else {
         let code = if key.model_allowed(&[&p.model]) { "model_not_found" } else { "model_not_allowed" };
         return refuse(em, code);
     };
@@ -1089,6 +1199,16 @@ mod tests {
         assert_eq!(v["stream_options"]["include_usage"], true);
         assert_eq!(v["stream_options"]["x"], 2);
         assert_eq!(v["model"], "u");
+    }
+
+    #[test]
+    fn reads_the_output_cap() {
+        assert_eq!(max_tokens(br#"{"model":"m","max_tokens":100}"#), Some(100));
+        assert_eq!(max_tokens(br#"{"max_tokens":100,"max_completion_tokens":50}"#), Some(50));
+        assert_eq!(max_tokens(br#"{"max_tokens":100,"max_tokens":7}"#), Some(7), "the last, as the upstream reads it");
+        for none in [&br#"{"model":"m"}"#[..], br#"{"max_tokens":"many"}"#, br#"{"max_tokens":-1}"#, b"[1]", b"{"] {
+            assert_eq!(max_tokens(none), None);
+        }
     }
 
     #[test]

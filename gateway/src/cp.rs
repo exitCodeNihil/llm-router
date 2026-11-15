@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cloud::jwt::{BoxFuture, ProvisionError, Provisioned, Provisioner};
 use crate::config::{Config, SCHEMA, Wire};
+use crate::delta;
 use crate::limits::{self, Counters, RateDelta};
 use crate::server::{HttpsClient, State, https_client};
 use crate::spool::{self, Spool};
@@ -62,6 +63,29 @@ const MAX_SAVED_AGE: Duration = Duration::from_secs(24 * 3600);
 /// How far ahead of this clock a saved confirmation may be: past that the
 /// clock, or the file, is wrong.
 const MAX_CLOCK_SKEW_MS: i64 = 5 * 60_000;
+/// The control-plane replicas whose limits cursor a sync names: the ones
+/// that answered most recently.
+const MAX_CURSORS: usize = 8;
+/// Sent with a config poll in a schema 3 session: the digest of the config
+/// held, so the control plane only sends a delta to a gateway that holds
+/// exactly what the delta is built on.
+const DIGEST_HEADER: &str = "x-llmr-config-digest";
+
+/// What the gateway keeps of the config in use besides the hot path's own
+/// form: enough to poll for the next one, to patch it with a delta, and to
+/// save it.
+#[derive(Clone)]
+struct Held {
+    epoch: String,
+    version: i64,
+    group: String,
+    /// Its digest, once the control plane's matched its entries: without
+    /// one, no delta is asked for.
+    digest: Option<String>,
+    /// The full config as a config response's body, received or patched.
+    gzip: bool,
+    body: Bytes,
+}
 
 pub struct ControlPlane {
     base: String,
@@ -81,9 +105,18 @@ pub struct ControlPlane {
     join_lock: tokio::sync::Mutex<()>,
     started: Instant,
     leaving: AtomicBool,
-    /// The version to poll the config with: 0 asks for it whatever the
-    /// control plane has.
-    config_version: AtomicI64,
+    /// The config in use; None asks for it whatever the control plane has.
+    held: Mutex<Option<Held>>,
+    /// Ask for the full config with the next poll, naming none: after a
+    /// delta that did not apply, and for a saved config that cannot say
+    /// which one it is.
+    refetch: AtomicBool,
+    /// The wire schema this session was joined with: SCHEMA, or the one
+    /// before it against a control plane that has not been upgraded yet.
+    schema: AtomicI64,
+    older_warned: AtomicBool,
+    /// The config held is the saved one, not yet replaced or confirmed.
+    restored: AtomicBool,
     /// The control plane has refused the join since the last one that
     /// succeeded: when that was noticed in this process, and for how long it
     /// had been going on by then, as the state directory had it.
@@ -110,6 +143,15 @@ struct Joined {
     #[serde(default)]
     sync_interval_ms: u64,
     group: Option<crate::config::WireGroup>,
+    /// The schema the control plane will speak with this gateway.
+    #[serde(default)]
+    schema: i64,
+}
+
+enum JoinError {
+    /// The control plane only knows an older schema than the one asked for.
+    Older(String),
+    Other(String),
 }
 
 enum Call {
@@ -137,7 +179,11 @@ impl ControlPlane {
             join_lock: tokio::sync::Mutex::new(()),
             started: Instant::now(),
             leaving: AtomicBool::new(false),
-            config_version: AtomicI64::new(0),
+            held: Mutex::new(None),
+            refetch: AtomicBool::new(false),
+            schema: AtomicI64::new(SCHEMA),
+            older_warned: AtomicBool::new(false),
+            restored: AtomicBool::new(false),
             refused_since: Mutex::new(None),
             refuse_after: REFUSE_AFTER,
             st: OnceLock::new(),
@@ -235,32 +281,27 @@ impl ControlPlane {
         }
     }
 
+    /// Join with this gateway's schema, or with the one before it when the
+    /// control plane says it is older: such a session has no config deltas
+    /// and none of the newer fields, as before them.
     async fn join(&self) -> Result<(), String> {
-        let body = serde_json::to_vec(&serde_json::json!({"name": self.name, "version": VERSION, "schema": SCHEMA}))
-            .unwrap_or_default();
-        let call = self
-            .call(
-                Method::POST,
-                "/gw/v1/join",
-                &self.join_token,
-                Some((body.into(), false)),
-                &[],
-                Duration::from_secs(15),
-            )
-            .await?;
-        let (status, bytes) = match call {
-            Call::Ok(status, _, bytes) => (status, bytes),
-            Call::Unauthorized(refused) => {
-                if refused {
-                    self.refused();
+        let (j, schema) = match self.join_as(SCHEMA).await {
+            Ok(j) => (j, SCHEMA),
+            Err(JoinError::Older(why)) => {
+                if !self.older_warned.swap(true, Ordering::Relaxed) {
+                    log_warn!(
+                        "the control plane does not know config schema {SCHEMA} ({why}); joining with schema {}: no config deltas until it is upgraded",
+                        SCHEMA - 1
+                    );
                 }
-                return Err("the control plane refused the join token".into());
+                match self.join_as(SCHEMA - 1).await {
+                    Ok(j) => (j, SCHEMA - 1),
+                    Err(JoinError::Older(e) | JoinError::Other(e)) => return Err(e),
+                }
             }
+            Err(JoinError::Other(e)) => return Err(e),
         };
-        if status != StatusCode::OK {
-            return Err(format!("join: {status}: {}", String::from_utf8_lossy(&bytes)));
-        }
-        let j: Joined = serde_json::from_slice(&bytes).map_err(|e| format!("join response: {e}"))?;
+        self.schema.store(if (1..schema).contains(&j.schema) { j.schema } else { schema }, Ordering::Relaxed);
         self.adopt(&j);
         self.joins.fetch_add(1, Ordering::Relaxed);
         if self.refused_since.lock().unwrap().take().is_some()
@@ -275,6 +316,42 @@ impl ControlPlane {
             log_info!("joined gateway group {} as instance {}", g.name, j.instance_id);
         }
         Ok(())
+    }
+
+    async fn join_as(&self, schema: i64) -> Result<Joined, JoinError> {
+        let body = serde_json::to_vec(&serde_json::json!({"name": self.name, "version": VERSION, "schema": schema}))
+            .unwrap_or_default();
+        let call = self
+            .call(
+                Method::POST,
+                "/gw/v1/join",
+                &self.join_token,
+                Some((body.into(), false)),
+                &[],
+                Duration::from_secs(15),
+            )
+            .await
+            .map_err(JoinError::Other)?;
+        let (status, bytes) = match call {
+            Call::Ok(status, _, bytes) => (status, bytes),
+            Call::Unauthorized(refused) => {
+                if refused {
+                    self.refused();
+                }
+                return Err(JoinError::Other("the control plane refused the join token".into()));
+            }
+        };
+        if status != StatusCode::OK {
+            let why = String::from_utf8_lossy(&bytes[..bytes.len().min(300)]).trim().to_string();
+            // An older control plane refuses a schema it does not know and
+            // says to upgrade it; any other 400 is about something else.
+            return Err(if status == StatusCode::BAD_REQUEST && why.to_ascii_lowercase().contains("upgrad") {
+                JoinError::Older(why)
+            } else {
+                JoinError::Other(format!("join: {status}: {why}"))
+            });
+        }
+        serde_json::from_slice(&bytes).map_err(|e| JoinError::Other(format!("join response: {e}")))
     }
 
     /// The control plane answered the join with its own 401: the group is
@@ -310,7 +387,7 @@ impl ControlPlane {
         );
         st.ready.set(false);
         st.config.store(None);
-        self.config_version.store(0, Ordering::Relaxed);
+        *self.held.lock().unwrap() = None;
         metrics::CONFIG_VERSION.store(0, Ordering::Relaxed);
         if let Some(state) = self.state.clone() {
             tokio::task::spawn_blocking(move || state.forget());
@@ -399,8 +476,10 @@ impl ControlPlane {
             );
             return;
         }
-        let cfg = match load(saved.gzip, &saved.config) {
-            Ok(cfg) => cfg,
+        let (gzip, body) = (saved.gzip, Bytes::from(saved.config));
+        let loaded = tokio::task::spawn_blocking(move || load(gzip, body)).await;
+        let Loaded { cfg, held } = match loaded.unwrap_or_else(|e| Err(e.to_string())) {
+            Ok(loaded) => loaded,
             Err(e) => {
                 log_warn!("state: the saved config is unusable ({e}); deleting it");
                 let _ = tokio::task::spawn_blocking(move || state.forget()).await;
@@ -420,6 +499,12 @@ impl ControlPlane {
             age_ms.max(0) / 1000,
             if saved.confirmed.spend.is_some() { "" } else { "; budgeted keys wait for the first sync" }
         );
+        // A saved config that knows its digest is polled for by name, and
+        // the control plane answers with what changed since; one that does
+        // not is replaced by the control plane's own, whatever it has.
+        self.refetch.store(held.digest.is_none(), Ordering::Relaxed);
+        self.restored.store(true, Ordering::Relaxed);
+        *self.held.lock().unwrap() = Some(held);
         self.install(st, cfg);
         st.ready.config_ok_ago(Duration::from_millis(age_ms.max(0) as u64));
         st.ready.set(true);
@@ -474,34 +559,61 @@ impl ControlPlane {
         }
     }
 
-    /// Long-poll the config. The first poll names no version, so a config
-    /// from the state directory is replaced by the control plane's own.
+    /// Long-poll the config, naming the one held so the control plane
+    /// answers only once it has another: with that config, or in a schema 3
+    /// session with what changed since (a delta). A delta that does not
+    /// apply is discarded and the full config fetched instead.
     async fn config_loop(self: Arc<Self>, st: &'static State) {
+        let mut discarded = 0u32;
         loop {
             let (s, generation) = self.session();
-            let etag = match self.config_version.load(Ordering::Relaxed) {
-                0 => Vec::new(),
-                version => vec![("if-none-match", format!("\"v{version}\""))],
-            };
-            match self.call(Method::GET, "/gw/v1/config?wait=25", &s, None, &etag, Duration::from_secs(40)).await {
+            let schema = self.schema.load(Ordering::Relaxed);
+            let held = self.held.lock().unwrap().clone();
+            // Before schema 3 a version says nothing about which control
+            // plane numbered it: a saved config is never named there.
+            let unnamed = self.refetch.load(Ordering::Relaxed) || (schema < 3 && self.restored.load(Ordering::Relaxed));
+            let named = held.as_ref().filter(|_| !unnamed);
+            let headers = named.map(|h| poll_headers(h, schema)).unwrap_or_default();
+            let unconditional = headers.is_empty();
+            match self.call(Method::GET, "/gw/v1/config?wait=25", &s, None, &headers, Duration::from_secs(40)).await {
                 Ok(Call::Ok(StatusCode::OK, headers, bytes)) => {
                     let gzip = headers.get(header::CONTENT_ENCODING) == Some(&HeaderValue::from_static("gzip"));
-                    match load(gzip, &bytes) {
-                        Ok(cfg) => {
-                            self.config_version.store(cfg.version, Ordering::Relaxed);
+                    // Reading a large config takes a while: off the request threads.
+                    let received =
+                        tokio::task::spawn_blocking(move || receive(held, gzip, bytes, schema, unconditional)).await;
+                    match received.unwrap_or_else(|e| Received::Rejected(e.to_string())) {
+                        Received::Config(loaded) => {
+                            let Loaded { cfg, held } = *loaded;
+                            discarded = 0;
+                            self.refetch.store(false, Ordering::Relaxed);
+                            self.restored.store(false, Ordering::Relaxed);
                             if let Some(state) = &self.state {
-                                state.put_config(gzip, bytes, now_ms(), cfg.version, &cfg.group.id);
+                                state.put_config(held.gzip, held.body.clone(), now_ms(), held.version, &held.group);
                             }
+                            *self.held.lock().unwrap() = Some(held);
                             self.install(st, cfg);
                             st.ready.config_ok();
                         }
-                        Err(e) => {
+                        Received::Ignored(why) => {
+                            log_warn!("config ignored: {why}");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                        Received::Discarded(why) => {
+                            log_warn!("config delta discarded: {why}; fetching the full config");
+                            self.refetch.store(true, Ordering::Relaxed);
+                            // at once the first time; a control plane that keeps
+                            // sending deltas that do not apply is not hammered
+                            tokio::time::sleep(Duration::from_secs(discarded.min(5) as u64)).await;
+                            discarded += 1;
+                        }
+                        Received::Rejected(e) => {
                             log_error!("config rejected: {e}");
                             tokio::time::sleep(Duration::from_secs(5)).await;
                         }
                     }
                 }
                 Ok(Call::Ok(StatusCode::NOT_MODIFIED, _, _)) => {
+                    self.restored.store(false, Ordering::Relaxed);
                     st.ready.config_ok();
                     if let Some(state) = &self.state {
                         state.confirm(now_ms());
@@ -518,6 +630,17 @@ impl ControlPlane {
                 }
             }
         }
+    }
+
+    /// The config in use, as a schema 3 sync or replay names it, so the
+    /// control plane can hold off until it knows that config too; None in a
+    /// session that does not say.
+    fn config_named(&self) -> Option<(i64, String)> {
+        if self.schema.load(Ordering::Relaxed) < 3 {
+            return None;
+        }
+        let held = self.held.lock().unwrap();
+        Some(held.as_ref().map_or((0, String::new()), |h| (h.version, h.epoch.clone())))
     }
 
     async fn sync_loop(self: Arc<Self>, st: &'static State) {
@@ -629,6 +752,7 @@ impl ControlPlane {
         let n = chunk.events.len();
         if n > 0 {
             let events = std::mem::take(&mut chunk.events);
+            let config = self.config_named();
             let Ok(Ok(body)) = tokio::task::spawn_blocking(move || {
                 let mut json = Vec::with_capacity(events.iter().map(|e| e.len() + 1).sum::<usize>() + 16);
                 json.extend_from_slice(b"{\"events\":[");
@@ -638,7 +762,14 @@ impl ControlPlane {
                     }
                     json.extend_from_slice(e);
                 }
-                json.extend_from_slice(b"]}");
+                json.push(b']');
+                if let Some((version, epoch)) = config {
+                    let epoch = serde_json::to_string(&epoch).unwrap_or_else(|_| "\"\"".into());
+                    json.extend_from_slice(
+                        format!(",\"config_version\":{version},\"config_epoch\":{epoch}").as_bytes(),
+                    );
+                }
+                json.push(b'}');
                 gzip(&json)
             })
             .await
@@ -688,9 +819,11 @@ impl ControlPlane {
     async fn replay_pending(&self, s: &mut Syncer, joins: u64) -> Option<bool> {
         let mut batch = s.pending.take()?;
         let n = batch.frozen.events.len();
+        let config = self.config_named();
         let (body, frozen) = tokio::task::spawn_blocking(move || {
             let frozen = batch.frozen;
-            let body = serde_json::to_vec(&ReplayRequest { events: &frozen.events })
+            let (config_version, config_epoch) = (config.as_ref().map(|c| c.0), config.as_ref().map(|c| c.1.as_str()));
+            let body = serde_json::to_vec(&ReplayRequest { events: &frozen.events, config_version, config_epoch })
                 .map_err(std::io::Error::other)
                 .and_then(|json| gzip(&json));
             (body, frozen)
@@ -766,8 +899,20 @@ impl ControlPlane {
                 cpu_pct: crate::resources::cpu_pct(),
                 leaving: self.leaving.load(Ordering::Relaxed),
             };
-            let frozen =
-                Frozen { batch: s.batch, cursor: s.cursor.clone(), events, sending, rates, stats, dropped_high: 0 };
+            // Schema 3: the config this gateway runs on, and its cursor at
+            // each control-plane replica that answered lately.
+            let config = self.config_named();
+            let frozen = Frozen {
+                batch: s.batch,
+                cursor: s.cursor().to_string(),
+                cursors: config.as_ref().map(|_| s.cursors.clone()),
+                config,
+                events,
+                sending,
+                rates,
+                stats,
+                dropped_high: 0,
+            };
             s.pending = Batch::build(frozen, scopes).await;
         }
         // A renewed session is the same instance: only a join in between
@@ -796,7 +941,7 @@ impl ControlPlane {
                     state.touch();
                 }
                 self.settle(batch.frozen.high()).await;
-                s.cursor = counters.cursor;
+                s.answered(counters.replica, counters.cursor);
                 s.pending = None;
                 true
             }
@@ -896,7 +1041,10 @@ impl Provisioner for ControlPlane {
 #[derive(Default)]
 struct Syncer {
     batch: i64,
-    cursor: String,
+    /// The limits cursor each control-plane replica last answered with, by
+    /// replica id, the latest first: replicas number their cursors apart.
+    /// A control plane that names no replica is the one named "".
+    cursors: Vec<(String, String)>,
     pending: Option<Batch>,
     /// A smaller byte cap than MAX_BATCH_BYTES, after a 413.
     limit_bytes: Option<usize>,
@@ -907,6 +1055,18 @@ struct Syncer {
 impl Syncer {
     fn max_bytes(&self) -> usize {
         self.limit_bytes.unwrap_or(MAX_BATCH_BYTES)
+    }
+
+    /// The cursor of the replica that answered last.
+    fn cursor(&self) -> &str {
+        self.cursors.first().map_or("", |(_, cursor)| cursor)
+    }
+
+    /// `replica` answered a sync with `cursor`.
+    fn answered(&mut self, replica: String, cursor: String) {
+        self.cursors.retain(|(r, _)| *r != replica);
+        self.cursors.insert(0, (replica, cursor));
+        self.cursors.truncate(MAX_CURSORS);
     }
 }
 
@@ -926,6 +1086,9 @@ struct Batch {
 struct Frozen {
     batch: i64,
     cursor: String,
+    /// Schema 3 only: every replica's cursor, and the config in use.
+    cursors: Option<Vec<(String, String)>>,
+    config: Option<(i64, String)>,
     events: Vec<Event>,
     /// The events' content, counted against the capture budget while the
     /// batch lives.
@@ -965,6 +1128,10 @@ enum Replay {
 #[derive(Serialize)]
 struct ReplayRequest<'a> {
     events: &'a [Event],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_epoch: Option<&'a str>,
 }
 
 /// Leftover events on their way to the replay, and the spool files that end
@@ -989,8 +1156,16 @@ impl Batch {
     async fn build(frozen: Frozen, scopes: Vec<Arc<limits::Scope>>) -> Option<Batch> {
         let body = tokio::task::spawn_blocking(move || {
             let f = &frozen;
-            let req =
-                SyncRequest { batch: f.batch, cursor: &f.cursor, events: &f.events, rates: &f.rates, stats: &f.stats };
+            let req = SyncRequest {
+                batch: f.batch,
+                cursor: &f.cursor,
+                cursors: f.cursors.as_ref().map(|c| c.iter().map(|(r, c)| (r.as_str(), c.as_str())).collect()),
+                config_version: f.config.as_ref().map(|c| c.0),
+                config_epoch: f.config.as_ref().map(|c| c.1.as_str()),
+                events: &f.events,
+                rates: &f.rates,
+                stats: &f.stats,
+            };
             let gz = (|| {
                 let json = serde_json::to_vec(&req).map_err(std::io::Error::other)?;
                 let mut gz =
@@ -1053,6 +1228,12 @@ fn refused(status: StatusCode) -> bool {
 struct SyncRequest<'a> {
     batch: i64,
     cursor: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursors: Option<std::collections::BTreeMap<&'a str, &'a str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_epoch: Option<&'a str>,
     events: &'a [Event],
     rates: &'a [RateDelta],
     stats: &'a Stats,
@@ -1074,20 +1255,143 @@ struct Stats {
     leaving: bool,
 }
 
-/// Build the config from a config response's body, as received or as saved.
-fn load(gzip: bool, bytes: &[u8]) -> Result<Config, String> {
-    let raw = if gzip {
-        let mut out = Vec::with_capacity(bytes.len() * 8);
-        flate2::read::GzDecoder::new(bytes).read_to_end(&mut out).map_err(|e| format!("gunzip: {e}"))?;
-        out
-    } else {
-        bytes.to_vec()
+/// What a config poll names the config held with. Schema 3 names its epoch
+/// too, and its digest once that is verified; before, the version alone.
+fn poll_headers(held: &Held, schema: i64) -> Vec<(&'static str, String)> {
+    if schema < 3 {
+        return vec![("if-none-match", format!("\"v{}\"", held.version))];
+    }
+    let tag = format!("\"{}-v{}\"", held.epoch, held.version);
+    // An epoch that cannot travel in a header names nothing: the full
+    // config comes back.
+    if held.epoch.contains('"') || HeaderValue::try_from(tag.as_str()).is_err() {
+        return Vec::new();
+    }
+    let mut headers = vec![("if-none-match", tag)];
+    if let Some(digest) = &held.digest {
+        headers.push((DIGEST_HEADER, digest.clone()));
+    }
+    headers
+}
+
+/// A config ready to serve, and what to hold of it.
+struct Loaded {
+    cfg: Config,
+    held: Held,
+}
+
+/// What became of a config response.
+enum Received {
+    Config(Box<Loaded>),
+    /// Not newer than the config held: kept waiting for one that is.
+    Ignored(String),
+    /// A delta that does not apply to the config held.
+    Discarded(String),
+    Rejected(String),
+}
+
+fn gunzip(gzip: bool, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if !gzip {
+        return Ok(bytes.to_vec());
+    }
+    let mut out = Vec::with_capacity(bytes.len() * 8);
+    flate2::read::GzDecoder::new(bytes).read_to_end(&mut out).map_err(|e| format!("gunzip: {e}"))?;
+    Ok(out)
+}
+
+/// Read a config response in a session of `schema`, against the config
+/// `held`. `unconditional` says the poll named no config. Blocking.
+fn receive(held: Option<Held>, gzip: bool, body: Bytes, schema: i64, unconditional: bool) -> Received {
+    let raw = match gunzip(gzip, &body) {
+        Ok(raw) => raw,
+        Err(e) => return Received::Rejected(e),
     };
-    let wire: Wire = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+    if schema >= 3 && delta::is_delta(&raw) {
+        return match patched(held, &raw) {
+            Ok(loaded) => Received::Config(Box::new(loaded)),
+            Err(e) => Received::Discarded(e),
+        };
+    }
+    let wire: Wire = match serde_json::from_slice(&raw) {
+        Ok(wire) => wire,
+        Err(e) => return Received::Rejected(e.to_string()),
+    };
+    drop(raw);
+    // Versions count within an epoch: a control plane that starts over
+    // names a new one, and its config is taken whatever its number. Within
+    // one, an older config is a replica lagging behind; the same version is
+    // only taken when it was asked for by no name, to replace the one held.
+    if schema >= 3
+        && let Some(h) = &held
+        && wire.epoch == h.epoch
+        && (wire.version < h.version || (wire.version == h.version && !unconditional))
+    {
+        return Received::Ignored(format!(
+            "the control plane sent version {} of epoch {:?}; version {} is in use",
+            wire.version, wire.epoch, h.version
+        ));
+    }
+    let digest = verified(&wire);
+    if schema >= 3 && digest.is_none() {
+        // The control plane is the authority on the config, so it is used;
+        // but no delta is asked for on top of what cannot be told apart.
+        log_warn!(
+            "config version {}: its digest {:?} does not match its entries; using it, without deltas until one matches",
+            wire.version,
+            wire.digest
+        );
+    }
+    match build(wire, digest, gzip, body) {
+        Ok(loaded) => Received::Config(Box::new(loaded)),
+        Err(e) => Received::Rejected(e),
+    }
+}
+
+/// The digest of a full config, when it is the one the config names.
+fn verified(wire: &Wire) -> Option<String> {
+    if wire.digest.is_empty() {
+        return None;
+    }
+    Some(delta::digest(wire)).filter(|computed| *computed == wire.digest)
+}
+
+/// The config `held` with a delta applied: only onto exactly the config the
+/// delta was built on, and only if the result has the digest the delta
+/// names. The patched config is kept as the control plane would have sent
+/// it, to patch again and to save.
+fn patched(held: Option<Held>, delta: &[u8]) -> Result<Loaded, String> {
+    let held = held.ok_or("no config is held")?;
+    let digest = held.digest.as_deref().ok_or("the config held has no verified digest")?;
+    let full = gunzip(held.gzip, &held.body)?;
+    let base = delta::Base { epoch: &held.epoch, version: held.version, digest };
+    let next = delta::apply(&full, delta, &base)?;
+    drop(full);
+    let wire: Wire = serde_json::from_slice(&next).map_err(|e| format!("the patched config is unreadable: {e}"))?;
+    let computed = delta::digest(&wire);
+    if computed != wire.digest {
+        return Err(format!("the patched config's digest is {computed}, not the {} it names", wire.digest));
+    }
+    let body = gzip(&next).map_err(|e| e.to_string())?;
+    drop(next);
+    build(wire, Some(computed), true, body.into())
+}
+
+/// Build the hot-path config from a full config, `body` being its bytes as
+/// a config response carries them.
+fn build(wire: Wire, digest: Option<String>, gzip: bool, body: Bytes) -> Result<Loaded, String> {
+    let epoch = wire.epoch.clone();
     let generation = limits::begin_config();
     let cfg = Config::build(wire)?;
     limits::end_config(generation);
-    Ok(cfg)
+    let held = Held { epoch, version: cfg.version, group: cfg.group.id.clone(), digest, gzip, body };
+    Ok(Loaded { cfg, held })
+}
+
+/// Read a full config as it was saved. Blocking.
+fn load(gzip: bool, body: Bytes) -> Result<Loaded, String> {
+    let wire: Wire = serde_json::from_slice(&gunzip(gzip, &body)?).map_err(|e| e.to_string())?;
+    let digest = verified(&wire);
+    build(wire, digest, gzip, body)
 }
 
 fn is_local(url: &str) -> bool {
@@ -1368,12 +1672,53 @@ mod tests {
     /// A replay status: the connection is closed without an answer.
     const CUT_OFF: usize = 1;
 
+    /// A full schema 3 config as the control plane sends it: epoch "e1", the
+    /// keys of `wire_config`, each entry with its hash, and the digest.
+    fn config3(version: i64) -> serde_json::Value {
+        delta::tests::sealed(serde_json::json!({
+            "schema": 3, "version": version, "epoch": "e1", "rest_hash": "r1",
+            "group": {"id": "g1", "name": "group"},
+            "keys": [
+                {"hash": "11".repeat(32), "id": "cp-budgeted", "budget_usd": 1.0, "h": "k1"},
+                {"hash": "22".repeat(32), "id": "cp-free", "h": "k2"},
+            ],
+        }))
+    }
+
+    /// A delta from `base` to `target`, changing only what `changes` says.
+    fn delta3(base: &serde_json::Value, target: &serde_json::Value, changes: serde_json::Value) -> serde_json::Value {
+        let mut d = serde_json::json!({"schema": 3, "delta": true, "epoch": target["epoch"],
+            "base_version": base["version"], "base_digest": base["digest"],
+            "version": target["version"], "digest": target["digest"]});
+        d.as_object_mut().unwrap().extend(changes.as_object().unwrap().clone());
+        d
+    }
+
+    /// What a mock control plane answers config polls with.
+    #[derive(Default)]
+    struct Configs {
+        /// The config it has; None is `config3(3)`.
+        current: Option<serde_json::Value>,
+        /// Answers to the next polls, before `current` is looked at.
+        next: std::collections::VecDeque<serde_json::Value>,
+    }
+
     #[derive(Default)]
     struct Gwcp {
         mode: AtomicUsize,
         joins: AtomicUsize,
+        /// A control plane from before schema 3: it refuses a join that
+        /// names it, and speaks schema 2.
+        older: AtomicBool,
+        /// The schema of each join.
+        join_schemas: Mutex<Vec<i64>>,
+        configs: Mutex<Configs>,
         /// The If-None-Match of each config poll.
         polls: Mutex<Vec<Option<String>>>,
+        /// The digest header of each config poll.
+        digests: Mutex<Vec<Option<String>>>,
+        /// The replica ids syncs are answered under, in turn; none names no replica.
+        replicas: Mutex<Vec<&'static str>>,
         /// Every sync and replay in order: its path, the status answered, its JSON.
         calls: Mutex<Vec<(String, u16, serde_json::Value)>>,
         /// How many of the next syncs are answered 401, as an ended session is.
@@ -1385,6 +1730,19 @@ mod tests {
     }
 
     impl Gwcp {
+        /// Answer the next polls with `next`, in order, and have `current` from then on.
+        fn serve(&self, next: Vec<serde_json::Value>, current: serde_json::Value) {
+            let mut configs = self.configs.lock().unwrap();
+            configs.next.extend(next);
+            configs.current = Some(current);
+        }
+
+        /// Every sync's JSON, in order, with the status it was answered.
+        fn syncs(&self) -> Vec<(u16, serde_json::Value)> {
+            let calls = self.calls.lock().unwrap();
+            calls.iter().filter(|(path, _, _)| path.ends_with("sync")).map(|(_, code, v)| (*code, v.clone())).collect()
+        }
+
         /// The model names of the events in each call to `path` answered `status`.
         fn models(&self, path: &str, status: u16) -> Vec<Vec<String>> {
             let calls = self.calls.lock().unwrap();
@@ -1396,9 +1754,10 @@ mod tests {
     }
 
     /// A control plane with the whole gateway protocol: joins answered as
-    /// `mode` says, sessions that end when it stops accepting, config
-    /// version 3, syncs that report no spend, and a replay that calls the
-    /// first event of each request a duplicate.
+    /// `mode` says, sessions that end when it stops accepting, the schema 3
+    /// config `config3(3)` unless told otherwise (`serve`), syncs that
+    /// report no spend, and a replay that calls the first event of each
+    /// request a duplicate. As an `older` one it speaks schema 2.
     async fn gateway_cp() -> (String, Arc<Gwcp>) {
         use hyper::service::service_fn;
         use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -1420,9 +1779,21 @@ mod tests {
                                 Ok::<_, std::io::Error>(resp.status(status).body(Full::new(Bytes::from(body))).unwrap())
                             };
                             let path = req.uri().path().to_string();
-                            let tag = req.headers().get("if-none-match").map(|v| v.to_str().unwrap().to_string());
+                            let header = |name: &str| req.headers().get(name).map(|v| v.to_str().unwrap().to_string());
+                            let (tag, digest) = (header("if-none-match"), header(DIGEST_HEADER));
+                            let older = cp.older.load(Ordering::Relaxed);
                             if path == "/gw/v1/join" {
                                 cp.joins.fetch_add(1, Ordering::Relaxed);
+                                let body = req.into_body().collect().await.unwrap().to_bytes();
+                                let schema = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["schema"]
+                                    .as_i64()
+                                    .unwrap();
+                                cp.join_schemas.lock().unwrap().push(schema);
+                                if mode == ACCEPT && older && schema > 2 {
+                                    let why =
+                                        "this gateway is newer than the control plane: upgrade llm-router first\n";
+                                    return answer(resp, 400, why.as_bytes().to_vec());
+                                }
                                 return match mode {
                                     ACCEPT => answer(
                                         resp,
@@ -1430,7 +1801,7 @@ mod tests {
                                         serde_json::to_vec(&serde_json::json!({
                                             "instance_id": "i1", "session": "s", "sync_interval_ms": 20,
                                             "expires_at_ms": now_ms() + 900_000,
-                                            "group": {"id": "g1", "name": "group"},
+                                            "group": {"id": "g1", "name": "group"}, "schema": schema.min(SCHEMA),
                                         }))
                                         .unwrap(),
                                     ),
@@ -1446,11 +1817,34 @@ mod tests {
                             match path.as_str() {
                                 "/gw/v1/config" => {
                                     cp.polls.lock().unwrap().push(tag.clone());
-                                    if tag.as_deref() == Some("\"v3\"") {
+                                    cp.digests.lock().unwrap().push(digest);
+                                    if older {
+                                        if tag.as_deref() == Some("\"v3\"") {
+                                            tokio::time::sleep(Duration::from_millis(20)).await;
+                                            return answer(resp, 304, Vec::new());
+                                        }
+                                        return answer(resp, 200, wire_config(3));
+                                    }
+                                    let body = {
+                                        let mut configs = cp.configs.lock().unwrap();
+                                        let current = configs.current.get_or_insert_with(|| config3(3)).clone();
+                                        let name = format!(
+                                            "\"{}-v{}\"",
+                                            current["epoch"].as_str().unwrap(),
+                                            current["version"]
+                                        );
+                                        match configs.next.pop_front() {
+                                            Some(next) => Some(next),
+                                            None if tag.as_deref() == Some(&name) => None,
+                                            None => Some(current),
+                                        }
+                                    };
+                                    let Some(body) = body else {
                                         tokio::time::sleep(Duration::from_millis(20)).await;
                                         return answer(resp, 304, Vec::new());
-                                    }
-                                    answer(resp, 200, wire_config(3))
+                                    };
+                                    let json = serde_json::to_vec(&body).unwrap();
+                                    answer(resp.header("content-encoding", "gzip"), 200, gzip(&json).unwrap())
                                 }
                                 "/gw/v1/sync" | "/gw/v1/replay" => {
                                     use std::io::Read;
@@ -1468,16 +1862,29 @@ mod tests {
                                         if failed {
                                             cp.fail.fetch_sub(1, Ordering::Relaxed);
                                         }
-                                        (
-                                            if expired {
-                                                401
-                                            } else if failed {
-                                                503
-                                            } else {
-                                                200
-                                            },
-                                            "{}".to_string(),
-                                        )
+                                        let status = if expired {
+                                            401
+                                        } else if failed {
+                                            503
+                                        } else {
+                                            200
+                                        };
+                                        // Each replica numbers its own cursors.
+                                        let replicas = cp.replicas.lock().unwrap();
+                                        let body = if status != 200 || replicas.is_empty() {
+                                            "{}".to_string()
+                                        } else {
+                                            let done = cp.calls.lock().unwrap();
+                                            let done =
+                                                done.iter().filter(|(p, code, _)| p.ends_with("sync") && *code == 200);
+                                            let n = done.count();
+                                            let replica = replicas[n % replicas.len()];
+                                            format!(
+                                                "{{\"replica\":\"{replica}\",\"cursor\":\"{replica}-{}\"}}",
+                                                n / replicas.len() + 1
+                                            )
+                                        };
+                                        (status, body)
                                     } else {
                                         match cp.replay_status.load(Ordering::Relaxed) {
                                             0 => (
@@ -1534,7 +1941,7 @@ mod tests {
         until("the config is polled twice", || mock.polls.lock().unwrap().len() >= 2).await;
         assert_eq!(
             mock.polls.lock().unwrap()[..2],
-            [None, Some("\"v3\"".to_string())],
+            [None, Some("\"e1-v3\"".to_string())],
             "the first poll is unconditional"
         );
         until("a 304 confirms the config", || st.ready.config_age().is_some_and(|a| a < Duration::from_secs(30))).await;
@@ -2010,6 +2417,7 @@ mod tests {
                 expires_at_ms: now_ms() + 900_000,
                 sync_interval_ms: 0,
                 group: None,
+                schema: 0,
             });
             assert_eq!(cp.generation.load(Ordering::Relaxed), generation + 1);
         };
@@ -2220,6 +2628,626 @@ mod tests {
         assert_eq!((usage::queued_content(), usage::sending_content()), (queued, 0), "back in the queue, content kept");
         assert!(cp.sync_once(&mut s).await);
         assert_eq!((usage::queued_content(), usage::sending_content()), (0, 0));
+    }
+
+    /// A config response as it arrives: gzipped JSON.
+    fn body(v: &serde_json::Value) -> Bytes {
+        gzip(&serde_json::to_vec(v).unwrap()).unwrap().into()
+    }
+
+    /// `receive` in a schema 3 session, a config expected.
+    fn received(held: Option<&Held>, v: &serde_json::Value, unconditional: bool) -> Loaded {
+        match receive(held.cloned(), true, body(v), 3, unconditional) {
+            Received::Config(loaded) => *loaded,
+            Received::Ignored(why) => panic!("ignored: {why}"),
+            Received::Discarded(why) => panic!("discarded: {why}"),
+            Received::Rejected(why) => panic!("rejected: {why}"),
+        }
+    }
+
+    fn key_ids(cfg: &Config) -> Vec<String> {
+        let mut ids: Vec<String> = cfg.keys.values().map(|k| k.id.clone()).collect();
+        ids.sort();
+        ids
+    }
+
+    fn header_names(held: &Held) -> Vec<(&'static str, String)> {
+        poll_headers(held, 3)
+    }
+
+    // A full config is held with its epoch, version and verified digest; a
+    // delta on exactly that config patches it, and the patched config is
+    // held as a full one: patched again, and read back as it would be from
+    // the state directory.
+    #[test]
+    fn a_delta_patches_the_config_held() {
+        let _globals = hold_globals();
+        let v3 = config3(3);
+        let Loaded { cfg, held } = received(None, &v3, true);
+        assert_eq!((cfg.version, key_ids(&cfg)), (3, vec!["cp-budgeted".to_string(), "cp-free".to_string()]));
+        assert_eq!((held.epoch.as_str(), held.version, held.group.as_str()), ("e1", 3, "g1"));
+        assert_eq!(held.digest.as_deref(), v3["digest"].as_str());
+        assert_eq!(
+            header_names(&held),
+            [("if-none-match", "\"e1-v3\"".to_string()), (DIGEST_HEADER, v3["digest"].as_str().unwrap().to_string())]
+        );
+
+        // version 5: one key gone, one changed, one new; a user, a team and an email appear
+        let mut v5 = v3.clone();
+        v5["version"] = 5.into();
+        v5["keys"] = serde_json::json!([
+            {"hash": "22".repeat(32), "id": "cp-free", "rpm_limit": 7, "h": "k2b"},
+            {"hash": "33".repeat(32), "id": "cp-new", "user_id": "u1", "team_id": "t1", "h": "k3"},
+        ]);
+        v5["users"] = serde_json::json!([{"id": "u1", "h": "u1a"}]);
+        v5["teams"] = serde_json::json!([{"id": "t1", "h": "t1a"}]);
+        v5["emails"] = serde_json::json!({"ee".repeat(32): "u1"});
+        let v5 = delta::tests::sealed(v5);
+        let changes = serde_json::json!({
+            "keys": {"upsert": v5["keys"], "remove": ["11".repeat(32)]},
+            "users": {"upsert": v5["users"]}, "teams": {"upsert": v5["teams"]},
+            "emails": {"upsert": v5["emails"]},
+        });
+        let Loaded { cfg, held } = received(Some(&held), &delta3(&v3, &v5, changes), false);
+        assert_eq!((cfg.version, key_ids(&cfg)), (5, vec!["cp-free".to_string(), "cp-new".to_string()]));
+        let new = &cfg.keys[&[0x33; 32]];
+        assert!(new.user.is_some() && new.team.is_some() && cfg.emails.contains_key(&[0xee; 32]));
+        assert!(cfg.keys[&[0x22; 32]].scope.is_some(), "the changed key has its limit");
+        assert_eq!((held.epoch.as_str(), held.version, held.digest.as_deref()), ("e1", 5, v5["digest"].as_str()));
+
+        // version 6, on the patched config: everything else replaced, the user, team and email removed
+        let mut v6 = v5.clone();
+        v6["version"] = 6.into();
+        v6["keys"] = serde_json::json!([{"hash": "22".repeat(32), "id": "cp-free", "rpm_limit": 7, "h": "k2b"}]);
+        (v6["users"], v6["teams"], v6["emails"]) =
+            (serde_json::json!([]), serde_json::json!([]), serde_json::json!({}));
+        v6["rest_hash"] = "r2".into();
+        v6["group"] = serde_json::json!({"id": "g1", "name": "renamed"});
+        v6["providers"] =
+            serde_json::json!([{"id": "p1", "name": "p", "type": "openai_compatible", "base_url": "http://p"}]);
+        v6["deployments"] =
+            serde_json::json!([{"id": "delta-d1", "provider_id": "p1", "model_name": "m1", "upstream_name": "up"}]);
+        let v6 = delta::tests::sealed(v6);
+        let changes = serde_json::json!({
+            "keys": {"remove": ["33".repeat(32)]},
+            "users": {"remove": ["u1"]}, "teams": {"remove": ["t1"]}, "emails": {"remove": ["ee".repeat(32)]},
+            "rest": {"group": v6["group"], "providers": v6["providers"], "deployments": v6["deployments"], "rest_hash": "r2"},
+        });
+        let Loaded { cfg, held } = received(Some(&held), &delta3(&v5, &v6, changes), false);
+        assert_eq!((cfg.version, key_ids(&cfg)), (6, vec!["cp-free".to_string()]));
+        assert!(cfg.emails.is_empty() && cfg.teams.is_empty());
+        assert_eq!((cfg.group.name.as_str(), cfg.names.as_slice()), ("renamed", &["m1".to_string()][..]));
+        assert_eq!(held.digest.as_deref(), v6["digest"].as_str());
+
+        // what is held is a full config: saved and loaded, it is the same one
+        let Loaded { cfg, held: reloaded } = load(held.gzip, held.body.clone()).unwrap();
+        assert_eq!((cfg.version, key_ids(&cfg), cfg.names.len()), (6, vec!["cp-free".to_string()], 1));
+        assert_eq!(
+            (reloaded.epoch, reloaded.version, reloaded.digest, reloaded.group),
+            (held.epoch.clone(), 6, held.digest.clone(), "g1".to_string())
+        );
+        let kept: serde_json::Value = serde_json::from_slice(&gunzip(true, &held.body).unwrap()).unwrap();
+        assert_eq!(kept["keys"][0]["h"], "k2b", "entry hashes stay with their entries");
+        assert_eq!(
+            (&kept["digest"], &kept["rest_hash"], &kept["epoch"]),
+            (&v6["digest"], &v6["rest_hash"], &v6["epoch"])
+        );
+    }
+
+    // A delta is applied only onto exactly the config it was built on, and
+    // only when the result has the digest it names; anything else is
+    // discarded for the full config, and the config in use stays.
+    #[test]
+    fn a_delta_that_does_not_fit_is_discarded() {
+        let _globals = hold_globals();
+        let v3 = config3(3);
+        let Loaded { held, .. } = received(None, &v3, true);
+        let mut v4 = v3.clone();
+        v4["version"] = 4.into();
+        v4["keys"].as_array_mut().unwrap().pop();
+        let v4 = delta::tests::sealed(v4);
+        let good = delta3(&v3, &v4, serde_json::json!({"keys": {"remove": ["22".repeat(32)]}}));
+        let discarded =
+            |held: Option<&Held>, d: &serde_json::Value| match receive(held.cloned(), true, body(d), 3, false) {
+                Received::Discarded(why) => why,
+                _ => panic!("not discarded: {d}"),
+            };
+        // the result is not what the control plane says it should be
+        let mut wrong = good.clone();
+        wrong["keys"] = serde_json::json!({"remove": []});
+        assert!(discarded(Some(&held), &wrong).contains("digest"));
+        let mut wrong = good.clone();
+        wrong["digest"] = "00".repeat(32).into();
+        assert!(discarded(Some(&held), &wrong).contains("digest"));
+        // built on another version, another digest, another epoch
+        for (field, value) in [("base_version", serde_json::json!(2)), ("base_digest", "ab".repeat(32).into())] {
+            let mut wrong = good.clone();
+            wrong[field] = value;
+            assert!(discarded(Some(&held), &wrong).contains("built on"), "{field}");
+        }
+        let mut wrong = good.clone();
+        wrong["epoch"] = "e2".into();
+        assert!(discarded(Some(&held), &wrong).contains("epoch"));
+        // unreadable, and with nothing, or nothing verified, to apply it to
+        assert!(discarded(Some(&held), &serde_json::json!({"delta": true, "keys": 7})).contains("unreadable"));
+        assert!(discarded(None, &good).contains("no config"));
+        let unverified = Held { digest: None, ..held.clone() };
+        assert!(discarded(Some(&unverified), &good).contains("no verified digest"));
+        // and the same delta, untouched, applies
+        assert_eq!(received(Some(&held), &good, false).cfg.version, 4);
+        // before schema 3 there are no deltas: one is not a config
+        assert!(matches!(receive(Some(held), true, body(&good), 2, false), Received::Rejected(_)));
+    }
+
+    // Versions count within an epoch. Another epoch's config is taken
+    // whatever its number; the same epoch's only when newer, or when the
+    // gateway asked for whatever the control plane has.
+    #[test]
+    fn a_config_is_taken_by_epoch_then_version() {
+        let _globals = hold_globals();
+        let Loaded { held, .. } = received(None, &config3(7), true);
+        let ignored = |v: &serde_json::Value, unconditional| {
+            matches!(receive(Some(held.clone()), true, body(v), 3, unconditional), Received::Ignored(_))
+        };
+        assert!(ignored(&config3(6), false), "older, the same epoch");
+        assert!(ignored(&config3(6), true), "older, even when asked for by no name");
+        assert!(ignored(&config3(7), false), "the same version");
+        assert_eq!(received(Some(&held), &config3(7), true).cfg.version, 7, "the same version, asked for by no name");
+        assert_eq!(received(Some(&held), &config3(8), false).cfg.version, 8);
+
+        // a control plane that started over: a new epoch, a lower version
+        let mut restored = config3(2);
+        restored["epoch"] = "e2".into();
+        let Loaded { cfg, held: now } = received(Some(&held), &restored, false);
+        assert_eq!((cfg.version, now.epoch.as_str(), now.version), (2, "e2", 2));
+        assert_eq!(header_names(&now)[0].1, "\"e2-v2\"");
+
+        // schema 2 sessions take what they are sent, as before
+        assert!(matches!(receive(Some(held.clone()), false, wire_config(3).into(), 2, false), Received::Config(_)));
+        assert_eq!(poll_headers(&held, 2), [("if-none-match", "\"v7\"".to_string())]);
+    }
+
+    // A full config whose digest does not match its entries is used: the
+    // control plane decides what the config is. But it is named without a
+    // digest, so no delta is built on it, until a config verifies.
+    #[test]
+    fn a_full_config_with_a_wrong_digest_is_used_without_deltas() {
+        let _globals = hold_globals();
+        let mut wrong = config3(3);
+        wrong["digest"] = "00".repeat(32).into();
+        let Loaded { cfg, held } = received(None, &wrong, true);
+        assert_eq!(cfg.version, 3);
+        assert_eq!(held.digest, None);
+        assert_eq!(header_names(&held), [("if-none-match", "\"e1-v3\"".to_string())]);
+        // none at all: a schema 2 config
+        let Loaded { held, .. } = load(false, wire_config(3).into()).unwrap();
+        assert_eq!((held.digest.as_deref(), held.epoch.as_str()), (None, ""));
+        // the next that verifies is named in full again
+        let Loaded { held, .. } = received(Some(&held), &config3(4), false);
+        assert_eq!(header_names(&held).len(), 2);
+        // an epoch that cannot be a header value names nothing
+        assert!(poll_headers(&Held { epoch: "a\"b".into(), ..held.clone() }, 3).is_empty());
+        assert!(poll_headers(&Held { epoch: "a\nb".into(), ..held }, 3).is_empty());
+    }
+
+    // A rotated key is two entries with one id while the old secret still
+    // works: both authenticate as the key and count against its one limit,
+    // and a delta that removes the old hash leaves the new one.
+    #[test]
+    fn a_rotated_keys_old_and_new_secret_are_one_key() {
+        let _globals = hold_globals();
+        let mut v3 = config3(3);
+        v3["keys"] = serde_json::json!([
+            {"hash": "aa".repeat(32), "id": "cp-rotated", "rpm_limit": 2, "h": "old"},
+            {"hash": "bb".repeat(32), "id": "cp-rotated", "rpm_limit": 2, "h": "new"},
+            {"hash": "22".repeat(32), "id": "cp-free", "h": "k2"},
+        ]);
+        let v3 = delta::tests::sealed(v3);
+        let Loaded { cfg, held } = received(None, &v3, true);
+        assert_eq!(cfg.keys.len(), 3);
+        let (old, new) = (&cfg.keys[&[0xaa; 32]], &cfg.keys[&[0xbb; 32]]);
+        assert_eq!((old.id.as_str(), new.id.as_str()), ("cp-rotated", "cp-rotated"));
+        assert!(Arc::ptr_eq(old.scope.as_ref().unwrap(), new.scope.as_ref().unwrap()), "one limit for both");
+        assert!(limits::check(old).is_ok() && limits::check(new).is_ok());
+        assert_eq!(limits::check(old).unwrap_err().code, "rate_limit_exceeded");
+        assert_eq!(limits::check(new).unwrap_err().code, "rate_limit_exceeded");
+
+        let mut v4 = v3.clone();
+        v4["version"] = 4.into();
+        v4["keys"].as_array_mut().unwrap().remove(0);
+        let v4 = delta::tests::sealed(v4);
+        let gone = delta3(&v3, &v4, serde_json::json!({"keys": {"remove": ["aa".repeat(32)]}}));
+        let Loaded { cfg, held } = received(Some(&held), &gone, false);
+        assert!(!cfg.keys.contains_key(&[0xaa; 32]), "the old secret no longer works");
+        assert_eq!(cfg.keys[&[0xbb; 32]].id, "cp-rotated");
+        assert_eq!(cfg.keys.len(), 2);
+        assert_eq!(held.digest.as_deref(), v4["digest"].as_str());
+        drop(limits::freeze());
+    }
+
+    /// A gateway running against `url`, keeping its state in `dir`.
+    fn running(url: &str, dir: Option<&TempDir>) -> (&'static State, tokio::task::JoinHandle<()>, Option<Arc<Store>>) {
+        let store = dir.map(|dir| Arc::new(Store::open(&dir.0, "llmrg_test").unwrap()));
+        let cp = ControlPlane::new(url, "llmrg_test".into(), "test".into()).with_state(store.clone());
+        let st = new_state();
+        (st, tokio::spawn(Arc::new(cp).start(st)), store)
+    }
+
+    fn version_of(st: &State) -> i64 {
+        st.config.load().as_ref().map_or(0, |c| c.version)
+    }
+
+    // Over the wire: the gateway names the config it holds and its digest;
+    // a delta whose result has another digest is discarded and the full
+    // config fetched by a poll that names nothing; the next delta applies.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
+    async fn a_digest_mismatch_fetches_the_full_config() {
+        let _globals = hold_globals();
+        let (url, mock) = gateway_cp().await;
+        let (st, running, _) = running(&url, None);
+        until("it has version 3", || version_of(st) == 3).await;
+        until("it polls by name", || mock.polls.lock().unwrap().len() >= 2).await;
+
+        let v3 = config3(3);
+        let without = |v: &serde_json::Value, version: i64, hash: &str| {
+            let mut next = v.clone();
+            next["version"] = version.into();
+            next["keys"].as_array_mut().unwrap().retain(|k| k["hash"] != hash.repeat(32));
+            delta::tests::sealed(next)
+        };
+        let v4 = without(&v3, 4, "22");
+        // a delta that leaves the key in: the result is not version 4's
+        let mut bad = delta3(&v3, &v4, serde_json::json!({"keys": {"remove": []}}));
+        bad["digest"] = v4["digest"].clone();
+        let polls = mock.polls.lock().unwrap().len();
+        mock.serve(vec![bad], v4.clone());
+        until("it has version 4", || version_of(st) == 4).await;
+        assert_eq!(key_ids(&st.config.load_full().unwrap()), ["cp-budgeted"]);
+        {
+            let (tags, digests) = (mock.polls.lock().unwrap(), mock.digests.lock().unwrap());
+            let v3_name = (Some("\"e1-v3\"".to_string()), v3["digest"].as_str().map(str::to_string));
+            assert_eq!((tags[0].clone(), digests[0].clone()), (None, None), "nothing held, nothing named");
+            for i in 1..=polls {
+                assert_eq!((tags[i].clone(), digests[i].clone()), v3_name, "poll {i}");
+            }
+            // the poll after the one the bad delta answered
+            assert_eq!(
+                (tags[polls + 1].clone(), digests[polls + 1].clone()),
+                (None, None),
+                "the full config, by no name"
+            );
+        }
+
+        // and a good delta from there
+        let v5 = without(&v4, 5, "11");
+        mock.serve(vec![delta3(&v4, &v5, serde_json::json!({"keys": {"remove": ["11".repeat(32)]}}))], v5.clone());
+        until("it has version 5", || version_of(st) == 5).await;
+        assert!(st.config.load_full().unwrap().keys.is_empty());
+        let asked = mock.polls.lock().unwrap().len();
+        until("it polls again", || mock.polls.lock().unwrap().len() > asked).await;
+        assert_eq!(mock.polls.lock().unwrap().last().unwrap().as_deref(), Some("\"e1-v5\""));
+        assert_eq!(mock.digests.lock().unwrap().last().unwrap().as_deref(), v5["digest"].as_str());
+        assert_eq!(mock.polls.lock().unwrap().iter().filter(|tag| tag.is_none()).count(), 2);
+
+        running.abort();
+        let _ = running.await;
+    }
+
+    // What a delta made of the config is what the state directory holds: a
+    // restart serves it, and names it to the control plane, digest and all,
+    // which then has nothing to send.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
+    async fn a_patched_config_survives_a_restart() {
+        let _globals = hold_globals();
+        let (url, mock) = gateway_cp().await;
+        let dir = TempDir::new("delta-state");
+        let (st, first, store) = running(&url, Some(&dir));
+        until("it has version 3", || version_of(st) == 3).await;
+        let v3 = config3(3);
+        let mut v4 = v3.clone();
+        v4["version"] = 4.into();
+        v4["keys"][1] = serde_json::json!({"hash": "44".repeat(32), "id": "cp-added", "budget_usd": 2.0, "h": "k4"});
+        let v4 = delta::tests::sealed(v4);
+        let changes = serde_json::json!({"keys": {"upsert": [v4["keys"][1]], "remove": ["22".repeat(32)]}});
+        mock.serve(vec![delta3(&v3, &v4, changes)], v4.clone());
+        until("it has version 4", || version_of(st) == 4).await;
+        // the save loop writes at most every SAVE_INTERVAL: write now
+        let store = store.unwrap();
+        store.flush(|| Some(Default::default()));
+        first.abort();
+        let _ = first.await;
+        drop(store);
+
+        // the state directory is free once the first gateway's tasks are gone
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let store = loop {
+            match Store::open(&dir.0, "llmrg_test") {
+                Ok(store) => break Arc::new(store),
+                Err(e) => assert!(Instant::now() < deadline, "{e}"),
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let polls = mock.polls.lock().unwrap().len();
+        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into()).with_state(Some(store));
+        let st = new_state();
+        cp.restore(st).await;
+        assert!(st.is_ready(), "served from the state directory");
+        assert_eq!(key_ids(&st.config.load_full().unwrap()), ["cp-added", "cp-budgeted"]);
+        {
+            let held = cp.held.lock().unwrap().clone().unwrap();
+            assert_eq!((held.epoch.as_str(), held.version, held.digest.as_deref()), ("e1", 4, v4["digest"].as_str()));
+        }
+        let second = tokio::spawn(Arc::new(cp).start(st));
+        until("it polls", || mock.polls.lock().unwrap().len() > polls + 1).await;
+        assert_eq!(mock.polls.lock().unwrap()[polls].as_deref(), Some("\"e1-v4\""), "named, not fetched anew");
+        assert_eq!(mock.digests.lock().unwrap()[polls].as_deref(), v4["digest"].as_str());
+        assert_eq!(version_of(st), 4);
+        second.abort();
+        let _ = second.await;
+    }
+
+    // A control plane that only knows schema 2 answers the join with a 400
+    // that says to upgrade it: the gateway joins with schema 2 and runs as
+    // it did before schema 3, until a join finds the control plane upgraded.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
+    async fn an_older_control_plane_is_joined_with_its_schema() {
+        let _globals = hold_globals();
+        drop(usage::take(usize::MAX, usize::MAX));
+        let (url, mock) = gateway_cp().await;
+        mock.older.store(true, Ordering::Relaxed);
+        let (st, running, _) = running(&url, None);
+        until("it serves", || st.is_ready()).await;
+        until("it polls by name", || mock.polls.lock().unwrap().len() >= 2).await;
+        assert_eq!(*mock.join_schemas.lock().unwrap(), [3, 2]);
+        assert_eq!(mock.polls.lock().unwrap()[..2], [None, Some("\"v3\"".to_string())]);
+        assert!(mock.digests.lock().unwrap().iter().all(|d| d.is_none()), "no digest before schema 3");
+        assert_eq!(key_ids(&st.config.load_full().unwrap()), ["cp-budgeted", "cp-free"]);
+        request("older-1");
+        until("it syncs", || mock.models("sync", 200).iter().any(|m| m == &["older-1"])).await;
+        for (_, sync) in mock.syncs() {
+            let sent = sync.as_object().unwrap();
+            assert!(["config_version", "config_epoch", "cursors"].iter().all(|f| !sent.contains_key(*f)), "{sync}");
+            assert_eq!(sync["cursor"], "");
+        }
+
+        // upgraded: the next join is on schema 3, and so is everything after it
+        mock.older.store(false, Ordering::Relaxed);
+        mock.expire.store(1, Ordering::Relaxed);
+        until("it joins again", || mock.join_schemas.lock().unwrap().len() >= 3).await;
+        assert_eq!(*mock.join_schemas.lock().unwrap(), [3, 2, 3]);
+        // the schema 2 config names no epoch: it is not version 3 of "e1", which is fetched in full
+        until("it has the schema 3 config", || {
+            mock.polls.lock().unwrap().last().is_some_and(|tag| tag.as_deref() == Some("\"e1-v3\""))
+        })
+        .await;
+        until("it names the digest", || mock.digests.lock().unwrap().last().unwrap().is_some()).await;
+        request("newer-1");
+        until("it syncs", || mock.models("sync", 200).iter().any(|m| m.contains(&"newer-1".to_string()))).await;
+        let (_, last) = mock.syncs().pop().unwrap();
+        assert_eq!((&last["config_version"], &last["config_epoch"]), (&serde_json::json!(3), &serde_json::json!("e1")));
+        assert!(last["cursors"].is_object());
+        running.abort();
+        let _ = running.await;
+    }
+
+    // Each control-plane replica numbers its limits cursors itself: the
+    // gateway keeps the last one of each and sends them all, with the one
+    // used last in the field a single control plane reads.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
+    async fn each_replica_gets_its_own_cursor_back() {
+        let _globals = hold_globals();
+        drop(usage::take(usize::MAX, usize::MAX));
+        let (url, mock) = gateway_cp().await;
+        *mock.replicas.lock().unwrap() = vec!["a", "b"];
+        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into());
+        cp.join().await.unwrap();
+        let mut s = cp.syncer.lock().await;
+        for _ in 0..5 {
+            assert!(cp.sync_once(&mut s).await);
+        }
+        let sent: Vec<(serde_json::Value, serde_json::Value)> =
+            mock.syncs().into_iter().map(|(_, v)| (v["cursor"].clone(), v["cursors"].clone())).collect();
+        let j = |v: serde_json::Value| v;
+        assert_eq!(
+            sent,
+            [
+                (j("".into()), serde_json::json!({})),
+                (j("a-1".into()), serde_json::json!({"a": "a-1"})),
+                (j("b-1".into()), serde_json::json!({"a": "a-1", "b": "b-1"})),
+                (j("a-2".into()), serde_json::json!({"a": "a-2", "b": "b-1"})),
+                (j("b-2".into()), serde_json::json!({"a": "a-2", "b": "b-2"})),
+            ]
+        );
+        // no config yet: version 0 of no epoch
+        let (_, first) = &mock.syncs()[0];
+        assert_eq!((&first["config_version"], &first["config_epoch"]), (&serde_json::json!(0), &serde_json::json!("")));
+
+        // a failed sync is resent with the cursors it was frozen with, and moves none
+        mock.fail.store(1, Ordering::Relaxed);
+        assert!(!cp.sync_once(&mut s).await);
+        assert_eq!(s.cursor(), "a-3");
+        assert!(cp.sync_once(&mut s).await);
+        let syncs = mock.syncs();
+        assert_eq!(syncs[5].1, syncs[6].1);
+        assert_eq!(s.cursor(), "b-3");
+
+        // the eight used last are kept
+        let mut s = Syncer::default();
+        for i in 0..12 {
+            s.answered(format!("r{i}"), format!("c{i}"));
+        }
+        s.answered("r7".into(), "c7b".into());
+        assert_eq!(s.cursors.len(), MAX_CURSORS);
+        assert_eq!(s.cursor(), "c7b");
+        let replicas: Vec<&str> = s.cursors.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(replicas, ["r7", "r11", "r10", "r9", "r8", "r6", "r5", "r4"]);
+        // a control plane that names no replica has one cursor, as before
+        let mut s = Syncer::default();
+        s.answered(String::new(), "c1".into());
+        s.answered(String::new(), "c2".into());
+        assert_eq!((s.cursor(), s.cursors.len()), ("c2", 1));
+    }
+
+    // A 503 from sync (a control plane whose snapshot is behind this
+    // gateway's config says so, with Retry-After) is a failure to retry:
+    // the batch keeps its number and its events, and goes out again as it was.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // one test at a time: see hold_globals
+    async fn a_503_from_sync_keeps_the_batch() {
+        let _globals = hold_globals();
+        drop(usage::take(usize::MAX, usize::MAX));
+        let dir = TempDir::new("sync-503");
+        let (url, mock) = gateway_cp().await;
+        let cp = ControlPlane::new(&url, "llmrg_test".into(), "test".into()).with_spool(Some(spool_in(&dir, u64::MAX)));
+        cp.join().await.unwrap();
+        let mut s = cp.syncer.lock().await;
+        request("kept-1");
+        request("kept-2");
+        mock.fail.store(3, Ordering::Relaxed);
+        for _ in 0..3 {
+            assert!(!cp.sync_once(&mut s).await, "503");
+            request("later"); // what arrives meanwhile waits for the next batch
+            assert_eq!(s.batch, 1, "the batch number does not move");
+            assert_eq!(s.pending.as_ref().unwrap().frozen.events.len(), 2);
+            assert!(!spool_files(&dir).is_empty(), "its events stay on disk");
+        }
+        assert!(mock.models("replay", 200).is_empty(), "a 503 is no reason to replay");
+        assert!(cp.sync_once(&mut s).await);
+        let syncs = mock.syncs();
+        assert_eq!(syncs.iter().map(|(code, _)| *code).collect::<Vec<_>>(), [503, 503, 503, 200]);
+        assert!(syncs.iter().all(|(_, v)| *v == syncs[0].1), "the same batch each time");
+        assert_eq!(syncs[3].1["batch"], 1);
+        assert_eq!(mock.models("sync", 200), [["kept-1", "kept-2"]]);
+        assert!(cp.sync_once(&mut s).await);
+        assert_eq!(mock.syncs()[4].1["batch"], 2);
+        assert_eq!(mock.models("sync", 200)[1], ["later", "later", "later"]);
+        assert!(spool_files(&dir).is_empty());
+    }
+
+    /// This process's resident memory in MiB, as `ps` reports it.
+    fn rss_mib() -> f64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().unwrap() / 1024.0
+    }
+
+    /// A full schema 3 config of 100,000 keys, 20,000 users and 200 teams as
+    /// the control plane sends it, gzipped, with its digest and its first
+    /// key's entry; `first_h` is that key's entry hash.
+    fn large_config(version: i64, first_h: &str) -> (Bytes, String, String) {
+        let hex = |seed: u64, n: usize| -> String {
+            let mut rng = fastrand::Rng::with_seed(seed);
+            (0..n).map(|_| char::from_digit(rng.u32(..16), 16).unwrap()).collect()
+        };
+        let id = |kind: u64, i: u64| {
+            let h = hex(kind << 32 | i, 32);
+            format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+        };
+        let mut digest = delta::Digest::default();
+        let mut first = String::new();
+        let mut json = String::with_capacity(64 << 20);
+        json.push_str(&format!(
+            r#"{{"schema":3,"version":{version},"epoch":"e1","rest_hash":"r1","group":{{"id":"g1","name":"group"}},"keys":["#
+        ));
+        for i in 0..100_000u64 {
+            let hash = hex(1 << 40 | i, 64);
+            let h = if i == 0 { first_h.to_string() } else { hex(2 << 40 | i, 64) };
+            digest.add("keys", &hash, &h);
+            let entry = format!(
+                r#"{{"hash":"{hash}","id":"{}","user_id":"{}","team_id":"{}","allowed_models":null,"budget_usd":50,"rpm_limit":600,"expires_at":0,"tags":["team-a"],"h":"{h}"}}"#,
+                id(1, i),
+                id(2, i % 20_000),
+                id(3, i % 200),
+            );
+            if i == 0 {
+                first = entry.clone();
+            } else {
+                json.push(',');
+            }
+            json.push_str(&entry);
+        }
+        json.push_str(r#"],"users":["#);
+        for i in 0..20_000u64 {
+            let h = hex(3 << 40 | i, 64);
+            digest.add("users", &id(2, i), &h);
+            json.push_str(&format!(
+                r#"{}{{"id":"{}","allowed_models":null,"team_models":["gpt-4o","claude-*"],"memberships":{{"{}":100}},"budget_usd":200,"team_ids":["{}"],"tags":[],"h":"{h}"}}"#,
+                if i > 0 { "," } else { "" },
+                id(2, i),
+                id(3, i % 200),
+                id(3, i % 200),
+            ));
+        }
+        json.push_str(r#"],"teams":["#);
+        for i in 0..200u64 {
+            let h = hex(4 << 40 | i, 64);
+            digest.add("teams", &id(3, i), &h);
+            json.push_str(&format!(
+                r#"{}{{"id":"{}","allowed_models":["gpt-4o","claude-*"],"budget_usd":10000,"h":"{h}"}}"#,
+                if i > 0 { "," } else { "" },
+                id(3, i),
+            ));
+        }
+        digest.add("rest", "", "r1");
+        json.push_str(&format!(r#"],"digest":"{}"}}"#, digest.hex()));
+        println!("the config is {} MiB of JSON", json.len() >> 20);
+        (gzip(json.as_bytes()).unwrap().into(), digest.hex(), first)
+    }
+
+    // What holding the config for deltas costs in memory and time, with
+    // 100,000 keys. Run it alone, the way the gateway runs (one config, one
+    // process):
+    //   cargo test --release --lib -- --ignored --nocapture --test-threads 1 memory_of_a_large_config
+    #[test]
+    #[ignore = "a measurement, not a check: prints resident memory"]
+    fn memory_of_a_large_config() {
+        let _globals = hold_globals();
+        // the delta first: making it is not what is measured
+        let (old_h, new_h) = ("cd".repeat(32), "ab".repeat(32));
+        let (_, v4, changed) = large_config(4, &new_h);
+        let (body, v3, _) = large_config(3, &old_h);
+        let d = format!(
+            r#"{{"schema":3,"delta":true,"epoch":"e1","base_version":3,"base_digest":"{v3}","version":4,"digest":"{v4}","keys":{{"upsert":[{changed}]}}}}"#
+        );
+        let d: Bytes = gzip(d.as_bytes()).unwrap().into();
+        let start = rss_mib();
+        println!("before: {start:.0} MiB, the response body ({:.1} MiB gzipped) in it", body.len() as f64 / 1048576.0);
+
+        let took = Instant::now();
+        let Loaded { cfg, held } = match receive(None, true, body, 3, true) {
+            Received::Config(loaded) => *loaded,
+            _ => panic!("the config was not taken"),
+        };
+        let took = took.elapsed();
+        assert_eq!((cfg.keys.len(), held.digest.as_deref()), (100_000, Some(v3.as_str())));
+        let cfg = Arc::new(cfg);
+        let serving = rss_mib();
+        println!(
+            "serving the full config, read in {took:?}: {serving:.0} MiB, {:.1} MiB of it the config held for deltas",
+            held.body.len() as f64 / 1048576.0
+        );
+
+        let took = Instant::now();
+        let Loaded { cfg: next, held } = match receive(Some(held), true, d, 3, false) {
+            Received::Config(loaded) => *loaded,
+            Received::Discarded(why) => panic!("{why}"),
+            _ => panic!("the delta was not taken"),
+        };
+        let took = took.elapsed();
+        let both = rss_mib();
+        drop(cfg); // the hot path swaps to the new one
+        assert_eq!((next.version, next.keys.len(), held.digest.as_deref()), (4, 100_000, Some(v4.as_str())));
+        println!(
+            "after a delta, applied in {took:?}: {both:.0} MiB with both configs, {:.0} MiB with the new one alone ({:.1} MiB held)",
+            rss_mib(),
+            held.body.len() as f64 / 1048576.0
+        );
     }
 
     #[test]

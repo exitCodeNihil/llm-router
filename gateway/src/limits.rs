@@ -8,6 +8,10 @@
 //! one-minute window over those decides; budgets add local spend on top of the
 //! control plane's. Two gateways can each admit what one sync interval allows
 //! before they hear about each other.
+//!
+//! A request's cost is only known when it ends, so a budget also counts what
+//! the requests in progress are expected to cost: each holds a reservation
+//! from admission until its cost is recorded or it ends any other way.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -40,6 +44,10 @@ struct Inner {
     inflight: Vec<Delta>,
     spend_pending: f64,
     spend_inflight: f64,
+    /// What the requests in progress are expected to cost, and how many of
+    /// them hold a part of it.
+    reserved: f64,
+    holders: u32,
     dirty: bool,
 }
 
@@ -59,6 +67,13 @@ impl Inner {
             }
         }
         prev as f64 * (1.0 - frac) + cur as f64
+    }
+
+    /// Give back one request's reservation of `usd`.
+    fn release(&mut self, usd: f64) {
+        self.holders = self.holders.saturating_sub(1);
+        // no holder, nothing held: sums of floats leave residue otherwise
+        self.reserved = if self.holders == 0 { 0.0 } else { (self.reserved - usd).max(0.0) };
     }
 
     fn add(&mut self, minute: i64, requests: i64, tokens: i64) {
@@ -158,34 +173,130 @@ pub struct Denial {
     pub retry_after_s: Option<u64>,
 }
 
+/// What all requests in progress hold of their budgets, in billionths of a
+/// dollar: each request counted once, however many scopes it holds it on.
+static RESERVED_NANOS: AtomicI64 = AtomicI64::new(0);
+
+/// The expected cost of the requests in progress that hold a reservation.
+pub fn reserved_usd() -> f64 {
+    RESERVED_NANOS.load(Ordering::Relaxed) as f64 / 1e9
+}
+
+/// A request's expected cost, held against every budget it counts towards
+/// from admission until its real cost is recorded (`settle`) or, dropped, it
+/// ends any other way: an error, a timeout, a client that went away.
+#[derive(Default)]
+pub struct Reservation {
+    scopes: Vec<Arc<Scope>>,
+    usd: f64,
+    nanos: i64,
+}
+
+impl std::fmt::Debug for Reservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Reservation(${} on {} scopes)", self.usd(), self.scopes.len())
+    }
+}
+
+impl Reservation {
+    /// What it holds on each of its scopes; 0 when it holds nothing.
+    pub fn usd(&self) -> f64 {
+        if self.scopes.is_empty() { 0.0 } else { self.usd }
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        for s in self.scopes.drain(..) {
+            s.inner.lock().unwrap().release(self.usd);
+        }
+        if self.nanos != 0 {
+            RESERVED_NANOS.fetch_sub(self.nanos, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Whether any scope of `key` has a budget.
+pub fn budgeted(key: &Key) -> bool {
+    key.scopes().any(|s| s.inner.lock().unwrap().budget.is_some())
+}
+
 /// Check every scope of `key`, then take one request from each rate limit.
-/// Nothing is taken when any scope refuses.
+/// Nothing is taken when any scope refuses. For requests that cost nothing.
 pub fn check(key: &Key) -> Result<(), Denial> {
+    admit(key, 0.0)?;
+    take_rates(key)
+}
+
+/// Check every budget of `key` and hold `expected_usd` against each until the
+/// returned reservation is settled or dropped. A budget refuses once it is
+/// spent, and while what it has left is held by other requests in progress:
+/// a request is admitted while spend plus the others' reservations are under
+/// the budget, so a scope nobody else holds admits on its spend alone and
+/// one request can always run. Requests expected to cost nothing hold
+/// nothing and are not held up by the others. Nothing stays held when any
+/// scope refuses.
+pub fn admit(key: &Key, expected_usd: f64) -> Result<Reservation, Denial> {
+    let expected = if expected_usd.is_finite() && expected_usd > 0.0 { expected_usd } else { 0.0 };
+    // Dropped on a refusal, it gives back what the scopes before had taken.
+    let mut held = Reservation { scopes: Vec::new(), usd: expected, nanos: 0 };
+    if key.scopes().next().is_none() {
+        return Ok(held);
+    }
+    let unknown = SPEND_REQUIRED.load(Ordering::Relaxed) && !SPEND_KNOWN.load(Ordering::Relaxed);
+    for s in key.scopes() {
+        let mut i = s.inner.lock().unwrap();
+        let Some(budget) = i.budget else { continue };
+        if unknown {
+            return Err(Denial {
+                code: "budget_unknown",
+                message: format!("spend for {} is not known yet: waiting for the control plane", s.name),
+                retry_after_s: Some(5),
+            });
+        }
+        let spent = i.g_spend + i.spend_pending + i.spend_inflight;
+        if spent >= budget {
+            return Err(Denial {
+                code: "budget_exceeded",
+                message: format!("budget of ${budget} exhausted for {} (spent ${spent})", s.name),
+                retry_after_s: None,
+            });
+        }
+        if expected == 0.0 {
+            continue;
+        }
+        if i.holders > 0 && spent + i.reserved >= budget {
+            return Err(Denial {
+                code: "budget_reserved",
+                message: format!(
+                    "the rest of the budget of ${budget} for {} is held by requests in progress (spent ${spent}); retry shortly",
+                    s.name
+                ),
+                retry_after_s: Some(1),
+            });
+        }
+        i.reserved += expected;
+        i.holders += 1;
+        drop(i);
+        held.scopes.push(s.clone());
+    }
+    if !held.scopes.is_empty() {
+        held.nanos = (expected * 1e9).round() as i64;
+        RESERVED_NANOS.fetch_add(held.nanos, Ordering::Relaxed);
+    }
+    Ok(held)
+}
+
+/// Check every rate limit of `key`, then take one request from each. Nothing
+/// is taken when any scope refuses.
+pub fn take_rates(key: &Key) -> Result<(), Denial> {
     if key.scopes().next().is_none() {
         return Ok(());
     }
     let (minute, frac) = clock();
     let retry = Some((60.0 * (1.0 - frac)).ceil() as u64);
-    let unknown = SPEND_REQUIRED.load(Ordering::Relaxed) && !SPEND_KNOWN.load(Ordering::Relaxed);
     for s in key.scopes() {
         let i = s.inner.lock().unwrap();
-        if let Some(budget) = i.budget {
-            if unknown {
-                return Err(Denial {
-                    code: "budget_unknown",
-                    message: format!("spend for {} is not known yet: waiting for the control plane", s.name),
-                    retry_after_s: Some(5),
-                });
-            }
-            let spent = i.g_spend + i.spend_pending + i.spend_inflight;
-            if spent >= budget {
-                return Err(Denial {
-                    code: "budget_exceeded",
-                    message: format!("budget of ${budget} exhausted for {} (spent ${spent})", s.name),
-                    retry_after_s: None,
-                });
-            }
-        }
         if let Some(tpm) = i.tpm
             && i.estimate(minute, frac, i.g_tpm, |d| d.tokens) >= tpm as f64
         {
@@ -219,12 +330,20 @@ pub fn check(key: &Key) -> Result<(), Denial> {
 /// after the request's usage event is queued, so the control plane never
 /// acknowledges spend before it has the event.
 pub fn record(key: &Key, tokens: i64, cost_usd: f64) {
-    if tokens <= 0 && cost_usd <= 0.0 {
-        return;
-    }
+    settle(key, tokens, cost_usd, Reservation::default());
+}
+
+/// As `record`, for a request that held a reservation: each scope gives the
+/// reservation back under the same lock that counts the cost, so a budget
+/// never counts both, or neither.
+pub fn settle(key: &Key, tokens: i64, cost_usd: f64, mut held: Reservation) {
     let (minute, _) = clock();
     for s in key.scopes() {
         let mut i = s.inner.lock().unwrap();
+        if let Some(at) = held.scopes.iter().position(|h| Arc::ptr_eq(h, s)) {
+            held.scopes.swap_remove(at);
+            i.release(held.usd);
+        }
         let mut changed = false;
         if tokens > 0 && i.tpm.is_some() {
             i.add(minute, 0, tokens);
@@ -238,6 +357,7 @@ pub fn record(key: &Key, tokens: i64, cost_usd: f64) {
             s.mark_dirty(&mut i);
         }
     }
+    // dropped here, `held` gives back what is on a scope the key no longer has
 }
 
 /// One scope's counts for one minute, as the sync sends them (gwsync.RateDelta).
@@ -289,6 +409,9 @@ pub fn discard(batch: &[Arc<Scope>]) {
 pub struct Counters {
     #[serde(default)]
     pub cursor: String,
+    /// The control-plane replica that answered (schema 3): `cursor` is its own.
+    #[serde(default)]
+    pub replica: String,
     #[serde(default)]
     pub now_ms: i64,
     #[serde(default)]
@@ -457,11 +580,169 @@ pub(crate) mod tests {
         assert_eq!(spend().unwrap()["key:t-unknown"], 0.0);
     }
 
+    fn spent(name: &str) -> f64 {
+        let reg = registry().lock().unwrap();
+        let i = reg[name].inner.lock().unwrap();
+        i.spend_pending
+    }
+
+    fn held(name: &str) -> (f64, u32) {
+        let reg = registry().lock().unwrap();
+        let i = reg[name].inner.lock().unwrap();
+        (i.reserved, i.holders)
+    }
+
+    // Requests in progress hold their expected cost: the budget admits them
+    // while spend plus what the others hold is under it, so however many
+    // arrive at once it is overshot by at most the one request admitted last.
+    #[test]
+    fn requests_in_progress_hold_the_budget() {
+        let _serial = SERIAL.lock().unwrap();
+        let before = reserved_usd();
+        let k = key("t-reserve", Some(1.0), None);
+        let mut admitted = Vec::new();
+        let mut refused = 0;
+        for _ in 0..50 {
+            match admit(&k, 0.3) {
+                Ok(r) => admitted.push(r),
+                Err(d) => {
+                    assert_eq!((d.code, d.retry_after_s), ("budget_reserved", Some(1)));
+                    assert!(d.message.contains("held by requests in progress"), "{}", d.message);
+                    refused += 1;
+                }
+            }
+        }
+        // 0, 0.3, 0.6 and 0.9 held by the others are under 1.0; 1.2 is not
+        assert_eq!((admitted.len(), refused), (4, 46));
+        assert!((reserved_usd() - before - 1.2).abs() < 1e-9);
+        assert_eq!(held("key:t-reserve").1, 4);
+
+        // each costs what was expected: the budget is overshot by less than one request
+        for r in admitted.drain(..) {
+            settle(&k, 10, 0.3, r);
+        }
+        assert!((spent("key:t-reserve") - 1.2).abs() < 1e-9);
+        assert_eq!(held("key:t-reserve"), (0.0, 0));
+        assert!((reserved_usd() - before).abs() < 1e-9);
+        assert_eq!(admit(&k, 0.3).unwrap_err().code, "budget_exceeded", "spent, not held");
+    }
+
+    #[test]
+    fn a_reservation_is_given_back_however_the_request_ends() {
+        let _serial = SERIAL.lock().unwrap();
+        let before = reserved_usd();
+        let k = key("t-reserve-drop", Some(1.0), None);
+        // one request alone always runs, whatever it is expected to cost
+        let big = admit(&k, 5.0).unwrap();
+        assert_eq!(big.usd(), 5.0);
+        assert_eq!(admit(&k, 0.01).unwrap_err().code, "budget_reserved");
+        // a request that costs nothing is not held up, and holds nothing
+        assert_eq!(admit(&k, 0.0).unwrap().usd(), 0.0);
+        assert!(check(&k).is_ok());
+        assert_eq!(held("key:t-reserve-drop"), (5.0, 1));
+        // dropped (the client went away, the upstream failed): given back
+        drop(big);
+        assert_eq!(held("key:t-reserve-drop"), (0.0, 0));
+        assert!((reserved_usd() - before).abs() < 1e-9);
+        let a = admit(&k, 0.6).unwrap();
+        let b = admit(&k, 0.6).unwrap();
+        assert!(admit(&k, 0.6).is_err());
+        // recording the cost and giving back the reservation are one step:
+        // the next request sees 0.9 spent and 0.6 held, never 0.9 and 1.2
+        settle(&k, 0, 0.9, a);
+        assert_eq!(held("key:t-reserve-drop"), (0.6, 1));
+        assert_eq!(admit(&k, 0.1).unwrap_err().code, "budget_reserved");
+        // a request that failed costs nothing and still gives it back
+        settle(&k, 0, 0.0, b);
+        assert_eq!(held("key:t-reserve-drop"), (0.0, 0));
+        assert!(admit(&k, 0.6).is_ok(), "0.9 of 1.0 spent, nobody else in progress");
+        assert!((reserved_usd() - before).abs() < 1e-9);
+    }
+
+    // Every budget a request counts towards holds it; when one refuses, the
+    // ones before it give back what they took, and no rate slot is used.
+    #[test]
+    fn a_refused_reservation_takes_nothing() {
+        let _serial = SERIAL.lock().unwrap();
+        drop(freeze());
+        let before = reserved_usd();
+        let team = Arc::new(crate::config::Team {
+            id: "t-reserve-team".into(),
+            allowed_models: None,
+            scope: scope("team:t-reserve-team".into(), Some(1.0), None, None),
+            tags: Vec::new(),
+        });
+        let member = |name: &str| Key {
+            team: Some(team.clone()),
+            scope: scope(format!("key:{name}"), Some(10.0), Some(100), None),
+            ..key(name, None, None)
+        };
+        let (a, b) = (member("t-reserve-a"), member("t-reserve-b"));
+        let first = admit(&a, 0.7).unwrap();
+        let second = admit(&a, 0.7).unwrap();
+        assert_eq!(held("team:t-reserve-team"), (1.4, 2));
+        // the other key's own budget has room, the team's is held
+        let d = admit(&b, 0.7).unwrap_err();
+        assert_eq!(d.code, "budget_reserved");
+        assert!(d.message.contains("team:t-reserve-team"), "{}", d.message);
+        assert_eq!(held("key:t-reserve-b"), (0.0, 0), "what its own scope took is given back");
+        assert!((reserved_usd() - before - 1.4).abs() < 1e-9);
+        // admission is before the rate limit: the refusal used no slot
+        let (deltas, scopes) = freeze();
+        assert!(deltas.iter().all(|d| d.scope != "key:t-reserve-b"), "{deltas:?}");
+        discard(&scopes);
+        assert!(take_rates(&b).is_ok());
+        let (deltas, scopes) = freeze();
+        assert!(deltas.iter().any(|d| d.scope == "key:t-reserve-b" && d.requests == 1), "{deltas:?}");
+        discard(&scopes);
+        drop((first, second));
+        assert_eq!(held("team:t-reserve-team"), (0.0, 0));
+        assert!((reserved_usd() - before).abs() < 1e-9);
+    }
+
+    // Many threads at one budget: whatever the interleaving, what is admitted
+    // beyond the budget is at most one request.
+    #[test]
+    fn concurrent_requests_cannot_overshoot_by_more_than_one() {
+        let _serial = SERIAL.lock().unwrap();
+        let before = reserved_usd();
+        let k = Arc::new(key("t-reserve-race", Some(1.0), None));
+        let most = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (k, most) = (k.clone(), most.clone());
+                std::thread::spawn(move || {
+                    let mut served = 0;
+                    for _ in 0..2000 {
+                        let Ok(r) = admit(&k, 0.01) else { continue };
+                        let (reserved, _) = held("key:t-reserve-race");
+                        most.fetch_max((reserved * 1e6) as u64, Ordering::Relaxed);
+                        std::thread::yield_now();
+                        settle(&k, 0, 0.01, r);
+                        served += 1;
+                    }
+                    served
+                })
+            })
+            .collect();
+        let served: u32 = threads.into_iter().map(|t| t.join().unwrap()).sum();
+        let total = spent("key:t-reserve-race");
+        assert!((total - served as f64 * 0.01).abs() < 1e-6);
+        assert!((1.0..1.0 + 0.01 + 1e-9).contains(&total), "spent {total} of 1.0");
+        assert!(
+            most.load(Ordering::Relaxed) as f64 / 1e6 <= 1.0 + 0.01 + 1e-9,
+            "spend and holds stay within one request"
+        );
+        assert_eq!(held("key:t-reserve-race"), (0.0, 0));
+        assert!((reserved_usd() - before).abs() < 1e-9);
+    }
+
     #[test]
     fn unlimited_keys_skip_everything() {
         let _serial = SERIAL.lock().unwrap();
         let k = key("t-free", None, None);
         assert!(k.scope.is_none());
         assert!(check(&k).is_ok());
+        assert_eq!(admit(&k, 1.0).unwrap().usd(), 0.0, "no budget, nothing held");
     }
 }

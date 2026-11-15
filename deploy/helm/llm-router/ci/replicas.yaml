@@ -5,3 +5,5 @@ rollingUpdate: true
 gateway:
   enabled: true
   joinToken: llmr_gw_test
+usageClientIP: true
+trustedProxies: ["10.0.0.0/8"]

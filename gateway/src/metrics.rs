@@ -83,10 +83,15 @@ pub fn attempt(a: Attempt) {
     ATTEMPT[a as usize].fetch_add(1, Relaxed);
 }
 
-const DENIALS: [&str; 3] = ["budget_exceeded", "rate_limit_exceeded", "budget_unknown"];
-static DENIAL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+const DENIALS: [&str; 4] = ["budget_exceeded", "rate_limit_exceeded", "budget_unknown", "budget_reserved"];
+static DENIAL: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Requests refused because requests in progress held the rest of a budget.
+pub static BUDGET_RESERVED_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
 pub fn denial(code: &str) {
+    if code == "budget_reserved" {
+        BUDGET_RESERVED_REFUSALS.fetch_add(1, Relaxed);
+    }
     if let Some(i) = DENIALS.iter().position(|d| *d == code) {
         DENIAL[i].fetch_add(1, Relaxed);
     }
@@ -165,6 +170,11 @@ pub fn render(ready: bool, usage_queued: usize, usage_capacity: usize, usage_dro
     }
     let _ = writeln!(
         s,
+        "# HELP llmr_budget_reserved_usd Expected cost of the requests in progress, held against their budgets\n# TYPE llmr_budget_reserved_usd gauge\nllmr_budget_reserved_usd {}",
+        crate::limits::reserved_usd().max(0.0)
+    );
+    let _ = writeln!(
+        s,
         "# HELP llmr_build_info The gateway's version\n# TYPE llmr_build_info gauge\nllmr_build_info{{runtime=\"gateway\",version=\"{}\"}} 1",
         crate::cp::VERSION.replace(['\\', '"', '\n'], "_")
     );
@@ -222,6 +232,11 @@ pub fn render(ready: bool, usage_queued: usize, usage_capacity: usize, usage_dro
         "llmr_replay_refused_events_total",
         "Replayed usage events dropped because the control plane refused them",
         REPLAY_REFUSED_EVENTS.load(Relaxed),
+    );
+    counter(
+        "llmr_budget_reserved_refusals_total",
+        "Requests refused because requests in progress held the rest of a budget",
+        BUDGET_RESERVED_REFUSALS.load(Relaxed),
     );
     counter("llmr_usage_dropped_total", "Usage events dropped because the queue was full", usage_dropped);
     counter(
