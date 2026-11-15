@@ -3,7 +3,9 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -184,6 +186,19 @@ func LockTimedOut(err error) bool {
 
 // BumpConfigVersion increments the config version counter and NOTIFYs listeners.
 // Called by every mgmt-API write so gateways rebuild their snapshot.
+// NewConfigEpoch starts a new run of config versions, if the epoch is still
+// `old`: several control planes that notice the same rewind agree on one.
+func (s *Store) NewConfigEpoch(ctx context.Context, old string) error {
+	b := make([]byte, 16)
+	rand.Read(b)
+	if _, err := s.Pool.Exec(ctx, `UPDATE settings SET value = to_jsonb($1::text)
+		WHERE key = 'config_epoch' AND value = to_jsonb($2::text)`, hex.EncodeToString(b), old); err != nil {
+		return err
+	}
+	_, err := s.Pool.Exec(ctx, `NOTIFY llmr_config`)
+	return err
+}
+
 func (s *Store) BumpConfigVersion(ctx context.Context) error {
 	if _, err := s.Pool.Exec(ctx,
 		`UPDATE settings SET value = to_jsonb((value::text)::bigint + 1) WHERE key = 'config_version'`); err != nil {

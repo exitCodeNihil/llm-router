@@ -42,6 +42,10 @@ const (
 	staleInstance   = 7 * 24 * time.Hour
 )
 
+// rewindAfter is how long a gateway may stay ahead of this control plane
+// before the database is taken to have gone back (behind).
+var rewindAfter = time.Minute
+
 // Server is mounted on the control plane under /gw/v1/.
 type Server struct {
 	Store     *store.Store
@@ -62,6 +66,9 @@ type Server struct {
 	mu     sync.Mutex          // guards the two maps, never a build
 	cache  map[string]*encoded // by group and schema: the latest version asked for
 	tracks map[string]*tracker // by group and schema
+	// ahead is since when each gateway has run on a newer config than this
+	// control plane's (behind).
+	ahead map[string]time.Time
 
 	tokensOnce sync.Once
 	provMu     sync.Mutex
@@ -412,9 +419,37 @@ type SyncRequest struct {
 // config a gateway runs on, which another control plane gave it. Its usage
 // may be for keys this one does not know yet and would drop, so the gateway
 // is told to try again; the snapshot catches up within seconds.
-func behind(w http.ResponseWriter, snap *snapshot.Snapshot, epoch string, version int64) bool {
-	if snap != nil && (epoch != snap.Epoch || version <= snap.Version) {
+//
+// A control plane is behind for seconds. A gateway that stays ahead for a
+// minute is ahead of the database itself: it was restored to an earlier state
+// in place. The control plane then starts a new epoch, and every gateway
+// takes the restored config.
+func (s *Server) behind(w http.ResponseWriter, snap *snapshot.Snapshot, instance, epoch string, version int64) bool {
+	ahead := epoch == snap.Epoch && version > snap.Version
+	s.mu.Lock()
+	since, seen := s.ahead[instance]
+	switch {
+	case !ahead:
+		delete(s.ahead, instance)
+	case !seen:
+		if s.ahead == nil {
+			s.ahead = map[string]time.Time{}
+		}
+		s.ahead[instance] = time.Now()
+	}
+	s.mu.Unlock()
+	if !ahead {
 		return false
+	}
+	if seen && time.Since(since) > rewindAfter {
+		slog.Warn("a gateway has been ahead of the database for a minute: taking the database as restored to an earlier state",
+			"instance", instance, "gateway_version", version, "version", snap.Version)
+		if err := s.Store.NewConfigEpoch(context.Background(), snap.EpochID); err != nil {
+			slog.Error("starting a new config epoch failed", "err", err)
+		}
+		s.mu.Lock()
+		delete(s.ahead, instance) // a minute more before trying again
+		s.mu.Unlock()
 	}
 	w.Header().Set("Retry-After", "1")
 	http.Error(w, "this control plane is catching up: try again", http.StatusServiceUnavailable)
@@ -471,7 +506,7 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request, p peer) {
 		http.Error(w, "invalid sync request", http.StatusBadRequest)
 		return
 	}
-	if behind(w, snap, req.ConfigEpoch, req.ConfigVersion) {
+	if s.behind(w, snap, instance, req.ConfigEpoch, req.ConfigVersion) {
 		return
 	}
 	g := snap.GatewayGroups[group]

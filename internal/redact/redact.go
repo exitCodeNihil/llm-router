@@ -55,6 +55,9 @@ var builtin = map[string]*regexp.Regexp{
 	"private_key": regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)`),
 }
 
+// dataURL is the start of an encoded file given as a URL.
+var dataURL = regexp.MustCompile(`^data:[A-Za-z0-9.+\-]+/[A-Za-z0-9.+\-]+;base64,`)
+
 type rule struct {
 	kind string // counted under this
 	tag  string // [REDACTED:tag]
@@ -192,7 +195,16 @@ func (r *Redactor) document(raw []byte) ([]byte, bool) {
 func (r *Redactor) value(key string, v any) any {
 	switch t := v.(type) {
 	case map[string]any:
+		// An encoded image or document: {"type":"base64","media_type":…,
+		// "data":…}. Megabytes to scan and nothing to find.
+		_, media := t["media_type"]
+		if typ, _ := t["type"].(string); typ == "base64" {
+			media = true
+		}
 		for k, e := range t {
+			if media && k == "data" {
+				continue
+			}
 			t[k] = r.value(k, e)
 		}
 	case []any:
@@ -200,8 +212,7 @@ func (r *Redactor) value(key string, v any) any {
 			t[i] = r.value(key, e)
 		}
 	case string:
-		// Encoded media: nothing to find, and megabytes to scan.
-		if key == "data" || strings.HasPrefix(t, "data:") {
+		if dataURL.MatchString(t) { // an inline image
 			return t
 		}
 		if s := strings.TrimLeft(t, " \t\r\n"); s != "" && (s[0] == '{' || s[0] == '[') {

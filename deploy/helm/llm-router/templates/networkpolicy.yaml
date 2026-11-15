@@ -54,10 +54,11 @@ spec:
     - Egress
     {{- end }}
   ingress:
-    # Requests, and /metrics on the same port.
+    # Requests, and /metrics on the same port: so who may scrape is only
+    # narrowed where who may call is.
     - ports:
         - port: 8080
-      {{- if or $np.from $np.metricsFrom }}
+      {{- if $np.from }}
       from:
         - podSelector: {}
         {{- with $np.from }}

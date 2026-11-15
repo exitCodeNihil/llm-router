@@ -228,7 +228,6 @@ func TestRebase(t *testing.T) {
 	c.now = func() time.Time { return t0 }
 	s, id := budgetedSnap(1, t0.Add(-time.Second), &budget)
 	c.Observe(s)
-	c.Share(true)
 	c.RecordUsage(id, 0, 0.25)
 	c.RecordUsage(id, 0, 0.5) // not committed yet
 	c.Committed("key:k1", 0.25)
@@ -304,11 +303,7 @@ func TestShareBetweenReplicas(t *testing.T) {
 	s := &snapshot.Snapshot{KeysByHash: map[[32]byte]*snapshot.Key{{1}: k}}
 	id := &auth.Identity{Key: k}
 	a, b := New(), New()
-	a.Check(id, s) // before sharing: reaches b in the first hand-over
-	for _, r := range a.Share(true) {
-		b.IngestPeer(r)
-	}
-	b.Share(true)
+	a.Check(id, s)
 	a.Check(id, s)
 	a.Ingest("key:k1", a.rpm["key:k1"].minute, 1, 0) // a gateway of a's
 	rates, _ := a.Drain()
@@ -323,5 +318,72 @@ func TestShareBetweenReplicas(t *testing.T) {
 	}
 	if rates, _ := a.Drain(); len(rates) != 0 {
 		t.Fatalf("drained twice: %v", rates)
+	}
+}
+
+// One control plane and nothing but snapshots to go by, steady traffic: $0.01 every 2 s for 10 min,
+// snapshot every 30 s whose spend is exactly what was recorded so far.
+func TestSteadyTrafficIsNotCountedTwice(t *testing.T) {
+	budget := 100.0
+	t0 := time.Unix(1_800_000_000, 0)
+	now := t0
+	c := New()
+	c.now = func() time.Time { return now }
+	s, id := budgetedSnap(0, t0, &budget)
+	c.Check(id, s)
+	real := 0.0
+	for i := 1; i <= 300; i++ {
+		now = t0.Add(time.Duration(i) * 2 * time.Second)
+		c.RecordUsage(id, 10, 0.01)
+		real += 0.01
+		if i%15 == 0 {
+			s, id = budgetedSnap(real, now, &budget)
+			c.Check(id, s)
+		}
+	}
+	c.mu.Lock()
+	got := c.spent("key:k1")
+	c.mu.Unlock()
+	t.Logf("real spend %.2f, limiter believes %.2f", real, got)
+	if got > real+0.2 {
+		t.Fatalf("double counted: real %.2f, limiter %.2f", real, got)
+	}
+}
+
+// A snapshot read lands between the tick's spend read and Rebase.
+func TestRebaseBehindASnapshotStillRetires(t *testing.T) {
+	budget := 100.0
+	t0 := time.Unix(1_800_000_000, 0)
+	now := t0
+	c := New()
+	c.now = func() time.Time { return now }
+	s, id := budgetedSnap(0, t0, &budget)
+	c.Check(id, s)
+	c.RecordUsage(id, 10, 1.0)
+	c.Committed("key:k1", 1.0)
+	_, touched := c.Drain()
+	at := t0.Add(time.Second)
+	// snapshot read a little later than the tick's read, adopted first
+	s2, id2 := budgetedSnap(1.0, at.Add(time.Millisecond), &budget)
+	c.Check(id2, s2)
+	c.Rebase(at, []string{"key:k1"}, map[string]float64{"key:k1": 1.0}, touched)
+	// keep traffic going so it never settles
+	for i := 1; i <= 60; i++ {
+		now = t0.Add(time.Duration(i) * 2 * time.Second)
+		c.RecordUsage(id2, 10, 0.0001)
+		c.Committed("key:k1", 0.0001)
+		_, touched := c.Drain()
+		c.Rebase(now, []string{"key:k1"}, map[string]float64{"key:k1": 1.0 + float64(i)*0.0001}, touched)
+		if i%15 == 0 {
+			s3, id3 := budgetedSnap(1.0+float64(i)*0.0001, now.Add(time.Millisecond), &budget)
+			c.Check(id3, s3)
+		}
+	}
+	c.mu.Lock()
+	got := c.spent("key:k1")
+	c.mu.Unlock()
+	t.Logf("real ~1.006, limiter believes %.4f", got)
+	if got > 1.5 {
+		t.Fatalf("double counted")
 	}
 }

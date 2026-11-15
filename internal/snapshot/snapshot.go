@@ -164,7 +164,9 @@ type Snapshot struct {
 	// Epoch names the database the version counts in: it changes when the
 	// database is restored or replaced, where the version can go backwards.
 	// Empty when Postgres won't say.
-	Epoch              string
+	Epoch string
+	// EpochID is the part of Epoch kept in settings (store.NewConfigEpoch).
+	EpochID            string
 	KeysByHash         map[[32]byte]*Key
 	UsersByID          map[string]*User
 	UsersByEmail       map[string]*User

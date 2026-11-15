@@ -40,7 +40,9 @@ func TestString(t *testing.T) {
 func TestJSONStaysValid(t *testing.T) {
 	r := mustCompile(t, Config{Enabled: true})
 	in := `[{"role":"user","content":[{"type":"text","text":"I am a@b.io"},` +
-		`{"type":"image","source":{"data":"a@b.io","media_type":"image/png"}}]},` +
+		`{"type":"image","source":{"data":"a@b.io","media_type":"image/png"}},` +
+		`{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD@b.io"}}]},` +
+		`{"role":"user","content":"data: my mail is e@f.io"},{"role":"tool","data":"g@h.io"},` +
 		`{"role":"assistant","tool_calls":[{"function":{"name":"pay","arguments":"{\"card\":4111111111111111,\"to\":\"c@d.org\",\"n\":3}"}}]},` +
 		`{"a@b.io":"key stays"}]`
 	out := r.JSON(json.RawMessage(in))
@@ -49,18 +51,18 @@ func TestJSONStaysValid(t *testing.T) {
 		t.Fatalf("not JSON: %v\n%s", err, out)
 	}
 	s := string(out)
-	for _, gone := range []string{`"I am a@b.io"`, "c@d.org", "4111111111111111"} {
+	for _, gone := range []string{`"I am a@b.io"`, "c@d.org", "4111111111111111", "e@f.io", "g@h.io"} {
 		if strings.Contains(s, gone) {
 			t.Errorf("%q survived: %s", gone, s)
 		}
 	}
-	for _, kept := range []string{`"data":"a@b.io"`, `"a@b.io":"key stays"`, `\"n\":3`} {
+	for _, kept := range []string{`"data":"a@b.io"`, `"a@b.io":"key stays"`, `\"n\":3`, "data:image/png;base64,QUJD@b.io"} {
 		if !strings.Contains(s, kept) {
 			t.Errorf("%q changed: %s", kept, s)
 		}
 	}
 	// The arguments string must still hold JSON.
-	args := v[1]["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)["arguments"].(string)
+	args := v[3]["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)["arguments"].(string)
 	if !json.Valid([]byte(args)) {
 		t.Errorf("arguments no longer JSON: %s", args)
 	}

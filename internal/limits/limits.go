@@ -76,20 +76,18 @@ type Checker struct {
 	tpm  map[string]*window
 
 	// Spend of budgeted scopes: base is what Postgres held at baseAt, delta
-	// what was added here since and is not in base yet. lastAdd is when delta
-	// last grew.
-	base    map[string]float64
-	baseAt  map[string]time.Time
-	delta   map[string]float64
-	lastAdd map[string]time.Time
-	budget  map[string]bool
+	// what was added here since and is not in base yet, kept by the second it
+	// was added so each part can be retired when a reading covers it.
+	base   map[string]float64
+	baseAt map[string]time.Time
+	delta  map[string]*pending
+	budget map[string]bool
 
 	// held is the expected cost of requests in flight, per scope.
 	held map[string]*hold
 
-	// For the other replicas: counts taken in here since the last Drain, and
-	// spend committed here since then. Kept only while sharing is on.
-	share   bool
+	// Counts taken in here since the last Drain, for the other replicas, and
+	// spend added here that Postgres is known to hold since then.
 	out     map[rateKey]*[2]int64
 	touched map[string]float64
 
@@ -111,8 +109,7 @@ func New() *Checker {
 		tpm:     map[string]*window{},
 		base:    map[string]float64{},
 		baseAt:  map[string]time.Time{},
-		delta:   map[string]float64{},
-		lastAdd: map[string]time.Time{},
+		delta:   map[string]*pending{},
 		budget:  map[string]bool{},
 		held:    map[string]*hold{},
 		out:     map[rateKey]*[2]int64{},
@@ -173,12 +170,28 @@ func (c *Checker) observe(s *snapshot.Snapshot) {
 				c.baseAt[scope] = at
 			}
 		}
-		if at.IsZero() || at.After(c.lastAdd[scope].Add(settle)) {
+	}
+	// What was added here long enough before the reading is in it. Its
+	// commit, if still to be reported, is no longer owed either.
+	for scope, p := range c.delta {
+		var gone float64
+		if at.IsZero() || !c.budget[scope] {
+			gone = p.take(p.sum)
+		} else {
+			gone = p.before(at.Add(-settle).Unix())
+		}
+		if gone > 0 {
+			if left := c.touched[scope] - gone; left > 1e-12 {
+				c.touched[scope] = left
+			} else {
+				delete(c.touched, scope)
+			}
+		}
+		if p.sum <= 1e-12 {
 			delete(c.delta, scope)
-			delete(c.lastAdd, scope)
 		}
 	}
-	for _, m := range []map[string]float64{c.base, c.delta, c.touched} {
+	for _, m := range []map[string]float64{c.base, c.touched} {
 		for scope := range m {
 			if !c.budget[scope] {
 				delete(m, scope)
@@ -188,7 +201,6 @@ func (c *Checker) observe(s *snapshot.Snapshot) {
 	for scope := range c.baseAt {
 		if !c.budget[scope] {
 			delete(c.baseAt, scope)
-			delete(c.lastAdd, scope)
 		}
 	}
 	clear(c.changed)
@@ -200,13 +212,68 @@ func (c *Checker) observe(s *snapshot.Snapshot) {
 
 // spent is a scope's spend as far as this process knows.
 func (c *Checker) spent(scope string) float64 {
+	var local float64
+	if p := c.delta[scope]; p != nil {
+		local = p.sum
+	}
 	if b, ok := c.base[scope]; ok {
-		return b + c.delta[scope]
+		return b + local
 	}
 	if c.snap != nil { // a budget the snapshot's own lists don't show
-		return c.snap.Spend[scope].USD + c.delta[scope]
+		return c.snap.Spend[scope].USD + local
 	}
-	return c.delta[scope]
+	return local
+}
+
+// pending is spend added here that base does not hold yet, by the second it
+// was added, oldest first.
+type pending struct {
+	sum   float64
+	parts []part
+}
+
+type part struct {
+	sec int64
+	usd float64
+}
+
+func (p *pending) add(sec int64, usd float64) {
+	p.sum += usd
+	if n := len(p.parts); n > 0 && p.parts[n-1].sec == sec {
+		p.parts[n-1].usd += usd
+		return
+	}
+	p.parts = append(p.parts, part{sec, usd})
+}
+
+// take removes up to usd, oldest first, and returns what it removed.
+func (p *pending) take(usd float64) float64 {
+	var gone float64
+	for len(p.parts) > 0 && usd-gone > 1e-12 {
+		if first := &p.parts[0]; first.usd > usd-gone+1e-12 {
+			first.usd -= usd - gone
+			gone = usd
+			break
+		}
+		gone += p.parts[0].usd
+		p.parts = p.parts[1:]
+	}
+	if p.sum -= gone; p.sum < 1e-12 || len(p.parts) == 0 {
+		p.sum, p.parts = 0, nil
+	}
+	return gone
+}
+
+// before removes what was added before sec and returns it.
+func (p *pending) before(sec int64) float64 {
+	var usd float64
+	for _, part := range p.parts {
+		if part.sec >= sec {
+			break
+		}
+		usd += part.usd
+	}
+	return p.take(usd)
 }
 
 // sweep forgets rate windows for keys, users and teams that are no longer in
@@ -454,14 +521,16 @@ func (c *Checker) AddSpend(scope string, usd float64) {
 		return
 	}
 	c.addSpend(scope, usd)
-	if c.share {
-		c.touched[scope] += usd
-	}
+	c.touched[scope] += usd
 }
 
 func (c *Checker) addSpend(scope string, usd float64) {
-	c.delta[scope] += usd
-	c.lastAdd[scope] = c.now()
+	p := c.delta[scope]
+	if p == nil {
+		p = &pending{}
+		c.delta[scope] = p
+	}
+	p.add(c.now().Unix(), usd)
 	c.seq++
 	c.changed[scope] = c.seq
 }
@@ -560,8 +629,11 @@ func (c *Checker) ID() string { return c.epoch }
 
 // note records counts taken in here, for the other replicas.
 func (c *Checker) note(scope string, minute, requests, tokens int64) {
-	if !c.share || (requests == 0 && tokens == 0) {
+	if requests == 0 && tokens == 0 {
 		return
+	}
+	if len(c.out) > maxUndrained { // nothing is draining: don't grow for ever
+		clear(c.out)
 	}
 	k := rateKey{scope, minute}
 	d := c.out[k]
@@ -573,53 +645,8 @@ func (c *Checker) note(scope string, minute, requests, tokens int64) {
 	d[1] += tokens
 }
 
-// Share turns the collecting of counts for other replicas on or off. Turned
-// on, it returns this and last minute's counts so far, for a replica that was
-// not there to hear them.
-func (c *Checker) Share(on bool) []Rate {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	was := c.share
-	c.share = on
-	if !on {
-		clear(c.out)
-		clear(c.touched)
-		return nil
-	}
-	if was {
-		return nil
-	}
-	now, _ := c.clock()
-	byKey := map[rateKey]*Rate{}
-	at := func(scope string, minute int64) *Rate {
-		k := rateKey{scope, minute}
-		if byKey[k] == nil {
-			byKey[k] = &Rate{Scope: scope, Minute: minute}
-		}
-		return byKey[k]
-	}
-	for scope, w := range c.rpm {
-		if w.roll(now); w.cur != 0 {
-			at(scope, now).Requests = w.cur
-		}
-		if w.prev != 0 {
-			at(scope, now-1).Requests = w.prev
-		}
-	}
-	for scope, w := range c.tpm {
-		if w.roll(now); w.cur != 0 {
-			at(scope, now).Tokens = w.cur
-		}
-		if w.prev != 0 {
-			at(scope, now-1).Tokens = w.prev
-		}
-	}
-	out := make([]Rate, 0, len(byKey))
-	for _, r := range byKey {
-		out = append(out, *r)
-	}
-	return out
-}
+// maxUndrained bounds the counts kept for a Drain that never comes.
+const maxUndrained = 200000
 
 // Drain returns, and forgets, the counts taken in here since the last call
 // and the spend committed here since then, by budgeted scope.
@@ -641,7 +668,7 @@ func (c *Checker) Drain() ([]Rate, map[string]float64) {
 func (c *Checker) Committed(scope string, usd float64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.share && c.budget[scope] && usd > 0 {
+	if c.budget[scope] && usd > 0 && c.delta[scope] != nil {
 		c.touched[scope] += usd
 	}
 }
@@ -667,21 +694,25 @@ func (c *Checker) Budgeted(scopes []string) []string {
 }
 
 // Rebase takes spend read from Postgres at `at` for scopes: the reading
-// becomes base, and committed, the part of delta the reading is known to
-// include, stops being counted on top. A reading older than base is ignored.
+// becomes base unless base is a newer one, and committed, the part of delta
+// Postgres is known to hold, stops being counted on top.
 func (c *Checker) Rebase(at time.Time, scopes []string, totals, committed map[string]float64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, scope := range scopes {
-		if !c.budget[scope] || c.baseAt[scope].After(at) {
+		if !c.budget[scope] {
 			continue
 		}
 		before := c.spent(scope)
-		c.base[scope], c.baseAt[scope] = totals[scope], at
-		if d := c.delta[scope] - committed[scope]; d > 1e-9 {
-			c.delta[scope] = d
-		} else {
-			delete(c.delta, scope)
+		// What was committed is in every reading taken after it, this one
+		// and any newer one base already holds: stop counting it on top.
+		if p := c.delta[scope]; p != nil {
+			if p.take(committed[scope]); p.sum <= 1e-12 {
+				delete(c.delta, scope)
+			}
+		}
+		if !c.baseAt[scope].After(at) {
+			c.base[scope], c.baseAt[scope] = totals[scope], at
 		}
 		if c.spent(scope) != before {
 			c.seq++

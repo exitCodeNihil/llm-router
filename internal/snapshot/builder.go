@@ -49,6 +49,11 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 		(pg_control_checkpoint()).timeline_id`).Scan(&sysid, &timeline); err == nil {
 		s.Epoch = strconv.FormatInt(sysid, 36) + "." + strconv.FormatInt(timeline, 36)
 	}
+	// ... and a value of our own, replaced when the database is found to
+	// have gone back in place.
+	if err := b.Pool.QueryRow(ctx, `SELECT value #>> '{}' FROM settings WHERE key='config_epoch'`).Scan(&s.EpochID); err == nil {
+		s.Epoch += "." + s.EpochID
+	}
 
 	rows, err := b.Pool.Query(ctx, `SELECT id, email, role, budget_usd, budget_period, rpm_limit, tpm_limit, tags, allowed_models FROM users WHERE NOT disabled`)
 	if err != nil {

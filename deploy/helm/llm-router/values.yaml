@@ -214,7 +214,8 @@ podDisruptionBudget:
 # llm-router's port 8080 stays open to the namespace's pods and to `from`
 # (apps, the ingress controller and workspaces call it); the metrics port is
 # open to `metricsFrom`; gateways accept `from` on 8080. An empty list allows
-# every source. Outgoing traffic is not restricted unless egress.enabled, which
+# every source; a gateway serves metrics on its request port, so metricsFrom
+# narrows it only together with `from`. Outgoing traffic is not restricted unless egress.enabled, which
 # then allows DNS, traffic inside the namespace and the rules you list
 # (docs/deploy.md names what llm-router needs to reach).
 networkPolicy:

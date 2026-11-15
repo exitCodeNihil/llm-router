@@ -110,7 +110,7 @@ func (s *Server) replay(w http.ResponseWriter, r *http.Request, p peer) {
 		http.Error(w, "invalid replay request", http.StatusBadRequest)
 		return
 	}
-	if behind(w, snap, req.ConfigEpoch, req.ConfigVersion) {
+	if s.behind(w, snap, p.instance, req.ConfigEpoch, req.ConfigVersion) {
 		return
 	}
 	g := snap.GatewayGroups[p.group]

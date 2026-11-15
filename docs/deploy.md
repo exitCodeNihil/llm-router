@@ -290,6 +290,9 @@ Any number of control planes can run on one database. Each registers in Postgres
   admit within a second or two, the same margin gateways have.
 - **Gateways** can reach any of them through one Service. A control plane that is a few seconds
   behind on a config change asks the gateway to try again instead of answering with old data.
+  That needs 0.4 gateways: a 0.3 gateway does not say which config it runs on, so behind several
+  control planes it can be handed an older config for a moment, and usage for a key the lagging
+  one does not know yet is dropped. Upgrade the gateways before adding control planes.
 - **The console** shows the same thing on each: live traffic, gateways and events are put together
   from all of them. Latency figures on the live pages are then averages of each one's median.
 - **Per control plane**, not shared: sign-in attempt limits and the list of recently exported
@@ -298,6 +301,11 @@ Any number of control planes can run on one database. Each registers in Postgres
   `replicas × (LLMR_DB_MAX_CONNS + LLMR_DB_CONSOLE_MAX_CONNS)`. Use a direct connection or a
   session-mode pooler; a transaction-mode pooler breaks the locks that keep maintenance to one
   control plane at a time.
+- **A restored database**: gateways follow it. After a restore to another server, a point-in-time
+  recovery or a failover they take the restored config at once. After a restore in place (a
+  volume snapshot), where Postgres looks the same and only the config version went back, they
+  keep their newer config for about a minute, until a control plane has seen one stay ahead that
+  long and starts the versions over.
 - **Upgrades**: stop every control plane before starting a new release, unless that release's notes
   say it can run beside the one before. The chart does this by default (`rollingUpdate: false`).
   Set `rollingUpdate: true` for one-at-a-time restarts and configuration changes.

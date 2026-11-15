@@ -61,7 +61,8 @@ func (g *Server) clientIP(r *http.Request) string {
 	// ClientIP falls back to RemoteAddr's text, which inet may refuse (a
 	// unix socket), and with it the whole usage row.
 	ip := console.ClientIP(r, g.TrustedProxies)
-	if _, err := netip.ParseAddr(ip); err != nil {
+	// ... or a link-local address with a zone, which ParseAddr accepts.
+	if a, err := netip.ParseAddr(ip); err != nil || a.Zone() != "" {
 		return ""
 	}
 	return ip

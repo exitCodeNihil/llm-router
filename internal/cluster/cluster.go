@@ -53,8 +53,12 @@ type Node struct {
 	KeyFP   string
 
 	seq     int64
-	cursors map[string]int64 // last row read, by the replica that wrote it
+	cursors map[string]int64     // last row read, by the replica that wrote it
+	seen    map[string]time.Time // when each of those replicas was last alive
 	unsent  []row
+	// backlog is the last two minutes of counts taken in while there was
+	// nobody to hand them to: a replica that appears is given them, once.
+	backlog map[backlogKey]*row
 	reread  map[string]bool // scopes whose spend read failed
 	ticks   int
 	peers   atomic.Pointer[[]Peer]
@@ -64,6 +68,11 @@ type Node struct {
 	// Errors counts ticks that failed, for /metrics.
 	Errors atomic.Int64
 	once   sync.Once
+}
+
+type backlogKey struct {
+	scope  string
+	minute int64
 }
 
 type row struct {
@@ -124,7 +133,9 @@ func (n *Node) Tick(ctx context.Context) {
 func (n *Node) tick(ctx context.Context) error {
 	n.once.Do(func() {
 		n.cursors = map[string]int64{}
+		n.seen = map[string]time.Time{}
 		n.reread = map[string]bool{}
+		n.backlog = map[backlogKey]*row{}
 	})
 	if err := n.register(ctx); err != nil {
 		return err
@@ -132,11 +143,16 @@ func (n *Node) tick(ctx context.Context) error {
 	peers := n.Peers()
 	sharing := len(peers) > 0
 
-	// Hand over: this second's counts, and the scopes spend was committed for.
-	baseline := n.Limits.Share(sharing)
+	// Hand over: this second's counts, and the scopes spend was committed
+	// for. Every count is written at most once, whenever the others come
+	// and go: alone, they wait in the backlog while they still matter.
 	rates, touched := n.Limits.Drain()
 	if sharing {
-		for _, r := range append(baseline, rates...) {
+		for _, r := range n.backlog {
+			n.unsent = append(n.unsent, *r)
+		}
+		clear(n.backlog)
+		for _, r := range rates {
 			n.unsent = append(n.unsent, row{scope: r.Scope, minute: r.Minute, requests: r.Requests, tokens: r.Tokens})
 		}
 		for scope := range touched {
@@ -146,7 +162,25 @@ func (n *Node) tick(ctx context.Context) error {
 			n.unsent = n.unsent[len(n.unsent)-maxUnsent:]
 		}
 	} else {
+		for _, r := range append(n.unsent, rowsOf(rates)...) {
+			if r.spend {
+				continue // a replica that comes later reads spend from Postgres
+			}
+			k := backlogKey{r.scope, r.minute}
+			if b := n.backlog[k]; b != nil {
+				b.requests += r.requests
+				b.tokens += r.tokens
+			} else {
+				n.backlog[k] = &r
+			}
+		}
 		n.unsent = nil
+		oldest := time.Now().Unix()/60 - 1
+		for k := range n.backlog {
+			if k.minute < oldest || len(n.backlog) > maxUnsent {
+				delete(n.backlog, k)
+			}
+		}
 	}
 	var firstErr error
 	if len(n.unsent) > 0 {
@@ -228,16 +262,27 @@ func (n *Node) register(ctx context.Context) error {
 	}
 	n.peers.Store(&peers)
 	n.known.Store(true)
-	for id := range n.cursors {
-		gone := true
-		for _, p := range peers {
-			gone = gone && p.ID != id
-		}
-		if gone {
+	// A replica that drops out for a while and comes back must not be read
+	// from the start again: its place is kept for as long as its rows are.
+	now := time.Now()
+	for _, p := range peers {
+		n.seen[p.ID] = now
+	}
+	for id, at := range n.seen {
+		if now.Sub(at) > logKeep {
+			delete(n.seen, id)
 			delete(n.cursors, id)
 		}
 	}
 	return nil
+}
+
+func rowsOf(rates []limits.Rate) []row {
+	out := make([]row, len(rates))
+	for i, r := range rates {
+		out[i] = row{scope: r.Scope, minute: r.Minute, requests: r.Requests, tokens: r.Tokens}
+	}
+	return out
 }
 
 // append writes rows in one statement, numbered in order. One statement, so

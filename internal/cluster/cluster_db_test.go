@@ -144,3 +144,57 @@ func TestTwoReplicasShareLimits(t *testing.T) {
 		t.Fatalf("a wrote %d rows with no peer", after-n)
 	}
 }
+
+// A replica that is not seen for a while (a stall, a database blip) and comes
+// back is neither read from the start again nor sent what it already has.
+func TestPeerDroppingOutAndBack(t *testing.T) {
+	url := os.Getenv("LLMR_TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("LLMR_TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	st, err := store.Open(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	st.Pool.Exec(ctx, `TRUNCATE cp_rate_log, cp_replicas`)
+	rpm := 1000
+	k := &snapshot.Key{ID: "k1", RPMLimit: &rpm}
+	snap := &snapshot.Snapshot{KeysByHash: map[[32]byte]*snapshot.Key{{1}: k}, Spend: map[string]snapshot.Spend{}}
+	id := &auth.Identity{Key: k}
+	node := func() (*Node, *limits.Checker) {
+		c := limits.New()
+		c.Observe(snap)
+		return &Node{Pool: st.Pool, Limits: c, Version: "test"}, c
+	}
+	a, ca := node()
+	b, cb := node()
+	a.Tick(ctx)
+	b.Tick(ctx)
+	a.Tick(ctx)
+	for i := 0; i < 10; i++ {
+		ca.Check(id, snap)
+		cb.Check(id, snap)
+	}
+	for i := 0; i < 3; i++ {
+		a.Tick(ctx)
+		b.Tick(ctx)
+	}
+	sum := func(c *limits.Checker) int64 { r := c.Export(snap, "").Rates["key:k1"]; return r[0] + r[1] }
+	t.Logf("before flap: a=%d b=%d (real 20)", sum(ca), sum(cb))
+	// b is not seen for 11 s (a stall, or its connection to Postgres), then returns.
+	st.Pool.Exec(ctx, `UPDATE cp_replicas SET last_seen = now() - interval '11 seconds' WHERE id = $1`, b.ID())
+	a.Tick(ctx)
+	for i := 0; i < 3; i++ {
+		b.Tick(ctx)
+		a.Tick(ctx)
+	}
+	t.Logf("after flap: a=%d b=%d (real 20)", sum(ca), sum(cb))
+	if sum(ca) != 20 || sum(cb) != 20 {
+		t.Fatal("counts multiplied")
+	}
+}
