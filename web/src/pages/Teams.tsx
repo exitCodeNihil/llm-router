@@ -163,7 +163,7 @@ function MemberBudgetForm({
   return (
     <form onSubmit={submit} noValidate>
       <VStack gap={4}>
-        <HStack gap={3} vAlign="end" wrap="wrap">
+        <HStack className="help-above" gap={3} vAlign="end" wrap="wrap">
           <TextInput
             label="Budget (USD)"
             placeholder="No share"
@@ -331,7 +331,7 @@ function MembersPanel({ team, me }: { team: Team; me: Me }) {
           <form onSubmit={addMember}>
             <VStack gap={2}>
               <span className="eyebrow">Add member</span>
-              <HStack gap={2} vAlign="end" wrap="wrap">
+              <HStack className="help-above" gap={2} vAlign="end" wrap="wrap">
                 {me.is_admin ? (
                   <EntityPicker
                     kind="user"

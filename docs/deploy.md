@@ -147,7 +147,7 @@ A new join token stops gateways joining with the old one. Running gateways carry
 they have, which they renew without the token. They need the token again when they restart, or when
 the session lapses because the control plane was unreachable for longer than it had left (5 to 15
 minutes); they are then refused as above and stop serving 15 minutes later. Give running gateways
-the new token before that.
+the new token before that. Until one has joined with it, the Gateways page marks it **old join token**.
 
 A gateway that stops syncing turns red on the Gateways page and disappears from it after 10 minutes.
 Its row is deleted from the database after 7 days, when it joins, and in the twice-daily maintenance

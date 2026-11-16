@@ -132,7 +132,7 @@ export function TagsInput({
 
   return (
     <VStack gap={2}>
-      <HStack gap={2} vAlign="end">
+      <HStack className="help-above" gap={2} vAlign="end">
         {/* Wide enough that the placeholder, which says how to add one, isn't cut off. */}
         <div style={{ flex: "1 1 240px", minWidth: 240, maxWidth: 360 }}>
           <TextInput

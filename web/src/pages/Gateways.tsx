@@ -65,6 +65,19 @@ function UnservedBadge({ node }: { node: Node }) {
   );
 }
 
+const OLD_TOKEN_HELP =
+  "This gateway joined with a join token that has since been replaced. It keeps working until it restarts or loses its session; after that it cannot join again. Give it the group's new token and restart it.";
+
+function OldTokenBadge() {
+  return (
+    <Tooltip content={OLD_TOKEN_HELP}>
+      <span tabIndex={0} role="group" aria-label={OLD_TOKEN_HELP} style={{ display: "inline-flex" }}>
+        <Badge variant="warning" label="old join token" />
+      </span>
+    </Tooltip>
+  );
+}
+
 // ── Live cluster (self + peers) ─────────────────────────────────
 function ClusterTable() {
   const nodes = useNodes();
@@ -94,6 +107,7 @@ function ClusterTable() {
             </HStack>
             {n.addr && <Code>{n.addr}</Code>}
             {!!n.unserved_providers?.length && <UnservedBadge node={n} />}
+            {n.old_token && <OldTokenBadge />}
           </VStack>
         </HStack>
       ),
@@ -372,11 +386,33 @@ function ClusterEvents() {
 }
 
 // ── Gateway groups ──────────────────────────────────────────────
-const DATA_RULES: { value: DataRule; label: string }[] = [
-  { value: "inherit", label: "Follow the capture policy" },
-  { value: "no_content", label: "Never capture prompts or responses" },
-  { value: "no_export", label: "Never export" },
+function rotateWarning(g: GatewayGroup | null): string {
+  if (!g) return "";
+  const n = g.live_instances ?? 0;
+  const running =
+    n === 0
+      ? "No gateways are running in this group."
+      : `${n} running gateway${n === 1 ? " keeps" : "s keep"} working for now, but ${n === 1 ? "it" : "each one"} needs the new token the next time it restarts or loses its session. Until then it is marked "old join token" on this page.`;
+  return `Replace the join token of "${g.name}"? The old token stops working for joins at once. ${running} Put the new token in every gateway of this group, then restart them. It is shown once.`;
+}
+const DATA_RULES: { value: DataRule; label: string; help: string }[] = [
+  {
+    value: "inherit",
+    label: "Follow the capture policy",
+    help: "No extra limit. The capture policy and each destination on Observability decide what is sent.",
+  },
+  {
+    value: "no_content",
+    label: "Never capture prompts or responses",
+    help: "Destinations get metadata only: model, tokens, cost, latency and status. Prompts and responses never leave these gateways.",
+  },
+  {
+    value: "no_export",
+    label: "Never export",
+    help: "Nothing from these gateways goes to any destination.",
+  },
 ];
+const DATA_RULE_NOTE = "Limits what goes to telemetry destinations. Usage, budgets and rate limits are not affected.";
 
 function GroupForm({
   group,
@@ -463,7 +499,7 @@ function GroupForm({
           value={rule}
           onChange={(v) => setRule(v as DataRule)}
           options={DATA_RULES}
-          description="What requests through these gateways may send to the observability exporter."
+          description={`${DATA_RULES.find((r) => r.value === rule)?.help} ${DATA_RULE_NOTE}`}
         />
         <FormActions
           onCancel={onClose}
@@ -604,7 +640,7 @@ function GatewayGroups({ onNew }: { onNew: () => void }) {
       <Confirm
         target={rotating}
         title="New join token"
-        description={`Replace the join token of "${rotating?.name}"? Running gateways keep working; new ones need the new token.`}
+        description={rotateWarning(rotating)}
         actionLabel="Replace token"
         isLoading={rotate.isPending}
         onCancel={() => setRotating(null)}

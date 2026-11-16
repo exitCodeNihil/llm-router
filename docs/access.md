@@ -62,7 +62,7 @@ so requests through different gateways can still overshoot by what they admit wi
 ## Sign-in and SSO
 
 Create the first admin on the setup screen, or sign in with `LLMR_ADMIN_TOKEN`. For SSO, fill in
-**Settings → OIDC provider**: Issuer URL, Client ID, Client secret and Redirect URL
+**Settings → Console sign-in**: Issuer URL, Client ID, Client secret and Redirect URL
 (`https://<gateway>/auth/callback`). Any OIDC provider works (Entra ID, Google, Okta, Zitadel,
 Keycloak). **Auto-create users** provisions people on their first sign-in.
 
@@ -100,7 +100,7 @@ destinations: the response lists these, and any workspace volume the runtime cou
 ## Cloud identity tokens
 
 Callers on Azure or GCP can send their platform token instead of a key. The gateway verifies it
-locally against the issuer's published keys. Add one under **Settings → Add issuer**:
+locally against the issuer's published keys. Add one under **Settings → API identity tokens → Add issuer**:
 
 | | Type | Issuer URL | Audience |
 |---|---|---|---|

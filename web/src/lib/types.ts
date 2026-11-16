@@ -549,6 +549,8 @@ export interface Node {
   region?: string;
   version: string;
   version_skew: boolean;
+  /** Joined before the group's join token was replaced: it cannot join again until it has the new one. */
+  old_token?: boolean;
   /** Providers this gateway leaves out because it is older than 0.3. */
   unserved_providers?: string[];
   uptime_s: number;

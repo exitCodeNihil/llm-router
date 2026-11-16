@@ -245,7 +245,7 @@ function DeploymentForm({
           />
         )}
 
-        <Grid columns={{ minWidth: 220, repeat: "fit" }} gap={3} align="end">
+        <Grid columns={{ minWidth: 220, repeat: "fit" }} gap={3}>
           <TextInput
             label="Model name"
             value={modelName}
@@ -283,7 +283,7 @@ function DeploymentForm({
           />
         </Grid>
 
-        <Grid columns={{ minWidth: 160, repeat: "fit" }} gap={3} align="end">
+        <Grid columns={{ minWidth: 160, repeat: "fit" }} gap={3}>
           <NumberInput
             label="Priority"
             value={priority}
@@ -328,7 +328,7 @@ function DeploymentForm({
                 description="Uses the native price catalog"
               />
             ) : (
-              <Grid columns={{ minWidth: 160, repeat: "fit" }} gap={3} align="end">
+              <Grid columns={{ minWidth: 160, repeat: "fit" }} gap={3}>
                 <NumberInput
                   label="Input $/1M"
                   value={inputPrice}
