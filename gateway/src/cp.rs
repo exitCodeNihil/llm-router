@@ -354,6 +354,9 @@ impl ControlPlane {
             Ok(j) => {
                 log_info!("the control plane now knows config schema {SCHEMA}");
                 self.joined(&j, SCHEMA);
+                // The config held came without an epoch or a digest: fetch
+                // it in full once, so later changes can come as deltas.
+                self.refetch.store(true, Ordering::Relaxed);
                 true
             }
             Err(JoinError::Older(_)) => false,
@@ -568,7 +571,11 @@ impl ControlPlane {
         loop {
             state.changed().await;
             let state = state.clone();
-            let _ = tokio::task::spawn_blocking(move || state.flush(limits::spend)).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                state.touch();
+                state.flush(limits::spend)
+            })
+            .await;
             tokio::time::sleep(SAVE_INTERVAL).await;
         }
     }
@@ -750,7 +757,11 @@ impl ControlPlane {
     /// old.
     pub async fn save(&self) {
         if let Some(state) = self.state.clone() {
-            let _ = tokio::task::spawn_blocking(move || state.flush(limits::spend)).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                state.touch();
+                state.flush(limits::spend)
+            })
+            .await;
         }
     }
 

@@ -461,7 +461,9 @@ pub fn require_spend() {
     SPEND_REQUIRED.store(true, Ordering::Relaxed);
 }
 
-/// The control plane's spend per budgeted scope, to save; None before any is
+/// Spend per budgeted scope, to save: the control plane's figure plus what
+/// this gateway has counted since and not yet had confirmed, so a restart
+/// while the control plane is away does not forget it. None before any is
 /// known.
 pub fn spend() -> Option<HashMap<String, f64>> {
     if !SPEND_KNOWN.load(Ordering::Relaxed) {
@@ -472,7 +474,7 @@ pub fn spend() -> Option<HashMap<String, f64>> {
         reg.values()
             .filter_map(|s| {
                 let i = s.inner.lock().unwrap();
-                i.budget.map(|_| (s.name.clone(), i.g_spend))
+                i.budget.map(|_| (s.name.clone(), i.g_spend + i.spend_pending + i.spend_inflight))
             })
             .collect(),
     )
@@ -582,6 +584,22 @@ pub(crate) mod tests {
         c.spend.insert("key:t-restore-spent".into(), 0.1);
         apply(&[], &c);
         assert!(check(&spent).is_ok());
+    }
+
+    // What the gateway counted itself is saved with the control plane's
+    // figure: a restart while the control plane is away must not forget it.
+    #[test]
+    fn saved_spend_includes_what_is_not_yet_confirmed() {
+        let _serial = SERIAL.lock().unwrap();
+        let k = key("t-save-local", Some(1.0), None);
+        restore(&HashMap::from([("key:t-save-local".into(), 0.25)]));
+        record(&k, 10, 0.5);
+        assert_eq!(spend().unwrap()["key:t-save-local"], 0.75);
+        let _ = freeze(); // a sync in flight still counts
+        assert_eq!(spend().unwrap()["key:t-save-local"], 0.75);
+        restore(&spend().unwrap());
+        record(&k, 10, 0.3);
+        assert_eq!(check(&k).unwrap_err().code, "budget_exceeded");
     }
 
     #[test]
