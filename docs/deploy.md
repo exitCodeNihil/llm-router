@@ -11,7 +11,7 @@ git clone https://github.com/exitcodenihil/llm-router && cd llm-router
 
 This writes `deploy/.env` once, starts Postgres and the gateway, and prints the console URL. **Back
 up `deploy/.env`**: `LLMR_ENCRYPTION_KEY` protects stored provider keys, and a different key makes
-them unreadable. Use `--build` to build from source, and `LLMR_VERSION=0.1.0` in `deploy/.env` to
+them unreadable. Use `--build` to build from source, and `LLMR_VERSION=0.4.0` in `deploy/.env` to
 pin a release. Only 8080 (console and API) and 8081 (workspace IDEs) are published, plus 3001 on
 loopback if you turn on [Langfuse](#langfuse-in-compose). For [workspaces](workspaces.md), run
 `./deploy/quickstart.sh --workspaces`.
@@ -182,7 +182,7 @@ A gateway logs why it refuses them, and requests to those providers fail with th
 | `LLMR_JOIN_TOKEN` | The group's join token |
 | `LLMR_LISTEN` | Listen address, default `0.0.0.0:8080` |
 | `LLMR_WORKERS` | Worker threads; default: the container's CPU allowance |
-| `LLMR_MAX_IN_FLIGHT` | Above this many requests in flight, answer 503 with `Retry-After` (default 10000) |
+| `LLMR_MAX_IN_FLIGHT` | Above this many requests in flight, answer `/v1` with 503 and `Retry-After` (default 10000). Probes and `/metrics` are always answered |
 | `LLMR_SHUTDOWN_TIMEOUT` | Seconds to finish requests on SIGTERM before exiting (default 30). Idle keep-alive connections close at once and the rest after their current request, so clients reconnect to another gateway |
 | `LLMR_GATEWAY_NAME` | Name on the Gateways page (default: the hostname) |
 | `LLMR_MAX_CONFIG_AGE` | Seconds a gateway serves after the control plane last confirmed its config; unset or 0: no limit. At least 120 |

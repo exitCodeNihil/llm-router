@@ -140,8 +140,9 @@ for a pause gets one retry at a time until it recovers.
 
 Export is best effort. Queues live in the control plane's memory and nothing is written to
 Postgres, so prompts never rest there. On shutdown the control plane keeps delivering what is
-queued for up to 20 seconds (`LLMR_TELEMETRY_DRAIN`); what is left after that, or queued when a
-process is killed, is lost. Usage, spend and the Requests page do not depend on export.
+queued, as many batches at a time as before, for up to 20 seconds (`LLMR_TELEMETRY_DRAIN`); what is
+left after that is counted in a warning in the log and lost, as is what is queued when a process is
+killed. Usage, spend and the Requests page do not depend on export.
 
 - A destination that is down or answers 429, 502, 503 or 504 is retried with backoff (honouring
   `Retry-After`) for up to 10 minutes, then the spans are dropped as expired.

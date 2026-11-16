@@ -1,6 +1,7 @@
 # Contributing
 
-Bug reports and pull requests are welcome. For anything bigger than a fix, open an issue first.
+Bug reports, feature requests and pull requests are welcome. [Open an issue](https://github.com/exitCodeNihil/llm-router/issues/new/choose)
+with the bug or feature form; for anything bigger than a fix, open an issue before the pull request.
 
 ## Development
 

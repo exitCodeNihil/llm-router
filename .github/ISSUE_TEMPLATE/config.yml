@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/exitCodeNihil/llm-router/security/advisories/new
+    about: Report vulnerabilities privately, as described in SECURITY.md. Do not open a public issue.
+  - name: Documentation
+    url: https://github.com/exitCodeNihil/llm-router#docs
+    about: Providers, clients, access, deploying, observability and monitoring.
