@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/exitCodeNihil/llm-router/compare/v0.3.1...v0.4.0) (2026-11-16)
+
+
+### ⚠ BREAKING CHANGES
+
+* usage retention, audit log, gateway resilience, ops hardening ([#23](https://github.com/exitCodeNihil/llm-router/issues/23))
+
+### Features
+
+* usage retention, audit log, gateway resilience, ops hardening ([#23](https://github.com/exitCodeNihil/llm-router/issues/23)) ([af32838](https://github.com/exitCodeNihil/llm-router/commit/af328389ef1ad996d3ecd4995374028833babbe9))
+
 ## [0.3.1](https://github.com/exitCodeNihil/llm-router/compare/v0.3.0...v0.3.1) (2026-11-10)
 
 
