@@ -50,11 +50,13 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 	// database that will not tell goes without; a query that fails for now
 	// fails the build, since an epoch with a part missing would
 	// read to gateways as another database.
-	var sysid, timeline int64
+	var sysid, timeline *int64
 	switch err := b.Pool.QueryRow(ctx, `SELECT (pg_control_system()).system_identifier,
 		(pg_control_checkpoint()).timeline_id`).Scan(&sysid, &timeline); {
 	case err == nil:
-		s.Epoch = strconv.FormatInt(sysid, 36) + "." + strconv.FormatInt(timeline, 36)
+		if sysid != nil && timeline != nil { // an engine without a control file may answer NULL
+			s.Epoch = strconv.FormatInt(*sysid, 36) + "." + strconv.FormatInt(*timeline, 36)
+		}
 	case unreachable(err):
 		return nil, fmt.Errorf("config epoch: %w", err)
 	}

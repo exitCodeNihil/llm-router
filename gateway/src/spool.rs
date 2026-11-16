@@ -30,6 +30,9 @@ pub struct Spool {
     dir: PathBuf,
     max_bytes: u64,
     inner: Mutex<Inner>,
+    /// One `seal` at a time: two that overlap would write the same events
+    /// twice and could set `sealed` back.
+    sealing: tokio::sync::Mutex<()>,
 }
 
 #[derive(Default)]
@@ -77,12 +80,13 @@ impl Spool {
         }
         usage::number_above(inner.sealed);
         inner.count();
-        Ok(Spool { dir: dir.to_path_buf(), max_bytes, inner: Mutex::new(inner) })
+        Ok(Spool { dir: dir.to_path_buf(), max_bytes, inner: Mutex::new(inner), sealing: Default::default() })
     }
 
     /// Write the events queued since the last call to one file. When the
     /// spool is full they are counted and left to memory alone.
     pub async fn seal(self: &Arc<Self>) {
+        let _one = self.sealing.lock().await;
         let mut after = self.inner.lock().unwrap().sealed;
         let mut records = MAGIC.to_vec();
         let mut span: Option<(u64, u64, usize)> = None;
