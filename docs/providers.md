@@ -66,8 +66,6 @@ The response headers `X-Llmr-Provider` and `X-Llmr-Upstream` show which backend 
   `host.containers.internal` (podman) or `host.docker.internal` (Docker Desktop).
 - Editing a provider's Base URL or auth mode clears its stored key, so enter it again. Changing
   `LLMR_ENCRYPTION_KEY` makes stored keys unreadable and those providers drop out of routing.
-- A direct Anthropic API key can't be added in the console. Use Claude on Vertex or Foundry,
-  OpenRouter, or the [subscription pass-through](clients.md#on-your-claudeai-subscription).
 
 ## Anthropic
 

@@ -22,6 +22,7 @@ import base64, json, os, shlex, subprocess, sys, time, urllib.error, urllib.requ
 # $/MTok: input, 5m cache write, 1h cache write, cache read, output.
 # platform.claude.com/docs/en/about-claude/pricing
 PUBLISHED = {
+    "claude-fable-5-2": (8, 10, 16, 0.2, 40),
     "claude-fable-5-1": (10, 12.5, 20, 0.25, 50),
     "claude-fable-5": (10, 12.5, 20, 1, 50),
     "claude-opus-5-5": (4, 5, 8, 0.2, 20),
