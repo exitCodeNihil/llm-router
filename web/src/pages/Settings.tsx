@@ -8,6 +8,7 @@ import { Button } from "@astryxdesign/core/Button";
 import { IconButton } from "@astryxdesign/core/IconButton";
 import { Icon } from "@astryxdesign/core/Icon";
 import { Badge } from "@astryxdesign/core/Badge";
+import { Banner } from "@astryxdesign/core/Banner";
 import { Code } from "@astryxdesign/core/Code";
 import { Switch } from "@astryxdesign/core/Switch";
 import { Divider } from "@astryxdesign/core/Divider";
@@ -49,6 +50,7 @@ function SsoCard() {
   const [redirect, setRedirect] = useState("");
   const [autoCreate, setAutoCreate] = useState(false);
   const configured = sso.data?.configured;
+  const secretError = sso.data?.secret_error;
 
   // Hydrate once settings load. client_secret always comes back empty.
   useEffect(() => {
@@ -102,13 +104,16 @@ function SsoCard() {
             isRequired
           />
           <TextInput label="Client ID" value={clientId} onChange={setClientId} isRequired />
+          {secretError && <Banner status="error" title="Sign-in with SSO is not working" description={secretError} />}
           <TextInput
             label="Client secret"
             type="password"
             value={clientSecret}
             onChange={setClientSecret}
-            placeholder={configured ? "••••••••" : "Paste the client secret"}
-            description={configured ? "A secret is stored. Leave blank to keep it." : undefined}
+            placeholder={configured && !secretError ? "••••••••" : "Paste the client secret"}
+            description={
+              configured && !secretError ? "A secret is stored, encrypted. Leave blank to keep it." : undefined
+            }
           />
           <TextInput
             label="Redirect URL"

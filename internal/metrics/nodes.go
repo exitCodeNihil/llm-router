@@ -7,9 +7,10 @@ import (
 )
 
 // NodeMetric is the latest self-reported ops snapshot of one gateway.
-// ponytail: in-memory only, keyed by instance id, repopulated by syncs after a
-// control-plane restart (no per-sync DB write). Each control-plane replica
-// knows the gateways that sync with it.
+// In memory only, keyed by instance id, repopulated by syncs after a
+// control-plane restart (no per-sync DB write). With several control planes,
+// each learns of the gateways syncing with the others from what those publish
+// (SetRemote).
 type NodeMetric struct {
 	Name, Group   string // the instance's and its group's names
 	Version       string
@@ -57,8 +58,10 @@ type Sample struct {
 
 type node struct {
 	NodeMetric
-	hist []Sample // ring of HistoryLen at most
-	head int      // the oldest sample's index once the ring is full
+	// remote: its latest sync went to another control plane, which told us.
+	remote bool
+	hist   []Sample // ring of HistoryLen at most
+	head   int      // the oldest sample's index once the ring is full
 }
 
 func (n *node) record(nm NodeMetric) {
@@ -113,7 +116,7 @@ func (s *NodeStore) Set(id string, nm NodeMetric) {
 		n = &node{}
 		s.m[id] = n
 	}
-	n.NodeMetric = nm
+	n.NodeMetric, n.remote = nm, false
 	n.record(nm)
 	if now.Sub(s.pruned) > time.Minute {
 		s.pruned = now
@@ -180,7 +183,7 @@ func (s *NodeStore) current() []NodeMetric {
 	s.mu.Lock()
 	for _, n := range s.m {
 		age := now.Sub(n.Updated)
-		if age > staleAfter || (n.Leaving && age > leftAfter) {
+		if n.remote || age > staleAfter || (n.Leaving && age > leftAfter) {
 			continue
 		}
 		k := gk{n.Group, n.Name}

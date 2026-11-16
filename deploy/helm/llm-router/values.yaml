@@ -3,13 +3,18 @@ image:
   tag: ""            # defaults to appVersion
   pullPolicy: IfNotPresent
 
-# The control plane keeps rate limits, budget counters, live metrics and
-# telemetry export queues in memory, so it runs as one replica. Scale request
-# traffic with gateways (gateway.replicas), which share those limits through
-# it. More than one replica is refused unless allowMultipleReplicas is set,
-# and then each replica enforces limits on its own traffic only.
+# Control planes. One is enough for most installs: gateways (gateway.replicas)
+# carry the traffic and keep serving while it restarts. Run two or more so the
+# console, the API and config changes stay up through a node failure; they
+# share rate limits and budgets through Postgres to within a second or two.
+# Each needs its own Postgres connections (database.maxConns + consoleMaxConns).
 replicas: 1
-allowMultipleReplicas: false
+# false replaces every pod at once on an upgrade (a short gap for the console
+# and for /v1 on the control plane; gateways keep serving). Needed whenever a
+# release changes the database in a way the release before it can't run on,
+# as 0.4 does. true replaces pods one at a time: for restarts, configuration
+# changes and upgrades whose notes say they allow it.
+rollingUpdate: false
 
 # Proxies in front of the console (addresses or CIDR ranges, e.g. your ingress
 # controller's pod range) whose X-Forwarded-For header names the client. Sign-in
@@ -17,11 +22,50 @@ allowMultipleReplicas: false
 # ingress shares one limit. Each proxy must append to X-Forwarded-For.
 trustedProxies: []
 
+# Store each request's client address with its usage, for admins on the
+# Requests page (LLMR_USAGE_CLIENT_IP, on llm-router and the gateways). Off by
+# default: the address is personal data. Behind a load balancer or ingress the
+# address is only right with trustedProxies set.
+usageClientIP: false
+
 databaseUrl: ""      # postgres://user:pass@host:5432/db — or use existingSecret
 adminToken: ""
 encryptionKey: ""
-# name of an existing Secret with keys: database-url, admin-token, encryption-key
+# Rotating encryptionKey (docs/deploy.md, "Rotating the encryption key"):
+# keys still read and verified but never written with.
+encryptionKeysOld: []
+encryptionKeyNext: ""
+# name of an existing Secret with keys: database-url, admin-token, encryption-key,
+# and optionally encryption-keys-old (comma-separated) and encryption-key-next
 existingSecret: ""
+
+# debug, info, warn or error; and text or json (one object per line).
+logLevel: info
+logFormat: text
+
+# How many 5-second checks the first start may take before Kubernetes restarts
+# the pod. Migrations run before llm-router listens; raise this for the first
+# start of a release on a very large database (120 = 10 minutes).
+startupFailureThreshold: 120
+
+# How long usage is kept, in whole months before the current one. 0 keeps it
+# for ever. usageMonths is for individual requests (the Requests page), at
+# least 2; rollupMonths is for the daily totals behind the dashboards and
+# per-day spend, at least 3. Hourly totals are always kept three months.
+# auditMonths is for the audit log of administrative actions.
+retention:
+  usageMonths: 0
+  rollupMonths: 0
+  auditMonths: 0
+
+# Postgres connections. llm-router keeps two pools: one for usage writes,
+# gateway sync and config, one for console reads. Their sum must fit under the
+# database's max_connections. consoleTimeout cancels a console query that runs
+# longer (the console then answers 504).
+database:
+  maxConns: 16
+  consoleMaxConns: 8
+  consoleTimeout: 30s
 
 # Workspaces (docs/workspaces.md). Adds RBAC for pods, exec, PVCs and secrets
 # in this release's namespace, plus the IDE listener on 8081 served from its own origin.
@@ -63,6 +107,23 @@ gateway:
   joinToken: ""
   existingSecret: ""
   controlPlaneUrl: ""  # default: this release's llm-router service
+  logLevel: info     # debug, info, warn or error
+  logFormat: text    # text or json
+  # Seconds a gateway keeps serving after the control plane last confirmed its
+  # config (LLMR_MAX_CONFIG_AGE, at least 120). Empty: for as long as the
+  # control plane is away.
+  maxConfigAge: ""
+  # Keep the last config and spend, encrypted with a key derived from the join
+  # token, and usage the control plane has not acknowledged yet, in an emptyDir
+  # (LLMR_STATE_DIR), so a restarted container serves before it reaches the
+  # control plane and hands over the usage it held. A new pod starts without it.
+  # sizeLimit is twice the usage spool's cap (LLMR_SPOOL_MAX_BYTES, 256 MiB by
+  # default): a pod that goes over its emptyDir limit is evicted, so the config
+  # and files being written need room beside a full spool. Raise the cap
+  # through extraEnv, and this with it.
+  state:
+    enabled: false
+    sizeLimit: 512Mi
   serviceAccount:
     create: true
     name: ""         # default: <release>-llm-router-gateway
@@ -116,6 +177,54 @@ metrics:
     gatewayMemoryRatio: 0.85   # of the gateway's memory limit
     errorRatio: 0.05           # 5xx share of /v1 requests
     notSyncingSeconds: 30
+
+# Security settings for the llm-router and gateway pods and containers. Both
+# images run as a non-root user and write only to mounted volumes. Set either
+# to {} to leave it to the cluster (OpenShift assigns its own user ids).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# Room for file uploads in transit (workspace files and templates).
+tmpSizeLimit: 64Mi
+
+# On a restart: keep accepting for preStopSleepSeconds while the pod leaves the
+# Service (0 turns this off; left out before Kubernetes 1.30), then finish
+# requests and flush usage and telemetry.
+preStopSleepSeconds: 5
+terminationGracePeriodSeconds: 45
+
+# PodDisruptionBudgets, so a node drain takes one pod at a time: for gateways
+# when there is more than one, for llm-router only when replicas > 1 (with one
+# replica a budget would block the drain).
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# NetworkPolicies (your cluster's network plugin must enforce them). Ingress:
+# llm-router's port 8080 stays open to the namespace's pods and to `from`
+# (apps, the ingress controller and workspaces call it); the metrics port is
+# open to `metricsFrom`; gateways accept `from` on 8080. An empty list allows
+# every source; a gateway serves metrics on its request port, so metricsFrom
+# narrows it only together with `from`. Outgoing traffic is not restricted unless egress.enabled, which
+# then allows DNS, traffic inside the namespace and the rules you list
+# (docs/deploy.md names what llm-router needs to reach).
+networkPolicy:
+  enabled: false
+  from: []           # e.g. [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress-nginx}}}]
+  metricsFrom: []    # e.g. [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}}]
+  egress:
+    enabled: false
+    rules: []        # NetworkPolicy egress rules, e.g. [{ports: [{port: 443}, {port: 5432}]}]
 
 # Extra env and volumes for the llm-router container.
 extraEnv: []

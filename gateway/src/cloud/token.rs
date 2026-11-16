@@ -242,7 +242,7 @@ async fn refresh<S: TokenSource>(inner: &Inner<S>, r: &mut Refresh) -> Result<He
             }
         }
         Err(FetchError { public: message, detail }) => {
-            eprintln!("{} failed: {detail}", inner.source.what());
+            crate::log_warn!("{} failed: {detail}", inner.source.what());
             r.failures += 1;
             r.last_err = Some(message.clone());
             inner.next_try.store(millis(now + backoff(r.failures)), Ordering::Relaxed);

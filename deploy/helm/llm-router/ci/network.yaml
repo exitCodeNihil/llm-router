@@ -1,0 +1,24 @@
+databaseUrl: postgres://u:p@db:5432/llmr
+encryptionKey: 0123456789abcdef0123456789abcdef
+gateway:
+  enabled: true
+  joinToken: llmr_gw_test
+workspaces:
+  enabled: true
+  ideOrigin: https://ide.example.com
+networkPolicy:
+  enabled: true
+  from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+  metricsFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+  egress:
+    enabled: true
+    rules:
+      - ports:
+          - port: 443
+          - port: 5432

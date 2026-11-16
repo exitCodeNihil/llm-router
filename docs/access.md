@@ -7,6 +7,23 @@
 full key is shown once; only a hash is stored. Send it as `Authorization: Bearer llmr_…`,
 `x-api-key`, or `X-Llmr-Key` (the form the [subscription pass-through](clients.md) needs).
 
+The console pages for users, keys and teams (and a team's members) load 50 rows at a time and search
+on the server, so they stay fast with 100,000 of each. The same lists take `limit` (1 to 200), `after`
+and `q` on `GET /api/users`, `/api/keys`, `/api/teams` and `/api/teams/{id}/members`, and then answer
+`{"items": [...], "next": "<cursor>"}`: pass `next` as `after` for the following page, and an empty
+`next` ends the list. `q` is a case-insensitive substring match (email and name; key name, prefix and
+owner; team name). Without `limit` they answer the full array as before, and `q` or `after` without
+`limit` is a 400. Paged keys also carry `user_email` and `team_name`. `POST /api/lookup` turns ids into
+names: `{"users": [...], "keys": [...], "teams": [...]}`, at most 100 of each kind.
+
+**Rotate** (the arrow on a key's row, or `POST /api/keys/{id}/rotate` with `{"grace_hours": N}`, 0
+to 720, default 24) gives a key a new secret, shown once. The key keeps its id, owner, limits and
+usage. The old secret keeps working until the grace period ends, so clients can move over without an
+outage, and the row says until when. Rotating again during a grace period starts another one; the
+older secret still stops at its own time. **Now** (grace 0) stops the old secret, and any from earlier
+rotations, at once: use it when a key has leaked. An old secret never outlives the key's own expiry,
+and a disabled key serves none. Who may rotate a key is who may edit it.
+
 ## Who may call which model
 
 **Allowed models** can be set on a team, a user and a key. Empty means everything.
@@ -34,12 +51,51 @@ with `budget_exceeded` or `rate_limit_exceeded`. Members can't change their own 
 across llm-router and every [gateway](deploy.md#gateways): gateways sync their counts every 2 seconds,
 and tokens are counted after the response, so a burst can overshoot a little.
 
+Cost is only known when a response ends, so while a request runs it holds its expected cost against
+its budgets: about a quarter of its text in input tokens, and twice the model's usual output (or
+`max_tokens`, if that is less). A request that would take a budget past its limit together with
+the ones already running gets `429` with `budget_reserved` and `Retry-After: 1`: the budget is not
+spent yet, and the request may pass once the others finish. A request with nothing else running on
+its budgets is never refused this way. The hold is kept by the process that admitted the request,
+so requests through different gateways can still overshoot by what they admit within a sync.
+
 ## Sign-in and SSO
 
 Create the first admin on the setup screen, or sign in with `LLMR_ADMIN_TOKEN`. For SSO, fill in
 **Settings → OIDC provider**: Issuer URL, Client ID, Client secret and Redirect URL
 (`https://<gateway>/auth/callback`). Any OIDC provider works (Entra ID, Google, Okta, Zitadel,
 Keycloak). **Auto-create users** provisions people on their first sign-in.
+
+The client secret is stored encrypted with `LLMR_ENCRYPTION_KEY` and never shown again. If that key
+changes, the secret can no longer be read: SSO sign-in stops, the error is logged, and the settings
+page asks for the secret again.
+
+Sign-in uses the authorization code flow with PKCE (S256), a nonce checked against the ID token, and a
+state value; all three are kept in short-lived HttpOnly cookies and cleared by the callback.
+
+Console sessions last 12 hours. **Sign out** ends that session on the server, not just in the
+browser: a copied cookie stops working too. **Sign out everywhere** ends every session of an account:
+on **Account settings** for yourself (`POST /api/me/sign-out`), and on a row of **Users** for an admin
+(`POST /api/users/{id}/sign-out`). It also happens on its own when a password is changed (your own
+session carries on; an admin's reset signs the user out) and when a user is disabled, so enabling the
+account again does not bring old sessions back. API keys are not affected. A workspace IDE that is
+already open stays connected until it is closed or reloaded: revocation applies to each new request,
+not to a connection already open.
+
+## Deleting and erasing users
+
+Deleting a user removes the account, its keys, team memberships, chats and workspaces. Its email,
+and the names of its keys, are kept as labels, so the Dashboard, Analytics and Requests still say
+whose usage it was: "ana@example.com (deleted)". The same goes for deleted keys and teams. Deleted
+users are listed under **Users → Deleted users**. The email is free to use for a new account.
+
+Erasing removes the person's personal data as well (**Erase** on a deleted user, or **Also erase
+this person's data** when deleting; `POST /api/users/{id}/erase`). It replaces the kept email and
+key names with "erased", removes the email from the audit log (as actor, and from the recorded
+detail of any change made to that user), takes the user off the workspaces allow-list, and makes
+gateways drop the hash of their email. Usage rows keep the user's id, which then names no one.
+Erase cannot reach application logs, database backups, or traces already exported to telemetry
+destinations: the response lists these, and any workspace volume the runtime could not remove.
 
 ## Cloud identity tokens
 
@@ -76,3 +132,28 @@ gateway can't create users on its own. The control plane must therefore reach th
 `/.well-known/openid-configuration` and `jwks_uri`): while it can't, new people's first requests
 fail, the gateway asks again a few seconds later, and nobody is refused for it. To map tokens to
 users, gateways get every user they serve and a hash of each email address, not the address.
+
+## Audit log
+
+Every change made through the console or the management API is recorded: who made it (the user,
+or the admin token), the action, the record it acted on, the outcome (the HTTP status), the client
+address, and which settings changed. Sign-ins, failed sign-ins, SSO sign-ins, sign-outs and the
+first-admin setup are recorded too. Refused attempts are recorded as well as successful ones: a
+member calling an admin route, a wrong admin token, a request with no credentials.
+
+For settings that are not secret, such as budgets, rate limits, roles, allowed models, names of
+teams, keys and deployments, the new values are kept. For everything else only the names of the
+fields sent are kept, or nothing. Never recorded: passwords, API keys, client secrets, telemetry
+headers and secrets, join tokens, uploaded files, URLs (they can carry credentials), tags, and any
+email address other than the acting user's own. A failed sign-in keeps no email at all, since the
+address tried is often a typo of someone else's. Reads, chats and the playground are not recorded.
+
+Admins read it on the **Audit log** page, or with `GET /api/audit` (filters: `actor`, `action`,
+`target_type`, `target_id`, `status=ok|err`, `since`, `until`; page with `before=<id>` and
+`limit`). Each event is also written as an `audit` log line, without the detail or any email, for
+shipping to a SIEM.
+
+Rows cannot be updated or deleted: a trigger refuses it. The only exception is retention:
+`LLMR_AUDIT_RETENTION_MONTHS` (chart: `retention.auditMonths`) deletes rows older than that many
+months. `0`, the default, keeps them for ever. The trigger stops the application and mistakes, not
+someone who owns the database: ship the log lines elsewhere if that matters.

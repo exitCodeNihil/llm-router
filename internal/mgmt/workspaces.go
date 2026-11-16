@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/exitcodenihil/llm-router/internal/auth"
+	"github.com/exitcodenihil/llm-router/internal/store"
 	"github.com/exitcodenihil/llm-router/internal/workspace"
 )
 
@@ -75,7 +76,7 @@ func (m *Server) putWorkspaceSettings(w http.ResponseWriter, r *http.Request) {
 // This is permission to use the feature. Reaching a *particular* workspace is
 // the separate ownership check in loadWorkspace.
 func (m *Server) requireWorkspaceAccess(next http.HandlerFunc) http.Handler {
-	return m.requireAuth(func(w http.ResponseWriter, r *http.Request) {
+	return m.requireAuth(m.audited(func(w http.ResponseWriter, r *http.Request) {
 		c := CallerFrom(r.Context())
 		teams := make([]string, 0, len(c.TeamRoles))
 		for id := range c.TeamRoles {
@@ -86,7 +87,7 @@ func (m *Server) requireWorkspaceAccess(next http.HandlerFunc) http.Handler {
 			return
 		}
 		next(w, r)
-	})
+	}))
 }
 
 type workspaceRow struct {
@@ -182,7 +183,7 @@ func (m *Server) listWorkspaces(w http.ResponseWriter, r *http.Request) {
 		sql = `SELECT ` + cols + ` FROM workspaces w JOIN users u ON u.id = w.user_id ORDER BY w.created_at DESC`
 		args = nil
 	}
-	rows, err := listRows(r.Context(), m.Store.Pool, sql, args...)
+	rows, err := listRows(r.Context(), m.reads(), sql, args...)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -273,13 +274,14 @@ func (m *Server) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id := uuid.New()
+	id := store.NewID()
 	if _, err := m.Store.Pool.Exec(r.Context(),
 		`INSERT INTO workspaces (id, user_id, name, image, template_id) VALUES ($1,$2,$3,$4,$5)`,
 		id, c.UserID, req.Name, req.Image, templateID); err != nil {
 		httpError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	auditTarget(r, "workspace", id.String())
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id.String()})
 }
 
@@ -396,7 +398,7 @@ func (m *Server) mintWorkspaceKey(ctx context.Context, ws *workspaceRow) (string
 		m.Store.Pool.Exec(ctx, `DELETE FROM api_keys WHERE id=$1`, *ws.APIKeyID)
 	}
 	secret, hash, prefix := auth.GenerateKey()
-	keyID := uuid.New()
+	keyID := store.NewID()
 	// A budget is the point of routing the agent through our own gateway. An
 	// uncapped key would make the containment story fiction, so a missing or
 	// zero setting falls back to a real number rather than to "unlimited".

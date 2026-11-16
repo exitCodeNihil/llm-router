@@ -25,7 +25,6 @@ import { DropdownMenu } from "@astryxdesign/core/DropdownMenu";
 import type { RequestFilters, RequestRow, TelemetryDestination } from "../lib/types";
 import {
   useMe,
-  useKeys,
   useRequests,
   useDestinations,
   useUsageByModel,
@@ -33,6 +32,7 @@ import {
 import { compact, dateTime, int, money } from "../lib/format";
 import { Empty, ErrorState, Loading, Page } from "../components/Page";
 import { TagsInput } from "../components/forms";
+import { EntityPicker } from "../components/EntityPicker";
 import { FormDialog } from "../components/dialogs";
 
 type StatusOpt = "all" | "ok" | "err";
@@ -70,6 +70,7 @@ function RequestDetail({
     ["Request id", <Code key="r">{r.request_id}</Code>],
     ["Trace id", r.trace_id ? <Code key="t">{r.trace_id}</Code> : "—"],
     ["Model", <Code key="m">{r.model_name || "—"}</Code>],
+    ...(r.client_ip ? ([["Client address", <Code key="ip">{r.client_ip}</Code>]] as [string, ReactNode][]) : []),
     ["Upstream", r.upstream_name ? `${r.upstream_name}${r.provider_name ? ` · ${r.provider_name}` : ""}` : "—"],
     ["Key", r.key_name ?? "—"],
     ["Status", `${r.status_code}${r.error_code ? ` · ${r.error_code}` : ""}`],
@@ -165,7 +166,6 @@ export default function Requests() {
     [destinations.data],
   );
   const models = useUsageByModel(7);
-  const keys = useKeys();
 
   const allRows = useMemo(() => req.data?.pages.flat() ?? [], [req.data]);
   const rows = useMemo(() => {
@@ -333,13 +333,6 @@ export default function Requests() {
       .filter((m) => m.model_name)
       .map((m) => ({ value: m.model_name, label: m.model_name })),
   ];
-  const keyOptions = [
-    { value: "", label: "All keys" },
-    ...(keys.data ?? []).map((k) => ({
-      value: k.id,
-      label: k.name || k.key_prefix,
-    })),
-  ];
 
   const hasFilters =
     status !== "all" ||
@@ -353,7 +346,11 @@ export default function Requests() {
     <Page
       eyebrow="Overview"
       title="Requests"
-      description="Every request through the gateway, newest first."
+      description={
+        me?.usage_retention_months
+          ? `Every request through the gateway, newest first. Requests are kept for ${me.usage_retention_months} months; totals on the dashboard go back further.`
+          : "Every request through the gateway, newest first."
+      }
       action={
         hasFilters ? (
           <Button
@@ -400,14 +397,14 @@ export default function Requests() {
                   options={modelOptions}
                   hasSearch={modelOptions.length > 8}
                 />
-                <Selector
+                <EntityPicker
+                  kind="key"
                   label="Key"
                   isLabelHidden
+                  size="sm"
                   placeholder="All keys"
                   value={keyId}
                   onChange={setKeyId}
-                  options={keyOptions}
-                  hasSearch={keyOptions.length > 8}
                 />
               </HStack>
             }
@@ -456,6 +453,13 @@ export default function Requests() {
           </VStack>
         </Card>
 
+        {me && !me.is_admin && (
+          // Totals elsewhere cover every team you are in; individual requests
+          // are narrower, so say so rather than let the two seem to disagree.
+          <Text type="supporting" color="secondary">
+            You see your own requests and those of teams you administer.
+          </Text>
+        )}
         <Card padding={0}>
           {req.isLoading ? (
             <Loading />

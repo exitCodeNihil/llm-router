@@ -7,6 +7,8 @@ import (
 	"net/url"
 
 	"github.com/google/uuid"
+
+	"github.com/exitcodenihil/llm-router/internal/store"
 )
 
 var tokenIssuerPatchCols = []string{"issuer_url", "audience", "claim_mapping", "enabled"}
@@ -36,7 +38,7 @@ func (m *Server) createTokenIssuer(w http.ResponseWriter, r *http.Request) {
 	if req.ClaimMapping == nil {
 		req.ClaimMapping = map[string]any{}
 	}
-	id := uuid.New()
+	id := store.NewID()
 	_, err := m.Store.Pool.Exec(r.Context(), `
 		INSERT INTO token_issuers (id, type, issuer_url, audience, claim_mapping)
 		VALUES ($1,$2,$3,$4,$5)`,
@@ -45,6 +47,7 @@ func (m *Server) createTokenIssuer(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	auditTarget(r, "token_issuer", id.String())
 	m.bump(r.Context())
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id.String()})
 }

@@ -4,9 +4,12 @@ package config
 import (
 	"flag"
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -14,6 +17,10 @@ type Config struct {
 	DatabaseURL   string
 	AdminToken    string // bootstrap admin token for mgmt API
 	EncryptionKey string // hex/plain 32-byte key for provider secret encryption
+	// EncryptionKeysOld and EncryptionKeyNext are accepted besides
+	// EncryptionKey but never written with, for a rotation (docs/deploy.md).
+	EncryptionKeysOld []string
+	EncryptionKeyNext string
 
 	// IDEListen/IDEOrigin put the workspace IDE proxy on its own origin so
 	// content rendered by a container is never same-origin with the console.
@@ -30,6 +37,34 @@ type Config struct {
 	// MetricsListen serves /metrics on its own listener instead of the main
 	// one ("off": not at all). Empty = on the main listener, like a gateway.
 	MetricsListen string
+
+	// DBMaxConns and DBConsoleMaxConns size the two Postgres pools: ingest
+	// and sync, and console reads. DBConsoleTimeout is the statement timeout
+	// on console reads. Zero = the store's default.
+	DBMaxConns        int
+	DBConsoleMaxConns int
+	DBConsoleTimeout  time.Duration
+
+	// UsageRetentionMonths and RollupRetentionMonths are how many whole months
+	// of per-request usage, and of daily rollups and per-day spend, are kept.
+	// Zero keeps them for ever.
+	UsageRetentionMonths  int
+	RollupRetentionMonths int
+	// AuditRetentionMonths is how many months of the audit log are kept.
+	// Zero keeps it for ever.
+	AuditRetentionMonths int
+	// UsageClientIP stores each request's client address with its usage.
+	// Off by default: the address is personal data.
+	UsageClientIP bool
+	// TelemetryConcurrency is how many batches each telemetry destination is
+	// sent at once; TelemetryDrain how long a shutdown keeps delivering.
+	TelemetryConcurrency int
+	TelemetryDrain       time.Duration
+
+	// LogLevel is the least severe level logged; LogJSON writes one JSON
+	// object per line instead of text.
+	LogLevel slog.Level
+	LogJSON  bool
 }
 
 func Load(args []string) (*Config, error) {
@@ -51,6 +86,67 @@ func Load(args []string) (*Config, error) {
 	}
 	c.TrustedProxies = trusted
 	c.EncryptionKey = os.Getenv("LLMR_ENCRYPTION_KEY")
+	for _, k := range strings.Split(os.Getenv("LLMR_ENCRYPTION_KEYS_OLD"), ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			c.EncryptionKeysOld = append(c.EncryptionKeysOld, k)
+		}
+	}
+	c.EncryptionKeyNext = strings.TrimSpace(os.Getenv("LLMR_ENCRYPTION_KEY_NEXT"))
+	if c.DBMaxConns, err = envInt("LLMR_DB_MAX_CONNS"); err != nil {
+		return nil, err
+	}
+	if c.DBConsoleMaxConns, err = envInt("LLMR_DB_CONSOLE_MAX_CONNS"); err != nil {
+		return nil, err
+	}
+	switch v := strings.ToLower(envOr("LLMR_LOG_LEVEL", "info")); v {
+	case "debug":
+		c.LogLevel = slog.LevelDebug
+	case "info":
+		c.LogLevel = slog.LevelInfo
+	case "warn":
+		c.LogLevel = slog.LevelWarn
+	case "error":
+		c.LogLevel = slog.LevelError
+	default:
+		return nil, fmt.Errorf("LLMR_LOG_LEVEL must be debug, info, warn or error")
+	}
+	switch v := strings.ToLower(envOr("LLMR_LOG_FORMAT", "text")); v {
+	case "text":
+	case "json":
+		c.LogJSON = true
+	default:
+		return nil, fmt.Errorf("LLMR_LOG_FORMAT must be text or json")
+	}
+	if c.UsageRetentionMonths, err = envInt("LLMR_USAGE_RETENTION_MONTHS"); err != nil {
+		return nil, err
+	}
+	if c.RollupRetentionMonths, err = envInt("LLMR_ROLLUP_RETENTION_MONTHS"); err != nil {
+		return nil, err
+	}
+	if c.AuditRetentionMonths, err = envInt("LLMR_AUDIT_RETENTION_MONTHS"); err != nil {
+		return nil, err
+	}
+	if v := os.Getenv("LLMR_USAGE_CLIENT_IP"); v != "" {
+		if c.UsageClientIP, err = strconv.ParseBool(v); err != nil {
+			return nil, fmt.Errorf("LLMR_USAGE_CLIENT_IP must be true or false")
+		}
+	}
+	c.TelemetryConcurrency, c.TelemetryDrain = 4, 20*time.Second
+	if v := os.Getenv("LLMR_TELEMETRY_CONCURRENCY"); v != "" {
+		if c.TelemetryConcurrency, err = strconv.Atoi(v); err != nil || c.TelemetryConcurrency < 1 || c.TelemetryConcurrency > 16 {
+			return nil, fmt.Errorf("LLMR_TELEMETRY_CONCURRENCY must be 1 to 16")
+		}
+	}
+	if v := os.Getenv("LLMR_TELEMETRY_DRAIN"); v != "" {
+		if c.TelemetryDrain, err = time.ParseDuration(v); err != nil || c.TelemetryDrain <= 0 || c.TelemetryDrain > 5*time.Minute {
+			return nil, fmt.Errorf("LLMR_TELEMETRY_DRAIN must be a duration up to 5m, like 20s")
+		}
+	}
+	if v := os.Getenv("LLMR_DB_CONSOLE_TIMEOUT"); v != "" {
+		if c.DBConsoleTimeout, err = time.ParseDuration(v); err != nil || c.DBConsoleTimeout <= 0 {
+			return nil, fmt.Errorf("LLMR_DB_CONSOLE_TIMEOUT must be a duration like 30s")
+		}
+	}
 
 	if c.DatabaseURL == "" {
 		return nil, fmt.Errorf("LLMR_DATABASE_URL is required")
@@ -58,6 +154,9 @@ func Load(args []string) (*Config, error) {
 	// The encryption key also signs console sessions: an empty or
 	// placeholder value lets anyone mint a session for any user id.
 	if err := checkSecret("LLMR_ENCRYPTION_KEY", c.EncryptionKey, true, 16); err != nil {
+		return nil, err
+	}
+	if err := c.checkOtherKeys(); err != nil {
 		return nil, err
 	}
 	if err := checkSecret("LLMR_ADMIN_TOKEN", c.AdminToken, false, 12); err != nil {
@@ -71,6 +170,39 @@ func Load(args []string) (*Config, error) {
 	}
 	c.IDEOrigin = strings.TrimSuffix(c.IDEOrigin, "/")
 	return c, nil
+}
+
+// OtherKeys are the keys accepted besides EncryptionKey: the old ones, then
+// the next.
+func (c *Config) OtherKeys() []string {
+	keys := append([]string{}, c.EncryptionKeysOld...)
+	if c.EncryptionKeyNext != "" {
+		keys = append(keys, c.EncryptionKeyNext)
+	}
+	return keys
+}
+
+// checkOtherKeys holds the rotation keys to the current key's standard, and
+// refuses a repeat: a key listed twice is a rotation step done wrong.
+func (c *Config) checkOtherKeys() error {
+	seen := map[string]string{c.EncryptionKey: "LLMR_ENCRYPTION_KEY"}
+	names := make([]string, 0, len(c.EncryptionKeysOld)+1)
+	for range c.EncryptionKeysOld {
+		names = append(names, "LLMR_ENCRYPTION_KEYS_OLD")
+	}
+	if c.EncryptionKeyNext != "" {
+		names = append(names, "LLMR_ENCRYPTION_KEY_NEXT")
+	}
+	for i, k := range c.OtherKeys() {
+		if err := checkSecret(names[i], k, true, 16); err != nil {
+			return err
+		}
+		if prev, ok := seen[k]; ok {
+			return fmt.Errorf("%s repeats a key already in %s", names[i], prev)
+		}
+		seen[k] = names[i]
+	}
+	return nil
 }
 
 // checkSecret refuses the values that ship in examples and anything too short
@@ -97,6 +229,19 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envInt reads a whole number, zero or more; unset is 0.
+func envInt(key string) (int, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("%s must be a whole number, 0 or more", key)
+	}
+	return n, nil
 }
 
 // parsePrefixes reads a comma-separated list of addresses or CIDR ranges.

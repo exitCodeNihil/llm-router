@@ -12,11 +12,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/exitcodenihil/llm-router/internal/auth"
+	"github.com/exitcodenihil/llm-router/internal/console"
 	"github.com/exitcodenihil/llm-router/internal/provider"
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
 	"github.com/exitcodenihil/llm-router/internal/usage"
@@ -28,6 +30,10 @@ type LimitChecker interface {
 	Check(id *auth.Identity, s *snapshot.Snapshot) (bool, int, string, string)
 	// RecordUsage feeds TPM buckets and budget deltas after a request completes.
 	RecordUsage(id *auth.Identity, tokens int, costUSD float64)
+	// Reserve holds a request's expected cost against its budgets until
+	// release is called; ok false means they are taken up by requests in
+	// progress.
+	Reserve(id *auth.Identity, usd float64) (release func(), ok bool, msg string)
 }
 
 // CloudTokenValidator is implemented by the auth package for Entra/GCP inbound
@@ -39,6 +45,27 @@ type Server struct {
 	Usage     usage.Writer
 	Limits    LimitChecker
 	CloudAuth CloudTokenValidator
+	outputs   outputStats // what requests usually produce, for budget reservations
+	// RecordClientIP stores each request's client address with its usage
+	// (LLMR_USAGE_CLIENT_IP); TrustedProxies name the proxies whose
+	// X-Forwarded-For is believed.
+	RecordClientIP bool
+	TrustedProxies []netip.Prefix
+}
+
+// clientIP is the address to store with r's usage: "" unless RecordClientIP.
+func (g *Server) clientIP(r *http.Request) string {
+	if !g.RecordClientIP {
+		return ""
+	}
+	// ClientIP falls back to RemoteAddr's text, which inet may refuse (a
+	// unix socket), and with it the whole usage row.
+	ip := console.ClientIP(r, g.TrustedProxies)
+	// ... or a link-local address with a zone, which ParseAddr accepts.
+	if a, err := netip.ParseAddr(ip); err != nil || a.Zone() != "" {
+		return ""
+	}
+	return ip
 }
 
 type ctxKey int
@@ -107,6 +134,7 @@ func (g *Server) authenticate(next http.Handler) http.Handler {
 		}
 
 		tr := newTrace(w, r)
+		tr.ClientIP = g.clientIP(r)
 		if g.Limits != nil {
 			if ok, status, code, msg := g.Limits.Check(id, snap); !ok {
 				writeLimitError(w, status, code, msg)
@@ -147,7 +175,9 @@ func (g *Server) ServeAuthed(w http.ResponseWriter, r *http.Request, id *auth.Id
 			return
 		}
 	}
-	ctx := withTrace(context.WithValue(r.Context(), identityKey, id), newTrace(w, r))
+	tr := newTrace(w, r)
+	tr.ClientIP = g.clientIP(r)
+	ctx := withTrace(context.WithValue(r.Context(), identityKey, id), tr)
 	g.handleProxy(w, r.WithContext(ctx))
 }
 
@@ -198,7 +228,13 @@ func Logging(next http.Handler) http.Handler {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(sw, r)
-		slog.Info("http", "method", r.Method, "path", r.URL.Path, "status", sw.status,
+		// Probes, scrapes and each gateway's sync every two seconds would
+		// drown the rest: they are logged at debug.
+		level := slog.LevelInfo
+		if p := r.URL.Path; strings.HasPrefix(p, "/gw/v1/") || p == "/healthz" || p == "/readyz" || p == "/metrics" {
+			level = slog.LevelDebug
+		}
+		slog.Log(r.Context(), level, "http", "method", r.Method, "path", r.URL.Path, "status", sw.status,
 			"dur_ms", time.Since(start).Milliseconds())
 	})
 }

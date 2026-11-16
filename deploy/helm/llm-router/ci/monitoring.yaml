@@ -1,0 +1,12 @@
+databaseUrl: postgres://u:p@db:5432/llmr
+encryptionKey: 0123456789abcdef0123456789abcdef
+gateway:
+  enabled: true
+  joinToken: llmr_gw_test
+metrics:
+  podMonitor:
+    enabled: true
+  prometheusRule:
+    enabled: true
+anthropicIdentity:
+  enabled: true

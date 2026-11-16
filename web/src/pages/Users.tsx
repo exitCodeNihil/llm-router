@@ -1,14 +1,15 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Card } from "@astryxdesign/core/Card";
 import { VisuallyHidden } from "@astryxdesign/core/VisuallyHidden";
 import { HStack, VStack } from "@astryxdesign/core/Stack";
 import { Grid } from "@astryxdesign/core/Grid";
-import { Text } from "@astryxdesign/core/Text";
+import { Heading, Text } from "@astryxdesign/core/Text";
 import { Button } from "@astryxdesign/core/Button";
 import { IconButton } from "@astryxdesign/core/IconButton";
 import { Icon } from "@astryxdesign/core/Icon";
 import { Badge } from "@astryxdesign/core/Badge";
 import { Switch } from "@astryxdesign/core/Switch";
+import { CheckboxInput } from "@astryxdesign/core/CheckboxInput";
 import { Table, pixel, proportional } from "@astryxdesign/core/Table";
 import type { TableColumn } from "@astryxdesign/core/Table";
 import { TextInput } from "@astryxdesign/core/TextInput";
@@ -16,13 +17,16 @@ import { Selector } from "@astryxdesign/core/Selector";
 import { Timestamp } from "@astryxdesign/core/Timestamp";
 import { useToast } from "@astryxdesign/core/Toast";
 
-import type { User } from "../lib/types";
+import type { DeletedUser, User } from "../lib/types";
 import {
   useCreateUser,
   useDeleteUser,
+  useDeletedUsers,
+  useEraseUser,
   useSetUserPassword,
+  useSignOutUser,
   useUpdateUser,
-  useUsers,
+  useUsersPage,
 } from "../lib/hooks";
 import { budgetLabel } from "../lib/format";
 import { Empty, ErrorState, Loading, Page } from "../components/Page";
@@ -38,8 +42,8 @@ import {
   limitsPayload,
   type LimitsState,
 } from "../components/forms";
-import { IconEdit, IconPlus, IconTrash } from "../components/icons";
-import { SearchBox, useTableTools } from "../components/tables";
+import { IconEdit, IconLogout, IconPlus, IconTrash } from "../components/icons";
+import { LoadMore, SearchBox, useServerSearch } from "../components/tables";
 
 function UserForm({
   editing,
@@ -155,7 +159,7 @@ function UserForm({
           }
           description={
             editing
-              ? "Sets a new password for this user; they are not signed out."
+              ? "Sets a new password for this user and signs them out everywhere."
               : "Leave blank if they will sign in with SSO. An admin can set one later from Edit."
           }
           status={
@@ -183,15 +187,112 @@ function UserForm({
   );
 }
 
+const ERASES =
+  "Erasing removes their email and key names from the deleted-users list, the audit log and usage labels, " +
+  "and takes them off the workspaces allow-list. It cannot reach application logs, database backups or " +
+  "traces already exported to telemetry destinations. Usage rows keep the account's id, which then names no one.";
+
+function erasedToast(notReached: string[]) {
+  return `Erased. Not reached: ${notReached.join(", ")}.`;
+}
+
+/** Accounts that were deleted, kept by email so their history stays readable. */
+function DeletedUsers() {
+  const deleted = useDeletedUsers();
+  const erase = useEraseUser();
+  const showToast = useToast();
+  const [erasing, setErasing] = useState<DeletedUser | null>(null);
+
+  const columns: TableColumn<DeletedUser & Record<string, unknown>>[] = [
+    {
+      key: "label",
+      header: "Email",
+      width: proportional(2),
+      renderCell: (d) =>
+        d.erased_at ? (
+          <Text type="supporting" color="secondary">
+            erased
+          </Text>
+        ) : (
+          d.label
+        ),
+    },
+    {
+      key: "deleted_at",
+      header: "Deleted",
+      width: pixel(140),
+      renderCell: (d) => <Timestamp value={d.deleted_at} format="relative" />,
+    },
+    {
+      key: "actions",
+      header: <VisuallyHidden>Actions</VisuallyHidden>,
+      width: pixel(110),
+      align: "end",
+      renderCell: (d) =>
+        d.erased_at ? (
+          <Badge variant="neutral" label="erased" />
+        ) : (
+          <Button label="Erase" variant="ghost" size="sm" onClick={() => setErasing(d)} />
+        ),
+    },
+  ];
+
+  if (deleted.isLoading) return <Loading />;
+  if (deleted.error) return <ErrorState error={deleted.error} onRetry={() => deleted.refetch()} />;
+  if (!deleted.data?.length) return null;
+  return (
+    <VStack gap={2}>
+      <Heading level={4}>Deleted users</Heading>
+      <Text type="supporting" color="secondary">
+        A deleted account's email is kept so usage and history still name it. Erase it to remove it.
+      </Text>
+      <Card padding={0}>
+        <Table
+          data={deleted.data as Array<DeletedUser & Record<string, unknown>>}
+          columns={columns}
+          idKey="id"
+          density="compact"
+          dividers="rows"
+          textOverflow="truncate"
+        />
+      </Card>
+      <Confirm
+        target={erasing}
+        title="Erase deleted user"
+        description={`Erase ${erasing?.label}? ${ERASES}`}
+        actionLabel="Erase"
+        isLoading={erase.isPending}
+        onCancel={() => setErasing(null)}
+        onConfirm={async () => {
+          if (!erasing) return;
+          try {
+            const res = await erase.mutateAsync(erasing.id);
+            showToast({ body: erasedToast(res.not_reached) });
+          } catch (err) {
+            showToast({ body: err instanceof Error ? err.message : "Failed", type: "error" });
+          }
+          setErasing(null);
+        }}
+      />
+    </VStack>
+  );
+}
+
 export default function Users() {
-  const users = useUsers();
+  const search = useServerSearch();
+  const users = useUsersPage({ q: search.q });
+  const rows = useMemo(() => users.data?.pages.flatMap((p) => p.items) ?? [], [users.data]);
   const update = useUpdateUser();
   const del = useDeleteUser();
+  const erase = useEraseUser();
+  const [alsoErase, setAlsoErase] = useState(false);
   const showToast = useToast();
 
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState<User | null>(null);
   const [deleting, setDeleting] = useState<User | null>(null);
+  const [signingOut, setSigningOut] = useState<User | null>(null);
+  const signOut = useSignOutUser();
 
   // Confirmed rather than applied on click: disabling locks someone out of the
   // console and kills their keys; enabling hands all of it back.
@@ -213,7 +314,6 @@ export default function Users() {
     {
       key: "email",
       header: "User",
-      sortable: true,
       width: proportional(1.5),
       renderCell: (u) => (
         <VStack gap={0}>
@@ -231,7 +331,6 @@ export default function Users() {
     {
       key: "role",
       header: "Role",
-      sortable: true,
       width: pixel(96),
       renderCell: (u) => (
         <Badge
@@ -261,7 +360,6 @@ export default function Users() {
     {
       key: "created_at",
       header: "Added",
-      sortable: true,
       width: pixel(110),
       renderCell: (u) => <Timestamp value={u.created_at} format="date" />,
     },
@@ -281,10 +379,17 @@ export default function Users() {
     {
       key: "actions",
       header: <VisuallyHidden>Actions</VisuallyHidden>,
-      width: pixel(88),
+      width: pixel(120),
       align: "end",
       renderCell: (u) => (
         <HStack gap={1} hAlign="end">
+          <IconButton
+            label={`Sign ${u.email} out everywhere`}
+            variant="ghost"
+            size="sm"
+            icon={<Icon icon={IconLogout} size="sm" />}
+            onClick={() => setSigningOut(u)}
+          />
           <IconButton
             label={`Edit ${u.email}`}
             variant="ghost"
@@ -300,20 +405,15 @@ export default function Users() {
             variant="ghost"
             size="sm"
             icon={<Icon icon={IconTrash} size="sm" />}
-            onClick={() => setDeleting(u)}
+            onClick={() => {
+              setAlsoErase(false);
+              setDeleting(u);
+            }}
           />
         </HStack>
       ),
     },
   ];
-
-  const tools = useTableTools(
-    users.data as Array<User & Record<string, unknown>> | undefined,
-    {
-      search: (u) => `${u.email} ${u.role} ${(u.tags ?? []).join(" ")}`,
-      defaultSort: [{ sortKey: "email", direction: "ascending" }],
-    },
-  );
 
   const addButton = (
     <Button
@@ -335,8 +435,8 @@ export default function Users() {
       action={
         <HStack gap={2} vAlign="center">
           <SearchBox
-            value={tools.query}
-            onChange={tools.setQuery}
+            value={search.query}
+            onChange={search.setQuery}
             placeholder="Search users…"
           />
           {addButton}
@@ -348,25 +448,33 @@ export default function Users() {
           <Loading />
         ) : users.error ? (
           <ErrorState error={users.error} onRetry={() => users.refetch()} />
-        ) : (users.data?.length ?? 0) === 0 ? (
-          <Empty
-            title="No users yet"
-            description="Add a user, or enable SSO auto-provisioning."
-            action={addButton}
-          />
+        ) : rows.length === 0 ? (
+          search.q ? (
+            <Empty title="No matching users" description="Search looks at email and name." />
+          ) : (
+            <Empty
+              title="No users yet"
+              description="Add a user, or enable SSO auto-provisioning."
+              action={addButton}
+            />
+          )
         ) : (
-          <Table
-            data={tools.rows}
-            plugins={tools.plugins}
-            columns={columns}
-            idKey="id"
-            density="balanced"
-            dividers="rows"
-            hasHover
-            textOverflow="truncate"
-          />
+          <VStack gap={0}>
+            <Table
+              data={rows as Array<User & Record<string, unknown>>}
+              columns={columns}
+              idKey="id"
+              density="balanced"
+              dividers="rows"
+              hasHover
+              textOverflow="truncate"
+            />
+            <LoadMore {...users} />
+          </VStack>
         )}
       </Card>
+
+      <DeletedUsers />
 
       {showForm && (
         <FormDialog
@@ -398,25 +506,77 @@ export default function Users() {
       />
 
       <Confirm
-        target={deleting}
-        title="Delete user"
-        description={`Delete ${deleting?.email}? Their keys stop working immediately.`}
-        isLoading={del.isPending}
-        onCancel={() => setDeleting(null)}
+        target={signingOut}
+        title="Sign out everywhere"
+        description={`End every console session of ${signingOut?.email}? They have to sign in again; their API keys keep working. An IDE already open stays connected until it is closed.`}
+        actionLabel="Sign out"
+        isLoading={signOut.isPending}
+        onCancel={() => setSigningOut(null)}
         onConfirm={async () => {
-          if (!deleting) return;
+          if (!signingOut) return;
           try {
-            await del.mutateAsync(deleting.id);
-            showToast({ body: "User deleted" });
+            await signOut.mutateAsync(signingOut.id);
+            showToast({ body: `${signingOut.email} signed out everywhere` });
           } catch (err) {
             showToast({
               body: err instanceof Error ? err.message : "Failed",
               type: "error",
             });
           }
-          setDeleting(null);
+          setSigningOut(null);
         }}
       />
+
+      {deleting && (
+        <FormDialog
+          isOpen
+          onClose={() => setDeleting(null)}
+          title="Delete user"
+          subtitle={`Delete ${deleting.email}? Their keys stop working immediately.`}
+        >
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              try {
+                if (alsoErase) {
+                  const res = await erase.mutateAsync(deleting.id);
+                  showToast({ body: erasedToast(res.not_reached) });
+                } else {
+                  await del.mutateAsync(deleting.id);
+                  showToast({ body: "User deleted" });
+                }
+                setDeleting(null);
+              } catch (err) {
+                showToast({
+                  body: err instanceof Error ? err.message : "Failed",
+                  type: "error",
+                });
+              }
+            }}
+          >
+            <VStack gap={4}>
+              <Text type="supporting" color="secondary">
+                Their email stays on the deleted-users list so usage and history still name them.
+              </Text>
+              <CheckboxInput
+                label="Also erase this person's data"
+                description={ERASES}
+                value={alsoErase}
+                onChange={setAlsoErase}
+              />
+              <HStack gap={2} hAlign="end">
+                <Button label="Cancel" variant="ghost" onClick={() => setDeleting(null)} />
+                <Button
+                  label={alsoErase ? "Delete and erase" : "Delete"}
+                  variant="destructive"
+                  type="submit"
+                  isLoading={del.isPending || erase.isPending}
+                />
+              </HStack>
+            </VStack>
+          </form>
+        </FormDialog>
+      )}
     </Page>
   );
 }

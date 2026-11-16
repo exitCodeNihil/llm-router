@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -301,7 +300,7 @@ func (v *CloudValidator) ProvisionUser(ctx context.Context, email, teamID string
 	var disabled, created bool
 	err = tx.QueryRow(ctx,
 		`INSERT INTO users (id, email, role) VALUES ($1,$2,'member') ON CONFLICT (email) DO NOTHING RETURNING id`,
-		uuid.New(), email).Scan(&userID)
+		store.NewID(), email).Scan(&userID)
 	switch {
 	case err == nil:
 		created = true

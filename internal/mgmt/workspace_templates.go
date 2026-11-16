@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
+	"github.com/exitcodenihil/llm-router/internal/store"
 	"github.com/exitcodenihil/llm-router/internal/workspace"
 )
 
@@ -35,7 +36,7 @@ func (m *Server) createWorkspaceTemplate(w http.ResponseWriter, r *http.Request)
 		httpError(w, http.StatusBadRequest, "name and image are required")
 		return
 	}
-	id := uuid.New()
+	id := store.NewID()
 	if _, err := m.Store.Pool.Exec(r.Context(), `
 		INSERT INTO workspace_templates (id, name, description, image, dockerfile, source)
 		VALUES ($1, $2, $3, $4, $5, 'admin')`,
@@ -43,6 +44,7 @@ func (m *Server) createWorkspaceTemplate(w http.ResponseWriter, r *http.Request)
 		httpError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	auditTarget(r, "workspace_template", id.String())
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id.String()})
 }
 
@@ -259,7 +261,7 @@ func (m *Server) userFiles(r *http.Request, userID uuid.UUID) ([]workspace.File,
 		if err := rows.Scan(&path, &mode, &enc); err != nil {
 			return nil, err
 		}
-		data, err := snapshot.Decrypt(m.EncryptionKey, enc)
+		data, err := m.keys().Decrypt(enc)
 		if err != nil {
 			return nil, err
 		}

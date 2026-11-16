@@ -49,3 +49,15 @@
 {{- end -}}
 {{- $s -}}
 {{- end -}}
+
+{{/* Egress allowed when networkPolicy.egress.enabled: DNS, the release's namespace, and the listed rules. */}}
+{{- define "llm-router.egress" -}}
+- ports:
+    - {port: 53, protocol: UDP}
+    - {port: 53, protocol: TCP}
+- to:
+    - podSelector: {}
+{{- with .Values.networkPolicy.egress.rules }}
+{{ toYaml . }}
+{{- end }}
+{{- end }}

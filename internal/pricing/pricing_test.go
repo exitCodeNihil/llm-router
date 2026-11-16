@@ -115,6 +115,7 @@ func TestCostFixtures(t *testing.T) {
 // A failure here means one of the two changed: check the page before updating it.
 func TestAnthropicCatalog(t *testing.T) {
 	published := map[string][3]float64{
+		"claude-fable-5-2":           {8, 40, 0.2},
 		"claude-fable-5-1":           {10, 50, 0.25},
 		"claude-fable-5":             {10, 50, 1},
 		"claude-opus-5-5":            {4, 20, 0.2},
@@ -123,7 +124,7 @@ func TestAnthropicCatalog(t *testing.T) {
 		"claude-opus-4-7":            {5, 25, 0.5},
 		"claude-opus-4-6":            {5, 25, 0.5},
 		"claude-opus-4-5-20251101":   {5, 25, 0.5},
-		"claude-sonnet-5-5":          {2, 10, 0.2},
+		"claude-sonnet-5-5":          {2, 10, 0.1},
 		"claude-sonnet-5":            {2, 10, 0.2},
 		"claude-sonnet-4-6":          {3, 15, 0.3},
 		"claude-sonnet-4-5-20250929": {3, 15, 0.3},

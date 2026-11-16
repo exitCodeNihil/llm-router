@@ -4,9 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/google/uuid"
-
 	"github.com/exitcodenihil/llm-router/internal/auth"
+	"github.com/exitcodenihil/llm-router/internal/store"
 )
 
 // --- chat playground ---
@@ -87,7 +86,7 @@ func (m *Server) createChat(w http.ResponseWriter, r *http.Request) {
 	if req.Title == "" {
 		req.Title = "New chat"
 	}
-	id := uuid.New()
+	id := store.NewID()
 	_, err := m.Store.Pool.Exec(r.Context(),
 		`INSERT INTO chats (id, user_id, title, model) VALUES ($1,$2,$3,$4)`,
 		id, userID, req.Title, req.Model)
@@ -103,7 +102,7 @@ func (m *Server) getChat(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := listRows(r.Context(), m.Store.Pool, `
+	rows, err := listRows(r.Context(), m.reads(), `
 		SELECT id, title, model, system_prompt, settings, messages, created_at, updated_at
 		FROM chats WHERE id = $1 AND user_id = $2`, r.PathValue("id"), userID)
 	if err != nil {

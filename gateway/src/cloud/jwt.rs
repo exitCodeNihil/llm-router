@@ -147,7 +147,7 @@ impl Rejection {
             n => format!(" ({n} more since the last one)"),
         };
         let sep = if self.detail.is_empty() { "" } else { ": " };
-        eprintln!("identity token refused: {}{sep}{}{quiet}", self.reason, self.detail);
+        crate::log_warn!("identity token refused: {}{sep}{}{quiet}", self.reason, self.detail);
     }
 }
 
@@ -259,7 +259,7 @@ impl Identities {
                     Ok(p) => Outcome::Created(p.clone(), now + PROVISIONAL_FOR, cfg.version),
                     Err(ProvisionError::Refused(why)) => Outcome::Refused(why.clone(), now + REFUSED_FOR),
                     Err(ProvisionError::Unavailable(why)) => {
-                        eprintln!("identity token: provisioning {email} failed: {why}");
+                        crate::log_warn!("identity token: provisioning {email} failed: {why}");
                         Outcome::Refused(format!("could not create a user for {email}"), now + UNAVAILABLE_FOR)
                     }
                 };
@@ -444,7 +444,7 @@ async fn refresh(
             Ok(fresh)
         }
         Err(e) if cur.fetched.is_some() => {
-            eprintln!("identity token: refreshing keys of {issuer}: {e}");
+            crate::log_warn!("identity token: refreshing keys of {issuer}: {e}");
             Ok(cur)
         }
         Err(e) => Err(format!("issuer discovery failed: {e}")),

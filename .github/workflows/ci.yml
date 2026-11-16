@@ -62,3 +62,15 @@ jobs:
       # that fails to compile is caught here rather than at runtime.
       - run: npm run build
         working-directory: web
+
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: |
+          for values in ci/*.yaml; do
+            helm lint . -f "$values"
+            helm template release . -f "$values" --api-versions monitoring.coreos.com/v1 > /dev/null
+          done
+        working-directory: deploy/helm/llm-router

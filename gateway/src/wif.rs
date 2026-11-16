@@ -205,7 +205,7 @@ impl Source {
                     let now = millis(Instant::now()) + 60_000;
                     if now.saturating_sub(WARNED.load(Ordering::Relaxed)) > 60_000 {
                         WARNED.store(now, Ordering::Relaxed);
-                        eprintln!("{err}; using the token file");
+                        crate::log_warn!("{err}; using the token file");
                     }
                     Ok(t)
                 }

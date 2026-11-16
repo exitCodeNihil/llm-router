@@ -129,6 +129,17 @@ func (g *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	}
 	dec := telemetryDecision(snap, id, reqID, tr)
 
+	release, ok, msg := g.reserve(snap, id, deployments[0], areq.Model, raw, areq.MaxTokens, false)
+	if !ok {
+		w.Header().Set("Retry-After", "1")
+		writeAnthError(w, http.StatusTooManyRequests, "rate_limit_error", msg)
+		g.emit(snap, id, nil, &reqBody{Model: areq.Model, Stream: areq.Stream}, reqID,
+			usageCounts{}, http.StatusTooManyRequests, start, nil, "", dec,
+			emitExtra{Trace: tr, ErrorCode: "budget_reserved"})
+		return
+	}
+	defer release()
+
 	oaiBody, err := anthToOpenAI(&areq)
 	if err != nil {
 		writeAnthError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
@@ -203,6 +214,7 @@ func (g *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	e := g.emit(snap, id, chosen, body, reqID, counts, resp.StatusCode, start, input, output, dec,
 		emitExtra{Trace: tr, Attempts: attempts, ErrorCode: upstreamErrorCode(resp.StatusCode),
 			System: system, Truncated: cut})
+	g.outputs.add(areq.Model, counts.Completion)
 	if g.Limits != nil {
 		g.Limits.RecordUsage(id, counts.Prompt+counts.Completion, e.CostUSD)
 	}

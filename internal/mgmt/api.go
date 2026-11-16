@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -17,7 +18,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/exitcodenihil/llm-router/internal/audit"
 	"github.com/exitcodenihil/llm-router/internal/auth"
+	"github.com/exitcodenihil/llm-router/internal/cluster"
 	"github.com/exitcodenihil/llm-router/internal/console"
 	"github.com/exitcodenihil/llm-router/internal/gateway"
 	"github.com/exitcodenihil/llm-router/internal/metrics"
@@ -32,12 +35,20 @@ type Server struct {
 	Store         *store.Store
 	AdminToken    string
 	EncryptionKey string
+	// OtherKeys open secrets sealed under a key being rotated in or out.
+	OtherKeys []string
 
 	// Live console surfaces. All optional; nil-safe handlers.
 	Snapshots *snapshot.Holder
 	// IDEOrigin is the public origin of the separate IDE listener ("" = the
 	// IDE is served from this mux, which shares the console's origin).
 	IDEOrigin string
+	// CookieDomain is the session cookie's domain (LLMR_COOKIE_DOMAIN), for
+	// the cookie reissued after a password change.
+	CookieDomain string
+	// UsageRetentionMonths is how many months of individual requests are
+	// kept (usage.Retention.RawMonths), for the console to say so. 0 = for ever.
+	UsageRetentionMonths int
 
 	rtMu  sync.Mutex
 	rt    workspace.Runtime
@@ -54,8 +65,10 @@ type Server struct {
 	GatewaySync interface {
 		UnservedProviders(group string, schema int) []string
 	}
-	HTTP     *metrics.HTTP // the control plane's own listener
-	Events   *metrics.Events
+	HTTP   *metrics.HTTP // the control plane's own listener
+	Events *metrics.Events
+	// Peers is the other control planes, when there are any; nil for none.
+	Peers    func() []cluster.Peer
 	Recorder *telemetry.Recorder
 	// Telemetry reports destination health and trace links; nil when no
 	// exporter runs in-process.
@@ -63,138 +76,159 @@ type Server struct {
 	Gateway   *gateway.Server // chat playground bridge into the data plane
 	Version   string          // control-plane build version
 	Started   time.Time       // control-plane process start
+	// Audit records administrative actions; nil records nothing.
+	Audit *audit.Recorder
+	// TrustedProxies name the client in audit rows (LLMR_TRUSTED_PROXIES).
+	TrustedProxies []netip.Prefix
 }
 
-func (m *Server) Register(mux *http.ServeMux) {
-	h := func(fn http.HandlerFunc) http.Handler { return m.requireAdmin(fn) } // global admin
-	ha := func(fn http.HandlerFunc) http.Handler { return m.requireAuth(fn) } // any session
+func (m *Server) Register(mux *http.ServeMux) { m.routes(mux.Handle) }
+
+func (m *Server) keys() snapshot.Keyring {
+	return snapshot.Keyring{Current: m.EncryptionKey, Others: m.OtherKeys}
+}
+
+// routes hands every management route to handle. Each wrapper authenticates,
+// then audits (audit.go), then checks the caller's role.
+func (m *Server) routes(handle func(string, http.Handler)) {
+	h := func(fn http.HandlerFunc) http.Handler { return m.requireAdmin(fn) }            // global admin
+	ha := func(fn http.HandlerFunc) http.Handler { return m.requireAuth(m.audited(fn)) } // any session
 	// hw additionally requires that workspaces are enabled and that the caller
 	// is in the allow-list; ownership is checked per workspace inside.
 	hw := func(fn http.HandlerFunc) http.Handler { return m.requireWorkspaceAccess(fn) }
 
-	mux.Handle("GET /api/me", ha(m.me))
-	mux.Handle("POST /api/me/password", ha(m.changeOwnPassword))
-	mux.Handle("POST /api/users/{id}/password", h(m.setUserPassword))
+	handle("GET /api/me", ha(m.me))
+	handle("POST /api/me/password", ha(m.changeOwnPassword))
+	handle("POST /api/me/sign-out", ha(m.signOutSelf))
+	handle("POST /api/users/{id}/password", h(m.setUserPassword))
+	handle("POST /api/users/{id}/sign-out", h(m.signOutUser))
 
-	mux.Handle("GET /api/users", h(m.listUsers))
-	mux.Handle("POST /api/users", h(m.createUser))
-	mux.Handle("PATCH /api/users/{id}", h(m.patchUser))
-	mux.Handle("DELETE /api/users/{id}", h(m.deleteUser))
+	handle("GET /api/users", h(m.listUsers))
+	handle("POST /api/users", h(m.createUser))
+	handle("PATCH /api/users/{id}", h(m.patchUser))
+	handle("DELETE /api/users/{id}", h(m.deleteUser))
+	handle("POST /api/users/{id}/erase", h(m.eraseUser))
+	handle("GET /api/deleted-users", h(m.listDeletedUsers))
 
-	mux.Handle("GET /api/teams", ha(m.listTeamsScoped))
-	mux.Handle("POST /api/teams", h(m.createTeam))
-	mux.Handle("PATCH /api/teams/{id}", h(m.patchRow("teams", teamPatchCols)))
-	mux.Handle("DELETE /api/teams/{id}", h(m.deleteTeam))
-	mux.Handle("GET /api/teams/{id}/members", ha(m.listTeamMembers))
-	mux.Handle("POST /api/teams/{id}/members", ha(m.addTeamMember))
-	mux.Handle("PATCH /api/teams/{id}/members/{uid}", ha(m.patchTeamMember))
-	mux.Handle("DELETE /api/teams/{id}/members/{uid}", ha(m.removeTeamMember))
+	handle("GET /api/teams", ha(m.listTeamsScoped))
+	handle("POST /api/teams", h(m.createTeam))
+	handle("PATCH /api/teams/{id}", h(m.patchRow("teams", teamPatchCols)))
+	handle("DELETE /api/teams/{id}", h(m.deleteTeam))
+	handle("GET /api/teams/{id}/members", ha(m.listTeamMembers))
+	handle("POST /api/teams/{id}/members", ha(m.addTeamMember))
+	handle("PATCH /api/teams/{id}/members/{uid}", ha(m.patchTeamMember))
+	handle("DELETE /api/teams/{id}/members/{uid}", ha(m.removeTeamMember))
 
-	mux.Handle("GET /api/keys", ha(m.listKeys))
-	mux.Handle("POST /api/keys", ha(m.createKey))
-	mux.Handle("PATCH /api/keys/{id}", ha(m.patchKey))
-	mux.Handle("DELETE /api/keys/{id}", ha(m.deleteKey))
+	handle("GET /api/keys", ha(m.listKeys))
+	handle("POST /api/lookup", ha(m.lookup))
+	handle("POST /api/keys", ha(m.createKey))
+	handle("PATCH /api/keys/{id}", ha(m.patchKey))
+	handle("POST /api/keys/{id}/rotate", ha(m.rotateKey))
+	handle("DELETE /api/keys/{id}", ha(m.deleteKey))
 
-	mux.Handle("GET /api/providers", h(m.listProviders))
-	mux.Handle("GET /api/providers/{id}/models", h(m.providerModels))
-	mux.Handle("POST /api/providers", h(m.createProvider))
-	mux.Handle("PATCH /api/providers/{id}", h(m.patchProvider))
-	mux.Handle("DELETE /api/providers/{id}", h(m.deleteRow("providers")))
+	handle("GET /api/providers", h(m.listProviders))
+	handle("GET /api/providers/{id}/models", h(m.providerModels))
+	handle("POST /api/providers", h(m.createProvider))
+	handle("PATCH /api/providers/{id}", h(m.patchProvider))
+	handle("DELETE /api/providers/{id}", h(m.deleteRow("providers")))
 
-	mux.Handle("GET /api/deployments", h(m.listDeployments))
-	mux.Handle("POST /api/deployments", h(m.createDeployment))
-	mux.Handle("PATCH /api/deployments/{id}", h(m.patchRow("model_deployments", deploymentPatchCols)))
-	mux.Handle("DELETE /api/deployments/{id}", h(m.deleteRow("model_deployments")))
+	handle("GET /api/deployments", h(m.listDeployments))
+	handle("POST /api/deployments", h(m.createDeployment))
+	handle("PATCH /api/deployments/{id}", h(m.patchRow("model_deployments", deploymentPatchCols)))
+	handle("DELETE /api/deployments/{id}", h(m.deleteRow("model_deployments")))
 
-	mux.Handle("GET /api/prices", h(m.listPrices))
-	mux.Handle("PUT /api/prices/{id...}", h(m.putPrice))
-	mux.Handle("POST /api/prices/sync", h(m.syncPrices))
+	handle("GET /api/prices", h(m.listPrices))
+	handle("PUT /api/prices/{id...}", h(m.putPrice))
+	handle("POST /api/prices/sync", h(m.syncPrices))
 
-	mux.Handle("GET /api/settings/sso", h(m.getSSO))
-	mux.Handle("PUT /api/settings/sso", h(m.putSSO))
-	mux.Handle("GET /api/settings/telemetry", h(m.getTelemetry))
-	mux.Handle("PUT /api/settings/telemetry", h(m.putTelemetry))
-	mux.Handle("GET /api/settings/workspaces", h(m.getWorkspaceSettings))
-	mux.Handle("PUT /api/settings/workspaces", h(m.putWorkspaceSettings))
+	handle("GET /api/settings/sso", h(m.getSSO))
+	handle("PUT /api/settings/sso", h(m.putSSO))
+	handle("GET /api/settings/telemetry", h(m.getTelemetry))
+	handle("PUT /api/settings/telemetry", h(m.putTelemetry))
+	handle("POST /api/settings/telemetry/redaction-test", h(m.testRedaction))
+	handle("GET /api/settings/workspaces", h(m.getWorkspaceSettings))
+	handle("PUT /api/settings/workspaces", h(m.putWorkspaceSettings))
 
 	// Admins manage templates before switching workspaces on, so this list
 	// is admin-or-allowed rather than allow-list only.
-	mux.Handle("GET /api/workspace-templates", ha(func(w http.ResponseWriter, r *http.Request) {
+	handle("GET /api/workspace-templates", ha(func(w http.ResponseWriter, r *http.Request) {
 		if CallerFrom(r.Context()).IsAdmin {
 			m.listWorkspaceTemplates(w, r)
 			return
 		}
 		m.requireWorkspaceAccess(m.listWorkspaceTemplates).ServeHTTP(w, r)
 	}))
-	mux.Handle("POST /api/workspace-templates", h(m.createWorkspaceTemplate))
-	mux.Handle("PATCH /api/workspace-templates/{id}", h(m.patchWorkspaceTemplate))
-	mux.Handle("DELETE /api/workspace-templates/{id}", h(m.deleteRow("workspace_templates")))
-	mux.Handle("POST /api/workspace-templates/{id}/build", h(m.buildWorkspaceTemplate))
-	mux.Handle("GET /api/workspaces/files", hw(m.listUserFiles))
-	mux.Handle("PUT /api/workspaces/files", hw(m.putUserFiles))
-	mux.Handle("DELETE /api/workspaces/files", hw(m.deleteUserFile))
-	mux.Handle("GET /api/workspaces", hw(m.listWorkspaces))
-	mux.Handle("POST /api/workspaces", hw(m.createWorkspace))
-	mux.Handle("DELETE /api/workspaces/{id}", hw(m.deleteWorkspace))
-	mux.Handle("POST /api/workspaces/{id}/start", hw(m.startWorkspace))
-	mux.Handle("POST /api/workspaces/{id}/stop", hw(m.stopWorkspace))
-	mux.Handle("POST /api/workspaces/{id}/upload", hw(m.uploadFiles))
+	handle("POST /api/workspace-templates", h(m.createWorkspaceTemplate))
+	handle("PATCH /api/workspace-templates/{id}", h(m.patchWorkspaceTemplate))
+	handle("DELETE /api/workspace-templates/{id}", h(m.deleteRow("workspace_templates")))
+	handle("POST /api/workspace-templates/{id}/build", h(m.buildWorkspaceTemplate))
+	handle("GET /api/workspaces/files", hw(m.listUserFiles))
+	handle("PUT /api/workspaces/files", hw(m.putUserFiles))
+	handle("DELETE /api/workspaces/files", hw(m.deleteUserFile))
+	handle("GET /api/workspaces", hw(m.listWorkspaces))
+	handle("POST /api/workspaces", hw(m.createWorkspace))
+	handle("DELETE /api/workspaces/{id}", hw(m.deleteWorkspace))
+	handle("POST /api/workspaces/{id}/start", hw(m.startWorkspace))
+	handle("POST /api/workspaces/{id}/stop", hw(m.stopWorkspace))
+	handle("POST /api/workspaces/{id}/upload", hw(m.uploadFiles))
 	// The IDE is a whole application behind one prefix, so it takes every
 	// method and every sub-path — including websocket upgrades.
 	if m.IDEOrigin == "" {
-		mux.Handle("/api/workspaces/{id}/ide/", hw(m.workspaceIDE))
+		handle("/api/workspaces/{id}/ide/", hw(m.workspaceIDE))
 	}
 
-	mux.Handle("GET /api/routing/health", h(m.routingHealth))
-	mux.Handle("GET /api/gateway-groups", h(m.listGatewayGroups))
-	mux.Handle("POST /api/gateway-groups", h(m.createGatewayGroup))
-	mux.Handle("PATCH /api/gateway-groups/{id}", h(m.patchRow("gateway_groups", gatewayGroupPatchCols)))
-	mux.Handle("POST /api/gateway-groups/{id}/rotate-token", h(m.rotateGatewayToken))
-	mux.Handle("DELETE /api/gateway-groups/{id}", h(m.deleteGatewayGroup))
-	mux.Handle("GET /api/gateway-instances", h(m.listGatewayInstances))
-	mux.Handle("DELETE /api/gateway-instances/{id}", h(m.deleteRow("gateway_instances")))
+	handle("GET /api/routing/health", h(m.routingHealth))
+	handle("GET /api/gateway-groups", h(m.listGatewayGroups))
+	handle("POST /api/gateway-groups", h(m.createGatewayGroup))
+	handle("PATCH /api/gateway-groups/{id}", h(m.patchRow("gateway_groups", gatewayGroupPatchCols)))
+	handle("POST /api/gateway-groups/{id}/rotate-token", h(m.rotateGatewayToken))
+	handle("DELETE /api/gateway-groups/{id}", h(m.deleteGatewayGroup))
+	handle("GET /api/gateway-instances", h(m.listGatewayInstances))
+	handle("DELETE /api/gateway-instances/{id}", h(m.deleteRow("gateway_instances")))
 
-	mux.Handle("GET /api/token-issuers", h(m.listTokenIssuers))
-	mux.Handle("POST /api/token-issuers", h(m.createTokenIssuer))
-	mux.Handle("PATCH /api/token-issuers/{id}", h(m.patchTokenIssuer))
-	mux.Handle("DELETE /api/token-issuers/{id}", h(m.deleteRow("token_issuers")))
+	handle("GET /api/token-issuers", h(m.listTokenIssuers))
+	handle("POST /api/token-issuers", h(m.createTokenIssuer))
+	handle("PATCH /api/token-issuers/{id}", h(m.patchTokenIssuer))
+	handle("DELETE /api/token-issuers/{id}", h(m.deleteRow("token_issuers")))
 
-	mux.Handle("POST /api/chat/completions", ha(m.chatCompletions))
-	mux.Handle("GET /api/chat/models", ha(m.chatModels))
-	mux.Handle("GET /api/models/available", ha(m.availableModels))
-	mux.Handle("GET /api/chats", ha(m.listChats))
-	mux.Handle("POST /api/chats", ha(m.createChat))
-	mux.Handle("GET /api/chats/{id}", ha(m.getChat))
-	mux.Handle("PUT /api/chats/{id}", ha(m.putChat))
-	mux.Handle("DELETE /api/chats/{id}", ha(m.deleteChat))
+	handle("POST /api/chat/completions", ha(m.chatCompletions))
+	handle("GET /api/chat/models", ha(m.chatModels))
+	handle("GET /api/models/available", ha(m.availableModels))
+	handle("GET /api/chats", ha(m.listChats))
+	handle("POST /api/chats", ha(m.createChat))
+	handle("GET /api/chats/{id}", ha(m.getChat))
+	handle("PUT /api/chats/{id}", ha(m.putChat))
+	handle("DELETE /api/chats/{id}", ha(m.deleteChat))
 
-	mux.Handle("GET /api/usage/summary", ha(m.usageSummary))
-	mux.Handle("GET /api/usage/daily", ha(m.usageDaily))
-	mux.Handle("GET /api/usage/by-model", ha(m.usageByModel))
-	mux.Handle("GET /api/usage/recent", ha(m.usageRecent))
-	mux.Handle("GET /api/usage/flow", ha(m.usageFlow))
-	mux.Handle("GET /api/usage/stats", ha(m.usageStats))
-	mux.Handle("GET /api/usage/breakdown", ha(m.usageBreakdown))
-	mux.Handle("GET /api/usage/timeseries", ha(m.usageTimeseries))
-	mux.Handle("GET /api/usage/requests", ha(m.usageRequests))
-	mux.Handle("GET /api/usage/by-team", ha(m.usageByTeam))
-	mux.Handle("GET /api/usage/by-provider-daily", ha(m.usageByProviderDaily))
-	mux.Handle("GET /api/usage/by-deployment", h(m.usageByDeployment))
+	handle("GET /api/usage/summary", ha(m.usageSummary))
+	handle("GET /api/usage/daily", ha(m.usageDaily))
+	handle("GET /api/usage/by-model", ha(m.usageByModel))
+	handle("GET /api/usage/recent", ha(m.usageRecent))
+	handle("GET /api/usage/flow", ha(m.usageFlow))
+	handle("GET /api/usage/stats", ha(m.usageStats))
+	handle("GET /api/usage/breakdown", ha(m.usageBreakdown))
+	handle("GET /api/usage/timeseries", ha(m.usageTimeseries))
+	handle("GET /api/usage/requests", ha(m.usageRequests))
+	handle("GET /api/usage/by-team", ha(m.usageByTeam))
+	handle("GET /api/usage/by-provider-daily", ha(m.usageByProviderDaily))
+	handle("GET /api/usage/by-deployment", h(m.usageByDeployment))
 
-	mux.Handle("GET /api/metrics/live", h(m.metricsLive))
-	mux.Handle("GET /api/nodes", h(m.listNodes))
-	mux.Handle("GET /api/nodes/history", h(m.nodesHistory))
+	handle("GET /api/metrics/live", h(m.metricsLive))
+	handle("GET /api/nodes", h(m.listNodes))
+	handle("GET /api/nodes/history", h(m.nodesHistory))
 
-	mux.Handle("GET /api/telemetry/kinds", h(m.telemetryKinds))
-	mux.Handle("GET /api/telemetry/destinations", h(m.listDestinations))
-	mux.Handle("GET /api/telemetry/destinations/{id}", h(m.getDestination))
-	mux.Handle("POST /api/telemetry/destinations", h(m.createDestination))
-	mux.Handle("PUT /api/telemetry/destinations/{id}", h(m.putDestination))
-	mux.Handle("PATCH /api/telemetry/destinations/{id}", h(m.patchDestination))
-	mux.Handle("DELETE /api/telemetry/destinations/{id}", h(m.deleteDestination))
-	mux.Handle("POST /api/telemetry/destinations/test", h(m.testDestination))
-	mux.Handle("GET /api/observability/exported", h(m.observabilityExported))
-	mux.Handle("GET /api/observability/rules/stats", h(m.observabilityRulesStats))
+	handle("GET /api/telemetry/kinds", h(m.telemetryKinds))
+	handle("GET /api/telemetry/destinations", h(m.listDestinations))
+	handle("GET /api/telemetry/destinations/{id}", h(m.getDestination))
+	handle("POST /api/telemetry/destinations", h(m.createDestination))
+	handle("PUT /api/telemetry/destinations/{id}", h(m.putDestination))
+	handle("PATCH /api/telemetry/destinations/{id}", h(m.patchDestination))
+	handle("DELETE /api/telemetry/destinations/{id}", h(m.deleteDestination))
+	handle("POST /api/telemetry/destinations/test", h(m.testDestination))
+	handle("GET /api/observability/exported", h(m.observabilityExported))
+	handle("GET /api/observability/rules/stats", h(m.observabilityRulesStats))
+
+	handle("GET /api/audit", h(m.listAudit))
 }
 
 func (m *Server) me(w http.ResponseWriter, r *http.Request) {
@@ -225,22 +259,29 @@ func (m *Server) me(w http.ResponseWriter, r *http.Request) {
 		"workspaces": m.workspaceConfig(r.Context()).Allows(c.IsAdmin, c.UserID, teams),
 		// Where the IDE iframe loads from; "" means this origin.
 		"ide_origin": m.IDEOrigin,
+		// How long individual requests are kept; 0 = for ever.
+		"usage_retention_months": m.UsageRetentionMonths,
 	})
 }
 
 func (m *Server) requireAdmin(next http.HandlerFunc) http.Handler {
-	return m.requireAuth(func(w http.ResponseWriter, r *http.Request) {
+	return m.requireAuth(m.audited(func(w http.ResponseWriter, r *http.Request) {
 		if !CallerFrom(r.Context()).IsAdmin {
 			httpError(w, http.StatusForbidden, "admin role required")
 			return
 		}
 		next(w, r)
-	})
+	}))
 }
 
 // --- helpers ---
 
 func httpError(w http.ResponseWriter, status int, msg string) {
+	if strings.Contains(msg, "SQLSTATE 57014") {
+		// The console pool's statement timeout cancelled the query.
+		slog.Warn("console query timed out", "err", msg)
+		status, msg = http.StatusGatewayTimeout, "the query took too long; try a shorter time range"
+	}
 	if strings.Contains(msg, "SQLSTATE") {
 		// Driver text names tables and constraints. Say what went wrong in the
 		// caller's terms and keep the detail in the log.
@@ -298,6 +339,14 @@ func (m *Server) bump(ctx context.Context) {
 	}
 }
 
+// reads is the pool for console reads: the one with a statement timeout.
+func (m *Server) reads() *pgxpool.Pool {
+	if m.Store.Console != nil {
+		return m.Store.Console
+	}
+	return m.Store.Pool
+}
+
 // listRows runs a query and returns rows as []map[string]any (column name → value).
 func listRows(ctx context.Context, pool *pgxpool.Pool, sql string, args ...any) ([]map[string]any, error) {
 	rows, err := pool.Query(ctx, sql, args...)
@@ -326,7 +375,7 @@ func listRows(ctx context.Context, pool *pgxpool.Pool, sql string, args ...any) 
 }
 
 func (m *Server) list(w http.ResponseWriter, r *http.Request, sql string, args ...any) {
-	rows, err := listRows(r.Context(), m.Store.Pool, sql, args...)
+	rows, err := listRows(r.Context(), m.reads(), sql, args...)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -358,6 +407,26 @@ func (m *Server) deleteRow(table string) http.HandlerFunc {
 // --- users ---
 
 func (m *Server) listUsers(w http.ResponseWriter, r *http.Request) {
+	if p, paged, ok := readPage(w, r); !ok {
+		return
+	} else if paged {
+		l := pagedList{
+			sel: `SELECT u.id, u.email, u.name, u.role, u.budget_usd, u.budget_period, u.rpm_limit, u.tpm_limit, u.tags,
+				u.allowed_models, u.disabled, u.created_at FROM users u`,
+			cols: []string{"u.email", "u.id"}, casts: []string{"citext", "uuid"}, fields: []string{"email", "id"},
+			search: []string{"u.email", "u.name"},
+		}
+		if t := r.URL.Query().Get("not_in_team"); t != "" {
+			id, err := uuid.Parse(t)
+			if err != nil {
+				httpError(w, http.StatusBadRequest, "invalid not_in_team")
+				return
+			}
+			l.where = append(l.where, `NOT EXISTS (SELECT 1 FROM team_members tm WHERE tm.user_id = u.id AND tm.team_id = `+l.arg(id)+`)`)
+		}
+		m.servePage(w, r, p, l)
+		return
+	}
 	m.list(w, r, `SELECT id, email, name, role, budget_usd, budget_period, rpm_limit, tpm_limit, tags, allowed_models, disabled, created_at FROM users ORDER BY created_at`)
 }
 
@@ -400,7 +469,7 @@ func (m *Server) createUser(w http.ResponseWriter, r *http.Request) {
 		}
 		hash = h
 	}
-	id := uuid.New()
+	id := store.NewID()
 	_, err := m.Store.Pool.Exec(r.Context(), `
 		INSERT INTO users (id, email, name, role, budget_usd, budget_period, rpm_limit, tpm_limit, tags, password_hash, allowed_models)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
@@ -409,6 +478,7 @@ func (m *Server) createUser(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	auditTarget(r, "user", id.String())
 	m.bump(r.Context())
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id.String()})
 }
@@ -418,6 +488,20 @@ func (m *Server) createUser(w http.ResponseWriter, r *http.Request) {
 // listTeamsScoped: admins see every team, members only their own.
 func (m *Server) listTeamsScoped(w http.ResponseWriter, r *http.Request) {
 	c := CallerFrom(r.Context())
+	if p, paged, ok := readPage(w, r); !ok {
+		return
+	} else if paged {
+		l := pagedList{
+			sel:  `SELECT t.id, t.name, t.budget_usd, t.budget_period, t.rpm_limit, t.tpm_limit, t.tags, t.allowed_models, t.created_at FROM teams t`,
+			cols: []string{"t.name", "t.id"}, casts: []string{"text", "uuid"}, fields: []string{"name", "id"},
+			search: []string{"t.name"},
+		}
+		if !c.IsAdmin {
+			l.where = append(l.where, `t.id IN (SELECT team_id FROM team_members WHERE user_id = `+l.arg(c.UserID)+`)`)
+		}
+		m.servePage(w, r, p, l)
+		return
+	}
 	if c.IsAdmin {
 		m.list(w, r, `SELECT id, name, budget_usd, budget_period, rpm_limit, tpm_limit, tags, allowed_models, created_at FROM teams ORDER BY created_at`)
 		return
@@ -431,6 +515,24 @@ func (m *Server) listTeamMembers(w http.ResponseWriter, r *http.Request) {
 	teamID := r.PathValue("id")
 	if !c.InTeam(teamID) {
 		httpError(w, http.StatusForbidden, "not a member of this team")
+		return
+	}
+	if p, paged, ok := readPage(w, r); !ok {
+		return
+	} else if paged {
+		id, err := uuid.Parse(teamID)
+		if err != nil {
+			httpError(w, http.StatusBadRequest, "invalid team id")
+			return
+		}
+		l := pagedList{
+			sel: `SELECT tm.user_id, u.email, u.name, tm.role, tm.budget_usd, tm.budget_period FROM team_members tm
+				JOIN users u ON u.id = tm.user_id`,
+			cols: []string{"u.email", "tm.user_id"}, casts: []string{"citext", "uuid"}, fields: []string{"email", "user_id"},
+			search: []string{"u.email", "u.name"},
+		}
+		l.where = append(l.where, "tm.team_id = "+l.arg(id))
+		m.servePage(w, r, p, l)
 		return
 	}
 	m.list(w, r, `SELECT tm.user_id, u.email, u.name, tm.role, tm.budget_usd, tm.budget_period FROM team_members tm
@@ -532,7 +634,7 @@ func (m *Server) createTeam(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "name is required")
 		return
 	}
-	id := uuid.New()
+	id := store.NewID()
 	_, err := m.Store.Pool.Exec(r.Context(), `
 		INSERT INTO teams (id, name, budget_usd, budget_period, rpm_limit, tpm_limit, tags, allowed_models)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
@@ -541,6 +643,7 @@ func (m *Server) createTeam(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	auditTarget(r, "team", id.String())
 	m.bump(r.Context())
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id.String()})
 }
@@ -578,11 +681,12 @@ func (m *Server) addTeamMember(w http.ResponseWriter, r *http.Request) {
 	// Team admins have no user directory; let them name a member by email.
 	if _, err := uuid.Parse(req.UserID); err != nil && strings.Contains(req.UserID, "@") {
 		if err := m.Store.Pool.QueryRow(r.Context(),
-			`SELECT id::text FROM users WHERE lower(email)=lower($1) AND NOT disabled`, strings.TrimSpace(req.UserID)).Scan(&req.UserID); err != nil {
+			`SELECT id::text FROM users WHERE email=$1 AND NOT disabled`, strings.TrimSpace(req.UserID)).Scan(&req.UserID); err != nil {
 			httpError(w, http.StatusNotFound, "no user with that email")
 			return
 		}
 	}
+	auditTarget(r, "team_member", teamID.String()+"/"+req.UserID)
 	_, err = m.Store.Pool.Exec(r.Context(), `
 		INSERT INTO team_members (team_id, user_id, role, budget_usd, budget_period) VALUES ($1,$2,$3,$4,$5)
 		ON CONFLICT (team_id, user_id) DO UPDATE SET role = EXCLUDED.role,
@@ -599,12 +703,18 @@ func (m *Server) addTeamMember(w http.ResponseWriter, r *http.Request) {
 
 // --- api keys ---
 
-const keyCols = `id, key_prefix, name, user_id, team_id, allowed_models, budget_usd, budget_period,
-	rpm_limit, tpm_limit, expires_at, tags, disabled, created_at`
+var keyCols = `id, key_prefix, name, user_id, team_id, allowed_models, budget_usd, budget_period,
+	rpm_limit, tpm_limit, expires_at, tags, disabled, created_at, ` + oldKeyCol("api_keys")
 
 // listKeys: admins see all keys; others see their own keys and their teams' keys.
 func (m *Server) listKeys(w http.ResponseWriter, r *http.Request) {
 	c := CallerFrom(r.Context())
+	if p, paged, ok := readPage(w, r); !ok {
+		return
+	} else if paged {
+		m.pagedKeys(w, r, p, c)
+		return
+	}
 	if c.IsAdmin {
 		m.list(w, r, `SELECT `+keyCols+` FROM api_keys ORDER BY created_at`)
 		return
@@ -612,6 +722,29 @@ func (m *Server) listKeys(w http.ResponseWriter, r *http.Request) {
 	m.list(w, r, `SELECT `+keyCols+` FROM api_keys
 		WHERE user_id = $1 OR team_id = ANY(SELECT team_id FROM team_members WHERE user_id = $1)
 		ORDER BY created_at`, c.UserID)
+}
+
+// pagedKeys also names each key's owners. A non-admin sees an owner's email
+// only when it is themself or someone they share a team with, so a team key
+// created by an outsider does not reveal that address.
+func (m *Server) pagedKeys(w http.ResponseWriter, r *http.Request, p pageParams, c *Caller) {
+	l := pagedList{
+		cols: []string{"k.created_at", "k.id"}, casts: []string{"timestamptz", "uuid"}, fields: []string{"created_at", "id"},
+		desc: true,
+	}
+	ownerEmail := "u.email"
+	if !c.IsAdmin {
+		me := l.arg(c.UserID)
+		ownerEmail = `CASE WHEN u.id = ` + me + ` OR u.id IN (SELECT user_id FROM team_members WHERE team_id IN
+			(SELECT team_id FROM team_members WHERE user_id = ` + me + `)) THEN u.email END`
+		l.where = append(l.where, `(k.user_id = `+me+` OR k.team_id IN (SELECT team_id FROM team_members WHERE user_id = `+me+`))`)
+	}
+	l.sel = `SELECT k.id, k.key_prefix, k.name, k.user_id, k.team_id, k.allowed_models, k.budget_usd, k.budget_period,
+		k.rpm_limit, k.tpm_limit, k.expires_at, k.tags, k.disabled, k.created_at, ` + oldKeyCol("k") + `,
+		` + ownerEmail + ` AS user_email, t.name AS team_name
+		FROM api_keys k LEFT JOIN users u ON u.id = k.user_id LEFT JOIN teams t ON t.id = k.team_id`
+	l.search = []string{"k.name", "k.key_prefix", ownerEmail, "t.name"}
+	m.servePage(w, r, p, l)
 }
 
 // canManageKey: admins manage any key; team admins their team's keys; users their own.
@@ -668,7 +801,7 @@ func (m *Server) createKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	secret, hash, prefix := auth.GenerateKey()
-	id := uuid.New()
+	id := store.NewID()
 	_, err := m.Store.Pool.Exec(r.Context(), `
 		INSERT INTO api_keys (id, key_hash, key_prefix, name, user_id, team_id, allowed_models,
 			budget_usd, budget_period, rpm_limit, tpm_limit, expires_at, tags)
@@ -679,6 +812,7 @@ func (m *Server) createKey(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	auditTarget(r, "key", id.String())
 	m.bump(r.Context())
 	// the secret is returned exactly once and never stored
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id.String(), "key": secret})
@@ -752,7 +886,7 @@ func (m *Server) createProvider(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	id := uuid.New()
+	id := store.NewID()
 	_, err := m.Store.Pool.Exec(r.Context(), `
 		INSERT INTO providers (id, name, type, base_url, auth_mode, api_key_enc, config)
 		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
@@ -761,6 +895,7 @@ func (m *Server) createProvider(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	auditTarget(r, "provider", id.String())
 	m.bump(r.Context())
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id.String()})
 }
@@ -796,7 +931,7 @@ func (m *Server) providerModels(w http.ResponseWriter, r *http.Request) {
 	}
 	p.ApplyConfig(cfg)
 	if len(enc) > 0 && snapshot.ProviderHasSecret(p.AuthMode) {
-		if p.APIKey, err = snapshot.Decrypt(m.EncryptionKey, enc); err != nil {
+		if p.APIKey, err = m.keys().Decrypt(enc); err != nil {
 			httpError(w, http.StatusInternalServerError,
 				"cannot decrypt provider credentials — LLMR_ENCRYPTION_KEY changed since the key was saved; re-enter the provider API key")
 			return
@@ -866,7 +1001,7 @@ func (m *Server) syncPrices(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(enc) > 0 && snapshot.ProviderHasSecret(p.AuthMode) {
-			if p.APIKey, err = snapshot.Decrypt(m.EncryptionKey, enc); err != nil {
+			if p.APIKey, err = m.keys().Decrypt(enc); err != nil {
 				rows.Close()
 				httpError(w, http.StatusInternalServerError, "cannot decrypt provider credentials for "+p.Name)
 				return
@@ -931,7 +1066,7 @@ func (m *Server) createDeployment(w http.ResponseWriter, r *http.Request) {
 			req.APIFlavor = "anthropic"
 		}
 	}
-	id := uuid.New()
+	id := store.NewID()
 	_, err := m.Store.Pool.Exec(r.Context(), `
 		INSERT INTO model_deployments (id, provider_id, model_name, upstream_name, api_flavor, priority, catalog_model_id, input_per_1m, output_per_1m, cached_input_per_1m, context_tokens, region, timeout_ms)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
@@ -940,6 +1075,7 @@ func (m *Server) createDeployment(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	auditTarget(r, "deployment", id.String())
 	m.bump(r.Context())
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id.String()})
 }

@@ -6,8 +6,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,9 +17,16 @@ import (
 	"github.com/exitcodenihil/llm-router/internal/usage"
 )
 
-type captureWriter struct{ events []usage.Event }
+type captureWriter struct {
+	mu     sync.Mutex
+	events []usage.Event
+}
 
-func (c *captureWriter) Write(e usage.Event) { c.events = append(c.events, e) }
+func (c *captureWriter) Write(e usage.Event) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.events = append(c.events, e)
+}
 
 func newTestServer(t *testing.T, deployments map[string][]*snapshot.Deployment) (*Server, *captureWriter, string) {
 	t.Helper()
@@ -96,6 +105,26 @@ func TestNonStreamingUsageAndCost(t *testing.T) {
 	}
 	if e.UserID != "u1" || e.APIKeyID != "key1" {
 		t.Errorf("identity not stamped: %+v", e)
+	}
+	if e.ClientIP != "" {
+		t.Errorf("client address %q recorded with the setting off", e.ClientIP)
+	}
+
+	// On, the address is the client's, or what a trusted proxy forwarded for.
+	g.RecordClientIP = true
+	g.TrustedProxies = []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")} // httptest's RemoteAddr
+	mux := http.NewServeMux()
+	g.Register(mux)
+	for _, c := range []struct{ xff, want string }{{"", "192.0.2.1"}, {"198.51.100.9", "198.51.100.9"}} {
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"my-model","messages":[]}`))
+		req.Header.Set("Authorization", "Bearer "+key)
+		if c.xff != "" {
+			req.Header.Set("X-Forwarded-For", c.xff)
+		}
+		mux.ServeHTTP(httptest.NewRecorder(), req)
+		if got := cw.events[len(cw.events)-1].ClientIP; got != c.want {
+			t.Errorf("X-Forwarded-For %q: client address %q, want %q", c.xff, got, c.want)
+		}
 	}
 }
 

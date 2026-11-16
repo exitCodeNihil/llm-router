@@ -6,8 +6,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/exitcodenihil/llm-router/internal/store"
 )
 
 // Password auth: first-run setup creates the initial admin; after that,
@@ -40,12 +41,17 @@ func (a *Auth) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "setup status unavailable", http.StatusInternalServerError)
 		return
 	}
-	_, ssoErr := a.loadSSO(r.Context())
+	// An undecryptable secret hides the SSO button: sign-in cannot work.
+	_, ssoErr := LoadSSO(r.Context(), a.Store.Pool, a.keys())
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"needed": needed, "sso": ssoErr == nil})
 }
 
 func (a *Auth) handleSetup(w http.ResponseWriter, r *http.Request) {
+	sw := &statusWriter{ResponseWriter: w}
+	w = sw
+	var adminID, adminEmail string
+	defer func() { a.audit(r, "auth.setup", sw.status, adminID, adminEmail) }()
 	lim := a.signInLimits()
 	if !lim.admit(w, lim.clientIP(r), "", time.Now()) {
 		return
@@ -70,7 +76,7 @@ func (a *Auth) handleSetup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "hashing failed", http.StatusInternalServerError)
 		return
 	}
-	id := uuid.New()
+	id := store.NewID()
 	// One statement, so two concurrent setup calls cannot both win.
 	tag, err := a.Store.Pool.Exec(r.Context(),
 		`INSERT INTO users (id, email, name, role, password_hash)
@@ -84,11 +90,22 @@ func (a *Auth) handleSetup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "setup is already complete", http.StatusForbidden)
 		return
 	}
-	setSessionCookie(w, r, a.EncryptionKey, a.CookieDomain, id.String())
+	adminID, adminEmail = id.String(), req.Email
+	SetSessionCookie(w, r, a.EncryptionKey, a.CookieDomain, id.String(), 0)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *Auth) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
+	sw := &statusWriter{ResponseWriter: w}
+	w = sw
+	var signedIn, signedInEmail string
+	defer func() {
+		if signedIn != "" {
+			a.audit(r, "auth.signin", sw.status, signedIn, signedInEmail)
+		} else {
+			a.audit(r, "auth.signin_failed", sw.status, "", "")
+		}
+	}()
 	var req struct {
 		Email    string `json:"email"`
 		Password string `json:"password"`
@@ -111,16 +128,18 @@ func (a *Auth) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	var userID string
 	var hash []byte
+	var epoch int
 	err := a.Store.Pool.QueryRow(r.Context(),
-		`SELECT id, password_hash FROM users WHERE email=$1 AND NOT disabled`, req.Email).
-		Scan(&userID, &hash)
+		`SELECT id, password_hash, session_epoch FROM users WHERE email=$1 AND NOT disabled`, req.Email).
+		Scan(&userID, &hash, &epoch)
 	if err != nil || len(hash) == 0 ||
 		bcrypt.CompareHashAndPassword(hash, []byte(req.Password)) != nil {
 		http.Error(w, "incorrect email or password", http.StatusUnauthorized)
 		return
 	}
 	lim.succeeded(ip, email)
-	setSessionCookie(w, r, a.EncryptionKey, a.CookieDomain, userID)
+	signedIn, signedInEmail = userID, req.Email
+	SetSessionCookie(w, r, a.EncryptionKey, a.CookieDomain, userID, epoch)
 	w.WriteHeader(http.StatusNoContent)
 }
 

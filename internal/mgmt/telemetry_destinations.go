@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
+	"github.com/exitcodenihil/llm-router/internal/store"
 	"github.com/exitcodenihil/llm-router/internal/telemetry"
 )
 
@@ -218,7 +219,7 @@ func (m *Server) createDestination(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	id := uuid.New()
+	id := store.NewID()
 	cfg, _ := json.Marshal(d.Config)
 	_, err = m.Store.Pool.Exec(r.Context(), `INSERT INTO telemetry_destinations
 		(id, name, kind, enabled, endpoint, traces_url, config, secrets_enc, secret_names, content_mode,
@@ -230,6 +231,7 @@ func (m *Server) createDestination(w http.ResponseWriter, r *http.Request) {
 		destinationWriteError(w, err)
 		return
 	}
+	auditTarget(r, "telemetry_destination", id.String())
 	m.bump(r.Context())
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id.String()})
 }
@@ -408,7 +410,7 @@ func (m *Server) loadDestination(ctx context.Context, id uuid.UUID) (*snapshot.D
 	}
 	d.Secrets = map[string]string{}
 	if len(enc) > 0 {
-		plain, err := snapshot.Decrypt(m.EncryptionKey, enc)
+		plain, err := m.keys().Decrypt(enc)
 		if err == nil {
 			err = json.Unmarshal([]byte(plain), &d.Secrets)
 		}

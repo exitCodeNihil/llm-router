@@ -3,22 +3,25 @@ package console
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
-	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/netip"
 	"sync"
 
 	"github.com/coreos/go-oidc/v3/oidc"
-	"github.com/google/uuid"
 	"golang.org/x/oauth2"
 
+	"github.com/exitcodenihil/llm-router/internal/audit"
+	"github.com/exitcodenihil/llm-router/internal/snapshot"
 	"github.com/exitcodenihil/llm-router/internal/store"
 )
 
 // SSOConfig is the single OIDC provider configuration, stored in settings
-// under key 'sso'. It covers Entra ID, Google, Okta, and any OIDC IdP.
+// under key 'sso' with the secret encrypted (sso.go). It covers Entra ID,
+// Google, Okta, and any OIDC IdP.
 type SSOConfig struct {
 	IssuerURL    string `json:"issuer_url"`
 	ClientID     string `json:"client_id"`
@@ -31,10 +34,14 @@ type SSOConfig struct {
 type Auth struct {
 	Store         *store.Store
 	EncryptionKey string
-	CookieDomain  string
+	// OtherKeys are accepted besides EncryptionKey during a key rotation.
+	OtherKeys    []string
+	CookieDomain string
 	// TrustedProxies are the proxies whose X-Forwarded-For names the client
 	// for sign-in rate limits (LLMR_TRUSTED_PROXIES).
 	TrustedProxies []netip.Prefix
+	// Audit, when set, records sign-ins, failed sign-ins and sign-outs.
+	Audit func(context.Context, audit.Event)
 
 	limitsOnce sync.Once
 	limits     *signInLimits
@@ -44,29 +51,56 @@ type Auth struct {
 	issuer   string // issuer the cached provider was built for
 }
 
+func (a *Auth) keys() snapshot.Keyring {
+	return snapshot.Keyring{Current: a.EncryptionKey, Others: a.OtherKeys}
+}
+
 func (a *Auth) Register(mux *http.ServeMux) {
 	a.registerPassword(mux)
 	mux.HandleFunc("GET /auth/login", a.handleLogin)
 	mux.HandleFunc("GET /auth/callback", a.handleCallback)
-	mux.HandleFunc("GET /auth/logout", func(w http.ResponseWriter, r *http.Request) {
-		http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, Domain: a.CookieDomain})
-		// The marker lets the console drop a bootstrap token it holds in
-		// local storage, which no server-side action can clear.
-		http.Redirect(w, r, "/?signed_out=1", http.StatusFound)
-	})
+	mux.HandleFunc("GET /auth/logout", a.handleLogout)
 }
 
+// handleLogout ends this session for good, not just in this browser: its id
+// goes on the revoked list until the cookie would have expired. A cookie from
+// before sessions had ids cannot be singled out, so it signs the user out
+// everywhere instead.
+func (a *Auth) handleLogout(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if s, ok := RequestSession(a.keys(), r); ok {
+		var email string
+		// Only a live session is recorded: a bare GET from anyone, or a
+		// replayed cookie already signed out, is not an event.
+		if a.Store.Pool.QueryRow(ctx, `SELECT u.email FROM users u WHERE u.id=$1 AND `+SessionLiveSQL("$2", "$3"),
+			s.UserID, s.Epoch, s.SID).Scan(&email) == nil {
+			var err error
+			if s.SID != "" {
+				_, err = a.Store.Pool.Exec(ctx, `INSERT INTO revoked_sessions (sid, expires_at) VALUES ($1, $2)
+					ON CONFLICT (sid) DO NOTHING`, s.SID, s.Expires)
+			} else {
+				_, err = a.Store.Pool.Exec(ctx, `UPDATE users SET session_epoch = session_epoch + 1 WHERE id=$1`, s.UserID)
+			}
+			if err != nil {
+				slog.Error("sign-out: session not revoked", "err", err)
+			}
+			a.audit(r, "auth.signout", http.StatusFound, s.UserID, email)
+		}
+	}
+	ClearSessionCookie(w, a.CookieDomain)
+	// The marker lets the console drop a bootstrap token it holds in
+	// local storage, which no server-side action can clear.
+	http.Redirect(w, r, "/?signed_out=1", http.StatusFound)
+}
+
+// loadSSO is LoadSSO for sign-in. A secret it cannot decrypt is logged for
+// the admin and fails like a missing configuration.
 func (a *Auth) loadSSO(ctx context.Context) (*SSOConfig, error) {
-	var raw []byte
-	err := a.Store.Pool.QueryRow(ctx, `SELECT value FROM settings WHERE key='sso'`).Scan(&raw)
-	if err != nil {
-		return nil, err
+	cfg, err := LoadSSO(ctx, a.Store.Pool, a.keys())
+	if errors.Is(err, ErrSSOSecret) {
+		slog.Error("sso sign-in unavailable", "err", err)
 	}
-	var cfg SSOConfig
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return nil, err
-	}
-	return &cfg, nil
+	return cfg, err
 }
 
 func (a *Auth) oidcProvider(ctx context.Context, cfg *SSOConfig) (*oidc.Provider, error) {
@@ -105,20 +139,75 @@ func (a *Auth) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "identity provider unreachable", http.StatusBadGateway)
 		return
 	}
+	// state ties the callback to this browser, nonce ties the ID token to
+	// this sign-in, and the PKCE verifier makes a stolen code useless to
+	// anyone without the cookie. All three live only in HttpOnly cookies.
+	state, nonce, verifier := randomToken(), randomToken(), oauth2.GenerateVerifier()
+	a.setFlowCookie(w, r, stateCookie, state)
+	a.setFlowCookie(w, r, nonceCookie, nonce)
+	a.setFlowCookie(w, r, verifierCookie, verifier)
+	http.Redirect(w, r, a.oauthConfig(cfg, p).AuthCodeURL(state,
+		oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier)), http.StatusFound)
+}
+
+const (
+	stateCookie    = "llmr_oauth_state"
+	nonceCookie    = "llmr_oauth_nonce"
+	verifierCookie = "llmr_oauth_verifier"
+)
+
+func randomToken() string {
 	b := make([]byte, 16)
 	rand.Read(b)
-	state := base64.RawURLEncoding.EncodeToString(b)
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// setFlowCookie keeps one value of a sign-in in flight. maxAge -1 clears it.
+func (a *Auth) setFlowCookie(w http.ResponseWriter, r *http.Request, name, value string) {
+	maxAge := 300
+	if value == "" {
+		maxAge = -1
+	}
 	http.SetCookie(w, &http.Cookie{
-		Name: "llmr_oauth_state", Value: state, Path: "/auth",
-		MaxAge: 300, HttpOnly: true, SameSite: http.SameSiteLaxMode,
+		Name: name, Value: value, Path: "/auth",
+		MaxAge: maxAge, HttpOnly: true, Secure: secureRequest(r), SameSite: http.SameSiteLaxMode,
 	})
-	http.Redirect(w, r, a.oauthConfig(cfg, p).AuthCodeURL(state), http.StatusFound)
+}
+
+func cookieValue(r *http.Request, name string) string {
+	c, err := r.Cookie(name)
+	if err != nil {
+		return ""
+	}
+	return c.Value
 }
 
 func (a *Auth) handleCallback(w http.ResponseWriter, r *http.Request) {
-	stateCookie, err := r.Cookie("llmr_oauth_state")
-	if err != nil || r.URL.Query().Get("state") != stateCookie.Value {
+	sw := &statusWriter{ResponseWriter: w}
+	w = sw
+	var signedIn, signedInEmail string
+	stateOK := false
+	defer func() {
+		if signedIn != "" {
+			a.audit(r, "auth.sso_signin", sw.status, signedIn, signedInEmail)
+		} else if stateOK { // an anonymous hit carries no state cookie: not worth a row
+			a.audit(r, "auth.sso_signin_failed", sw.status, "", "")
+		}
+	}()
+	// Read once and cleared whatever happens next: a callback can only ever
+	// be completed once with them.
+	state, nonce, verifier := cookieValue(r, stateCookie), cookieValue(r, nonceCookie), cookieValue(r, verifierCookie)
+	for _, name := range []string{stateCookie, nonceCookie, verifierCookie} {
+		a.setFlowCookie(w, r, name, "")
+	}
+	got := r.URL.Query().Get("state")
+	if state == "" || subtle.ConstantTimeCompare([]byte(got), []byte(state)) != 1 {
 		http.Error(w, "state mismatch", http.StatusBadRequest)
+		return
+	}
+	stateOK = true
+	if nonce == "" || verifier == "" {
+		http.Error(w, "sign-in expired; start again", http.StatusBadRequest)
 		return
 	}
 	cfg, err := a.loadSSO(r.Context())
@@ -132,7 +221,7 @@ func (a *Auth) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	oauth := a.oauthConfig(cfg, p)
-	tok, err := oauth.Exchange(r.Context(), r.URL.Query().Get("code"))
+	tok, err := oauth.Exchange(r.Context(), r.URL.Query().Get("code"), oauth2.VerifierOption(verifier))
 	if err != nil {
 		http.Error(w, "code exchange failed", http.StatusBadGateway)
 		return
@@ -140,6 +229,12 @@ func (a *Auth) handleCallback(w http.ResponseWriter, r *http.Request) {
 	rawID, _ := tok.Extra("id_token").(string)
 	idToken, err := p.Verifier(&oidc.Config{ClientID: cfg.ClientID}).Verify(r.Context(), rawID)
 	if err != nil {
+		http.Error(w, "invalid id token", http.StatusUnauthorized)
+		return
+	}
+	// go-oidc leaves the nonce to the caller. Without this check an ID token
+	// from another sign-in of the same client would be accepted here.
+	if subtle.ConstantTimeCompare([]byte(idToken.Nonce), []byte(nonce)) != 1 {
 		http.Error(w, "invalid id token", http.StatusUnauthorized)
 		return
 	}
@@ -189,14 +284,15 @@ func (a *Auth) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var userID string
+	var epoch int
 	err = a.Store.Pool.QueryRow(r.Context(),
-		`SELECT id FROM users WHERE email=$1 AND NOT disabled`, email).Scan(&userID)
+		`SELECT id, session_epoch FROM users WHERE email=$1 AND NOT disabled`, email).Scan(&userID, &epoch)
 	if err != nil {
 		if !cfg.AutoCreateUsers {
 			http.Error(w, "no account for "+email+"; ask an admin to invite you", http.StatusForbidden)
 			return
 		}
-		id := uuid.New()
+		id := store.NewID()
 		if _, err := a.Store.Pool.Exec(r.Context(),
 			`INSERT INTO users (id, email, name, role) VALUES ($1,$2,$3,'member')
 			 ON CONFLICT (email) DO NOTHING`, id, email, claims.Name); err != nil {
@@ -204,12 +300,13 @@ func (a *Auth) handleCallback(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := a.Store.Pool.QueryRow(r.Context(),
-			`SELECT id FROM users WHERE email=$1`, email).Scan(&userID); err != nil {
+			`SELECT id, session_epoch FROM users WHERE email=$1`, email).Scan(&userID, &epoch); err != nil {
 			http.Error(w, "user lookup failed", http.StatusInternalServerError)
 			return
 		}
 	}
 
-	setSessionCookie(w, r, a.EncryptionKey, a.CookieDomain, userID)
+	signedIn, signedInEmail = userID, email
+	SetSessionCookie(w, r, a.EncryptionKey, a.CookieDomain, userID, epoch)
 	http.Redirect(w, r, "/", http.StatusFound)
 }

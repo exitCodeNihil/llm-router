@@ -265,7 +265,7 @@ pub fn adc() -> Arc<dyn Bearer> {
             if let Some(path) = adc.file()
                 && let Err(e) = adc.creds(path)
             {
-                eprintln!("google application default credentials: {e}");
+                crate::log_error!("google application default credentials: {e}");
             }
             Arc::new(RefreshingToken::new(adc))
         })
@@ -318,7 +318,7 @@ pub fn service_account(provider: &str, json: &str) -> Arc<dyn Bearer> {
         Ok(Creds::AuthorizedUser { .. }) => unreachable!("not allowed for a stored key"),
         Err(e) => {
             let e = format!("provider {provider:?}: google credentials: {e}");
-            eprintln!("{e}");
+            crate::log_error!("{e}");
             Arc::new(Refused(e))
         }
     };

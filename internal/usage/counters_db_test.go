@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/exitcodenihil/llm-router/internal/store"
 )
@@ -83,7 +84,23 @@ func TestConcurrentSyncsDoNotDeadlock(t *testing.T) {
 		Scan(&usd); err != nil {
 		t.Fatal(err)
 	}
-	if want := workers * rounds * cost; usd < want-1e-9 || usd > want+1e-9 {
+	want := workers * rounds * cost
+	if usd < want-1e-9 || usd > want+1e-9 {
 		t.Fatalf("key spend = %v, want %v", usd, want)
+	}
+	// The month and all-time rows carry the same spend as the day's.
+	rows, err := st.Pool.Query(ctx, `SELECT period, usd::float8 FROM spend_totals WHERE scope_type='key' AND scope_id=$1`, keys[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	totals := map[string]float64{}
+	var period string
+	if _, err := pgx.ForEachRow(rows, []any{&period, &usd}, func() error { totals[period] = usd; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	for _, period := range []string{"month", "total"} {
+		if got, ok := totals[period]; !ok || got < want-1e-9 || got > want+1e-9 {
+			t.Fatalf("%s spend = %v, want %v", period, got, want)
+		}
 	}
 }

@@ -17,7 +17,9 @@ import (
 // half-serves it. Older gateways get the schema they speak: 1 is 0.2.x.
 // Schema 2 adds Vertex and Entra credentials, identity-token issuers and the
 // telemetry policy, which a schema 1 gateway can't use and so never receives.
-const schemaVersion = 2
+// Schema 3 adds entry hashes and a digest, so a gateway can take a change as
+// a delta (delta.go), and tells syncs which config the gateway runs on.
+const schemaVersion = 3
 
 // Config is what a gateway runs on: the keys, users and teams its group
 // serves, the deployments they can reach in the group's routing order, and the
@@ -41,6 +43,11 @@ type Config struct {
 	// Schema 2: the capture policy and what content the group's gateways
 	// capture. Destinations and their credentials stay on the control plane.
 	Telemetry *Telemetry `json:"telemetry,omitempty"`
+	// Schema 3: the database the version counts in, the hash of everything
+	// that is not a key, user, team or email, and the digest of the whole.
+	Epoch    string `json:"epoch,omitempty"`
+	RestHash string `json:"rest_hash,omitempty"`
+	Digest   string `json:"digest,omitempty"`
 }
 
 // Telemetry is the capture policy (snapshot.Telemetry) plus Content: the
@@ -95,6 +102,7 @@ type Key struct {
 	TPMLimit      *int     `json:"tpm_limit,omitempty"`
 	ExpiresAt     int64    `json:"expires_at,omitempty"` // unix seconds
 	Tags          []string `json:"tags,omitempty"`
+	H             string   `json:"h,omitempty"` // schema 3: content hash
 }
 
 type User struct {
@@ -107,6 +115,7 @@ type User struct {
 	TPMLimit      *int                `json:"tpm_limit,omitempty"`
 	TeamIDs       []string            `json:"team_ids,omitempty"` // schema 2
 	Tags          []string            `json:"tags,omitempty"`     // schema 2
+	H             string              `json:"h,omitempty"`        // schema 3: content hash
 }
 
 type Team struct {
@@ -116,6 +125,7 @@ type Team struct {
 	RPMLimit      *int     `json:"rpm_limit,omitempty"`
 	TPMLimit      *int     `json:"tpm_limit,omitempty"`
 	Tags          []string `json:"tags,omitempty"` // schema 2
+	H             string   `json:"h,omitempty"`    // schema 3: content hash
 }
 
 type Provider struct {
@@ -157,7 +167,7 @@ type Price struct {
 // usage its gateways upload.
 type built struct {
 	cfg  Config
-	keys map[string]*snapshot.Key // by id: keys the group serves
+	keys map[string]*snapshot.Key // by id: keys the group serves (never an OldHash copy when the key is there)
 	// unserved names the providers with models the group serves that this
 	// schema leaves out, sorted.
 	unserved []string
@@ -209,7 +219,11 @@ func buildConfig(s *snapshot.Snapshot, g *snapshot.GatewayGroup, schema int) bui
 		if t != nil {
 			teams[t.ID] = t
 		}
-		b.keys[k.ID] = k
+		// A rotated key has more than one entry: its current hash and the
+		// old ones still in their grace period, all with the key's id.
+		if !k.OldHash || b.keys[k.ID] == nil {
+			b.keys[k.ID] = k
+		}
 		ids = append(ids, &auth.Identity{Key: k, User: u, Team: t})
 		wk := Key{Hash: hex.EncodeToString(hash[:]), ID: k.ID, UserID: k.UserID, TeamID: k.TeamID,
 			AllowedModels: list(k.AllowedModels), BudgetUSD: k.BudgetUSD, RPMLimit: k.RPMLimit, TPMLimit: k.TPMLimit}
@@ -265,7 +279,7 @@ func buildConfig(s *snapshot.Snapshot, g *snapshot.GatewayGroup, schema int) bui
 	providers := map[string]*snapshot.Provider{}
 	unserved := map[string]bool{}
 	for _, name := range names {
-		for _, d := range routingOrder(s.DeploymentsByModel[name], g.Region) {
+		for _, d := range routingOrder(s.DeploymentsByModel[name], g.Region, g.StrictRegion) {
 			if !servable(d.Provider, schema) {
 				unserved[d.Provider.Name] = true
 				continue
@@ -293,7 +307,12 @@ func buildConfig(s *snapshot.Snapshot, g *snapshot.GatewayGroup, schema int) bui
 	}
 
 	// Stable order, so a config only changes when its content does.
-	sort.Slice(c.Keys, func(i, j int) bool { return c.Keys[i].ID < c.Keys[j].ID })
+	sort.Slice(c.Keys, func(i, j int) bool {
+		if c.Keys[i].ID != c.Keys[j].ID {
+			return c.Keys[i].ID < c.Keys[j].ID
+		}
+		return c.Keys[i].Hash < c.Keys[j].Hash
+	})
 	sort.Slice(c.Users, func(i, j int) bool { return c.Users[i].ID < c.Users[j].ID })
 	sort.Slice(c.Teams, func(i, j int) bool { return c.Teams[i].ID < c.Teams[j].ID })
 	sort.Slice(c.Providers, func(i, j int) bool { return c.Providers[i].ID < c.Providers[j].ID })
@@ -431,8 +450,10 @@ func addIdentityUsers(c *Config, s *snapshot.Snapshot, g *snapshot.GatewayGroup,
 }
 
 // routingOrder puts the deployments in the group's region first, keeping the
-// snapshot's priority-then-price order inside each part.
-func routingOrder(ds []*snapshot.Deployment, region string) []*snapshot.Deployment {
+// snapshot's priority-then-price order inside each part. A strict group gets
+// only those: a model with no deployment in the region is then not served by
+// its gateways at all, and neither are the other regions' credentials sent.
+func routingOrder(ds []*snapshot.Deployment, region string, strict bool) []*snapshot.Deployment {
 	if region == "" {
 		return ds
 	}
@@ -441,6 +462,9 @@ func routingOrder(ds []*snapshot.Deployment, region string) []*snapshot.Deployme
 		if d.Region == region {
 			out = append(out, d)
 		}
+	}
+	if strict {
+		return out
 	}
 	for _, d := range ds {
 		if d.Region != region {

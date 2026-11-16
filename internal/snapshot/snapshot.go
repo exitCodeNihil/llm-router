@@ -24,6 +24,10 @@ type Key struct {
 	TPMLimit      *int
 	ExpiresAt     *time.Time
 	Tags          []string
+	// OldHash marks the entry for a rotated-out secret, a copy of the key
+	// whose ExpiresAt is the end of its grace period (or the key's own
+	// expiry, if sooner). Code that wants each key once skips these.
+	OldHash bool
 }
 
 type User struct {
@@ -124,6 +128,7 @@ type GatewayGroup struct {
 	ID           string
 	Name         string
 	Region       string
+	StrictRegion bool            // only deployments in Region, no fallback to others
 	AllowedTeams map[string]bool // nil = every team
 	DataRule     string          // inherit | no_content | no_export
 }
@@ -155,7 +160,13 @@ type Spend struct {
 }
 
 type Snapshot struct {
-	Version            int64
+	Version int64
+	// Epoch names the database the version counts in: it changes when the
+	// database is restored or replaced, where the version can go backwards.
+	// Empty when Postgres won't say.
+	Epoch string
+	// EpochID is the part of Epoch kept in settings (store.NewConfigEpoch).
+	EpochID            string
 	KeysByHash         map[[32]byte]*Key
 	UsersByID          map[string]*User
 	UsersByEmail       map[string]*User
@@ -164,17 +175,64 @@ type Snapshot struct {
 	Prices             map[string]Price         // catalog model_id -> price
 	Issuers            []*Issuer
 	// Spend holds current-period spend keyed by "key:"+id / "user:"+id / "team:"+id.
-	Spend         map[string]Spend
+	Spend map[string]Spend
+	// SpendAt is when Spend was read from Postgres.
+	SpendAt       time.Time
 	Telemetry     Telemetry
 	GatewayGroups map[string]*GatewayGroup
 	Destinations  []*Destination // by name
 }
 
 // Holder is the atomic snapshot pointer the hot path reads through.
-type Holder struct{ p atomic.Pointer[Snapshot] }
+type Holder struct {
+	p atomic.Pointer[Snapshot]
+	// changed is closed, and replaced, on every Set.
+	changed atomic.Pointer[chan struct{}]
+	// For /metrics: when the snapshot in use was built, how long that took,
+	// and how many rebuilds have failed.
+	builtAt, buildNanos, failures atomic.Int64
+}
 
-func (h *Holder) Get() *Snapshot  { return h.p.Load() }
-func (h *Holder) Set(s *Snapshot) { h.p.Store(s) }
+func (h *Holder) Get() *Snapshot { return h.p.Load() }
+
+func (h *Holder) Set(s *Snapshot) {
+	h.p.Store(s)
+	h.builtAt.Store(time.Now().UnixNano())
+	next := make(chan struct{})
+	if old := h.changed.Swap(&next); old != nil {
+		close(*old)
+	}
+}
+
+// Changed returns a channel that is closed at the next Set. Take it before
+// reading the snapshot you will wait on, or a Set in between is missed.
+func (h *Holder) Changed() <-chan struct{} {
+	for {
+		if c := h.changed.Load(); c != nil {
+			return *c
+		}
+		first := make(chan struct{})
+		if h.changed.CompareAndSwap(nil, &first) {
+			return first
+		}
+	}
+}
+
+// Built records how long the latest rebuild took; Failed counts one that failed.
+func (h *Holder) Built(took time.Duration) { h.buildNanos.Store(int64(took)) }
+func (h *Holder) Failed()                  { h.failures.Add(1) }
+
+// Age is how long ago the snapshot in use was built; LastBuild how long that
+// took. Both are zero before the first Set.
+func (h *Holder) Age() time.Duration {
+	at := h.builtAt.Load()
+	if at == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, at))
+}
+func (h *Holder) LastBuild() time.Duration { return time.Duration(h.buildNanos.Load()) }
+func (h *Holder) Failures() int64          { return h.failures.Load() }
 
 // Rate is a deployment's list price per 1M tokens (input + output), used to
 // order backends that share a priority so the cheaper one is tried first.

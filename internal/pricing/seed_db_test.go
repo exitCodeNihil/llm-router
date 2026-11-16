@@ -31,7 +31,7 @@ func TestSeedKeepsEditedPrices(t *testing.T) {
 		t.Fatal(err)
 	}
 	// An old seed value, and an admin's own price.
-	st.Pool.Exec(ctx, `UPDATE price_catalog SET cached_input_per_1m=0.1 WHERE model_id=$1`, seeded)
+	st.Pool.Exec(ctx, `UPDATE price_catalog SET cached_input_per_1m=0.2 WHERE model_id=$1`, seeded)
 	st.Pool.Exec(ctx, `UPDATE price_catalog SET input_per_1m=99, source='admin' WHERE model_id=$1`, edited)
 	if err := Seed(ctx, st.Pool); err != nil {
 		t.Fatal(err)
@@ -39,8 +39,8 @@ func TestSeedKeepsEditedPrices(t *testing.T) {
 	var cached, input float64
 	st.Pool.QueryRow(ctx, `SELECT cached_input_per_1m FROM price_catalog WHERE model_id=$1`, seeded).Scan(&cached)
 	st.Pool.QueryRow(ctx, `SELECT input_per_1m FROM price_catalog WHERE model_id=$1`, edited).Scan(&input)
-	if cached != 0.2 {
-		t.Errorf("a seed row must follow the catalog: cached read %v, want 0.2", cached)
+	if cached != 0.1 {
+		t.Errorf("a seed row must follow the catalog: cached read %v, want 0.1", cached)
 	}
 	if input != 99 {
 		t.Errorf("an edited price must stay: input %v, want 99", input)

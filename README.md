@@ -1,23 +1,81 @@
 # llm-router
 
-> **Status: early (v0.1).** It runs real traffic and is tested, but expect rough edges and
+> **Note:** llm-router was built for internal use, and some of its features are specific to that
+> setup. If something does not work or is buggy, or you need a feature or a fix, please
+> [open an issue](https://github.com/exitCodeNihil/llm-router/issues/new/choose).
+
+> **Status: pre-1.0 (0.4).** It runs real traffic and is tested, but expect rough edges and
 > breaking changes before 1.0.
 
 A self-hosted LLM gateway. One endpoint speaks both the OpenAI and Anthropic protocols and routes
-to Azure OpenAI / AI Foundry, Google Vertex AI, OpenRouter, vLLM, LM Studio or any
+to Azure OpenAI / AI Foundry, Google Vertex AI, Anthropic, OpenRouter, vLLM, LM Studio or any
 OpenAI-compatible server.
 
 - Works with Claude Code, Cursor, OpenCode, pi and any SDK.
 - Virtual API keys, teams, budgets, rate limits and SSO, with usage and cost for every request.
-- Cheapest-first routing with failover across backends that share a model name.
+  Keys rotate with a grace period, sessions can be revoked, and an audit log records who changed
+  what ([access](docs/access.md)).
+- Cheapest-first routing with failover across backends that share a model name, and gateway
+  groups that can be held to one region.
 - Request traces to any OpenTelemetry backend and Langfuse, per team and gateway group, with or
-  without prompts ([observability](docs/observability.md)); Prometheus metrics and alerts for the
-  router itself ([monitoring](docs/monitoring.md)).
+  without prompts, and with secrets and personal data redacted before they leave
+  ([observability](docs/observability.md)); Prometheus metrics and alerts for the router itself
+  ([monitoring](docs/monitoring.md)).
 - Runs Claude Code on your claude.ai subscription and records it without holding a credential.
 - Optional per-user dev workspaces (VS Code and a coding agent), and Rust gateways you run behind a
-  load balancer, in other regions or per team, all configured from one place.
-- Go, one static binary, no database on the hot path: 15,000 req/s on one vCPU and 0.12 ms added
-  per request, against 125 req/s and 4.2 ms for LiteLLM ([benchmarks](docs/benchmarks.md)).
+  load balancer, in other regions or per team, all configured from one place. Gateways keep
+  serving, and keep their usage, while the control plane or Postgres is away.
+- Several control planes can share one database, and the encryption key rotates without downtime
+  ([deploying](docs/deploy.md)).
+- No database on the hot path. The control plane is one static Go binary: 15,000 req/s on one vCPU
+  and 0.12 ms added per request, against 125 req/s and 4.2 ms for LiteLLM. A Rust gateway reaches
+  30,000 req/s on one vCPU ([benchmarks](docs/benchmarks.md)).
+
+## How it fits together
+
+```mermaid
+flowchart LR
+    tools["Claude Code, Cursor,<br/>OpenCode, SDKs"]
+    people["Admins and users<br/>(browser)"]
+
+    subgraph cp["Control plane (Go)"]
+        console["Console and<br/>management API"]
+        cpapi["/v1 API"]
+    end
+
+    subgraph gws["Gateways (Rust, optional)"]
+        gwapi["/v1 API"]
+        disk[("State on disk:<br/>config, spend, usage")]
+    end
+
+    db[("Postgres:<br/>config, keys, usage, audit")]
+    providers["Model providers:<br/>Azure, Vertex AI, Anthropic,<br/>OpenRouter, vLLM, ..."]
+    traces["OpenTelemetry backends,<br/>Langfuse"]
+    prom["Prometheus,<br/>Grafana"]
+
+    people --> console
+    tools -->|"OpenAI or Anthropic protocol"| cpapi
+    tools -->|"OpenAI or Anthropic protocol"| gwapi
+    cpapi --> providers
+    gwapi --> providers
+    cp <--> db
+    gwapi <-->|"config, limits, usage"| cp
+    gwapi --- disk
+    cp -->|"request traces"| traces
+    prom -.->|"scrape /metrics"| cp
+    prom -.->|"scrape /metrics"| gws
+```
+
+| Component | What it does |
+|---|---|
+| **Control plane** (`llm-router`, Go) | The console and management API, plus a `/v1` endpoint of its own. It holds the config in memory and reads Postgres only to refresh it, so requests never wait on the database. Run one, or several on the same database. |
+| **Gateways** (`llm-router-gateway`, Rust) | Optional. They serve `/v1` close to your users: behind a load balancer, in another region or per team. They take keys, models, prices and limits from the control plane and send usage back, and keep working from disk when it is away. |
+| **Postgres** | Config, keys, usage, spend and the audit log. The only state to back up. |
+| **Model providers** | Whatever you add under Providers. Both paths call them directly. |
+| **Telemetry and monitoring** | Request traces go from the control plane to OpenTelemetry backends and Langfuse. Prometheus scrapes the control plane and each gateway. |
+
+A small installation is just the control plane and Postgres; add gateways when you need more
+throughput or another region.
 
 ## Quick start
 
@@ -46,7 +104,7 @@ Every request then shows up with tokens, cost, latency and which provider answer
 ### Docker without cloning
 
 The image is published for amd64 and arm64 at `ghcr.io/exitcodenihil/llm-router` (`latest`, or pin
-a release such as `:0.1.0`). It needs Postgres, so use Compose. In an empty directory:
+a release such as `:0.4.0`). It needs Postgres, so use Compose. In an empty directory:
 
 ```bash
 # Keep this file: the encryption key protects stored provider credentials.
@@ -135,8 +193,9 @@ docker run -d --name llm-router --network llmr -p 8080:8080 -p 8081:8081 \
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Report vulnerabilities privately per
-[SECURITY.md](SECURITY.md).
+Bug reports, feature requests and pull requests are welcome:
+[open an issue](https://github.com/exitCodeNihil/llm-router/issues/new/choose) or see
+[CONTRIBUTING.md](CONTRIBUTING.md). Report vulnerabilities privately per [SECURITY.md](SECURITY.md).
 
 ## License
 

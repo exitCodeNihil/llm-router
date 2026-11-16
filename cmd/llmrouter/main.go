@@ -15,7 +15,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/exitcodenihil/llm-router/internal/audit"
 	"github.com/exitcodenihil/llm-router/internal/auth"
+	"github.com/exitcodenihil/llm-router/internal/cluster"
 	"github.com/exitcodenihil/llm-router/internal/config"
 	"github.com/exitcodenihil/llm-router/internal/console"
 	"github.com/exitcodenihil/llm-router/internal/gateway"
@@ -24,6 +26,7 @@ import (
 	"github.com/exitcodenihil/llm-router/internal/metrics"
 	"github.com/exitcodenihil/llm-router/internal/mgmt"
 	"github.com/exitcodenihil/llm-router/internal/pricing"
+	"github.com/exitcodenihil/llm-router/internal/rekey"
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
 	"github.com/exitcodenihil/llm-router/internal/store"
 	"github.com/exitcodenihil/llm-router/internal/telemetry"
@@ -41,6 +44,30 @@ func main() {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
+}
+
+// readyz answers 200 once a snapshot is loaded, until shutdown begins.
+func readyz(holder *snapshot.Holder, shutdown context.Context) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case shutdown.Err() != nil:
+			http.Error(w, "shutting down", http.StatusServiceUnavailable)
+		case holder.Get() == nil:
+			http.Error(w, "starting", http.StatusServiceUnavailable)
+		default:
+			w.Write([]byte("ok"))
+		}
+	}
+}
+
+// setLogging applies LLMR_LOG_LEVEL and LLMR_LOG_FORMAT to the default logger.
+func setLogging(cfg *config.Config) {
+	opts := &slog.HandlerOptions{Level: cfg.LogLevel}
+	var h slog.Handler = slog.NewTextHandler(os.Stderr, opts)
+	if cfg.LogJSON {
+		h = slog.NewJSONHandler(os.Stderr, opts)
+	}
+	slog.SetDefault(slog.New(h))
 }
 
 // watchConfigEpoch appends a cluster event each time the snapshot version bumps
@@ -69,6 +96,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	setLogging(cfg)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -79,7 +107,9 @@ func run() error {
 	lim := limits.New()
 	gw := &gateway.Server{Snapshots: holder, Limits: lim}
 
-	st, err := store.Open(ctx, cfg.DatabaseURL)
+	st, err := store.OpenWith(ctx, cfg.DatabaseURL, store.Options{
+		MaxConns: cfg.DBMaxConns, ConsoleMaxConns: cfg.DBConsoleMaxConns, ConsoleTimeout: cfg.DBConsoleTimeout,
+	})
 	if err != nil {
 		return err
 	}
@@ -107,23 +137,73 @@ func run() error {
 		return err
 	}
 	telemetry.Register(otlp.Kind{}, langfuse.Kind{})
+	if err := console.MigrateSSO(ctx, st.Pool, cfg.EncryptionKey); err != nil {
+		return fmt.Errorf("encrypt the SSO client secret: %w", err)
+	}
 
-	builder := &snapshot.Builder{Pool: st.Pool, EncryptionKey: cfg.EncryptionKey}
+	// The keys of an encryption-key rotation: written under Current, read
+	// and verified under all (docs/deploy.md).
+	keys := snapshot.Keyring{Current: cfg.EncryptionKey, Others: cfg.OtherKeys()}
+	builder := &snapshot.Builder{Pool: st.Pool, EncryptionKey: keys.Current, OtherKeys: keys.Others}
+	buildStart := time.Now()
 	first, err := builder.Build(ctx)
 	if err != nil {
 		return err
 	}
+	holder.Built(time.Since(buildStart))
 	holder.Set(first)
 	go snapshot.Refresher(ctx, st.Pool, builder, holder, 30*time.Second)
 
 	writer := usage.NewPGWriter(st.Pool)
+	// Spend the limiter added when a request finished is in Postgres now.
+	writer.Committed = func(events []usage.Event) {
+		for _, e := range events {
+			for _, scope := range usage.ScopeKeys(e) {
+				lim.Committed(scope, e.CostUSD)
+			}
+		}
+	}
+	writer.Retention = usage.Retention{RawMonths: cfg.UsageRetentionMonths, RollupMonths: cfg.RollupRetentionMonths}
+	if err := writer.Retention.Validate(); err != nil {
+		return fmt.Errorf("LLMR_USAGE_RETENTION_MONTHS / LLMR_ROLLUP_RETENTION_MONTHS: %w", err)
+	}
+	auditRec := &audit.Recorder{Pool: st.Pool}
+	if cfg.AuditRetentionMonths > 0 {
+		writer.Maintenance = append(writer.Maintenance, func(ctx context.Context) error {
+			if err := auditRec.Prune(ctx, cfg.AuditRetentionMonths); err != nil {
+				return fmt.Errorf("audit retention: %w", err)
+			}
+			return nil
+		})
+	}
+	writer.Maintenance = append(writer.Maintenance, func(ctx context.Context) error {
+		if err := gwsync.PruneStale(ctx, st.Pool); err != nil {
+			return fmt.Errorf("gateway instances: %w", err)
+		}
+		if err := console.PruneSessions(ctx, st.Pool); err != nil {
+			return fmt.Errorf("revoked sessions: %w", err)
+		}
+		if err := mgmt.PruneKeyHashes(ctx, st.Pool); err != nil {
+			return fmt.Errorf("rotated key hashes: %w", err)
+		}
+		return nil
+	})
 	if err := writer.EnsurePartitions(ctx); err != nil {
 		return fmt.Errorf("usage_events partitions: %w (the database role needs CREATE on the schema)", err)
 	}
-	go writer.Run(ctx)
+	// Stopped only once the HTTP server has drained: the requests still
+	// finishing after the signal write their usage too.
+	writerCtx, stopWriter := context.WithCancel(context.Background())
+	defer stopWriter()
+	writerDone := make(chan struct{})
+	go func() {
+		writer.Run(writerCtx)
+		close(writerDone)
+	}()
 	recorder := telemetry.NewRecorder()
 	exporter := telemetry.NewManager(holder, st.Pool)
 	exporter.Recorder = recorder
+	exporter.SetDelivery(cfg.TelemetryConcurrency, cfg.TelemetryDrain)
 	// Stopped only once the HTTP server has drained, so the events of the
 	// last requests are in the queues it flushes.
 	exportCtx, stopExport := context.WithCancel(context.Background())
@@ -136,20 +216,53 @@ func run() error {
 	live := metrics.NewLive()
 	nodeStore := metrics.NewNodeStore()
 	httpm := metrics.NewHTTP()
-	promReg := newMetrics(httpm, nodeStore, writer, exporter)
+	promReg := newMetrics(httpm, nodeStore, writer, exporter, holder, st, auditRec)
 	events := &metrics.Events{}
 	go watchConfigEpoch(ctx, holder, events)
 	gw.Usage = usage.MultiWriter{writer, exporter, live}
 	gw.CloudAuth = auth.NewCloudValidator(st.Pool).Validate
+	gw.RecordClientIP, gw.TrustedProxies = cfg.UsageClientIP, cfg.TrustedProxies
 
 	if cfg.AdminToken == "" {
 		slog.Warn("LLMR_ADMIN_TOKEN is not set; bootstrap admin login is disabled")
 	}
-	mg := &mgmt.Server{Store: st, AdminToken: cfg.AdminToken, EncryptionKey: cfg.EncryptionKey,
+	mg := &mgmt.Server{Store: st, AdminToken: cfg.AdminToken, EncryptionKey: keys.Current, OtherKeys: keys.Others,
 		Snapshots: holder, Live: live, NodeStore: nodeStore, HTTP: httpm, Events: events, Recorder: recorder, Telemetry: exporter,
-		Gateway: gw, Version: version, Started: time.Now(), IDEOrigin: cfg.IDEOrigin}
+		Gateway: gw, Version: version, Started: time.Now(), IDEOrigin: cfg.IDEOrigin,
+		UsageRetentionMonths: cfg.UsageRetentionMonths, Audit: auditRec, TrustedProxies: cfg.TrustedProxies,
+		CookieDomain: cfg.CookieDomain}
 	mg.Register(mux)
 	go mg.SyncWorkspaceModels(ctx)
+
+	// Other control planes on this database, if any: limits and budgets are
+	// shared with them, and each one's console shows all of them.
+	node := &cluster.Node{Pool: st.Pool, Limits: lim, Version: version, State: mg.ClusterState,
+		Spend: func(ctx context.Context, scopes []string) (map[string]float64, time.Time, error) {
+			return builder.SpendOf(ctx, holder.Get(), scopes)
+		}}
+	mg.Peers = node.Peers
+	node.KeyFP = snapshot.KeyFP(keys.Current)
+	// Secrets under an old key are rewritten only once every replica has
+	// this one's current key, and only once they have been looked up.
+	rk := &rekey.Rekeyer{Pool: st.Pool, Keys: keys, PeersAgree: func() bool {
+		for _, p := range node.Peers() {
+			if p.KeyFP != node.KeyFP {
+				return false
+			}
+		}
+		return node.Known()
+	}}
+	go rk.Run(ctx)
+	promReg.Register(rekeyMetrics(rk))
+	go node.Run(ctx)
+	promReg.Register(metrics.CollectorFunc(func(w *metrics.PromWriter) {
+		w.Family("llmr_control_planes", "gauge", "Control planes running on this database, this one included")
+		w.Sample("llmr_control_planes", float64(1+len(node.Peers())))
+		w.Family("llmr_cluster_sync_errors_total", "counter", "Rounds of sharing limits with the other control planes that failed")
+		w.Sample("llmr_cluster_sync_errors_total", float64(node.Errors.Load()))
+		w.Family("llmr_budget_reserved_usd", "gauge", "Expected cost of requests in flight, held against budgets")
+		w.Sample("llmr_budget_reserved_usd", lim.Held())
+	}))
 	if cfg.IDEListen != "" {
 		ideMux := http.NewServeMux()
 		mg.RegisterIDE(ideMux)
@@ -167,22 +280,27 @@ func run() error {
 	} else {
 		slog.Warn("LLMR_IDE_ORIGIN is not set: workspace IDEs share the console origin; set LLMR_IDE_LISTEN/LLMR_IDE_ORIGIN in production")
 	}
-	consoleAuth := &console.Auth{Store: st, EncryptionKey: cfg.EncryptionKey, CookieDomain: cfg.CookieDomain,
-		TrustedProxies: cfg.TrustedProxies}
+	consoleAuth := &console.Auth{Store: st, EncryptionKey: keys.Current, OtherKeys: keys.Others, CookieDomain: cfg.CookieDomain,
+		TrustedProxies: cfg.TrustedProxies, Audit: auditRec.Record}
 	consoleAuth.Register(mux)
 	mg.TokenGuard = consoleAuth
 	gwSync := &gwsync.Server{Store: st, Snapshots: holder, Limits: lim, Export: usage.MultiWriter{exporter, live}, Nodes: nodeStore,
-		Key: auth.DeriveKey("llmr-gw-session", cfg.EncryptionKey)}
+		Key: auth.DeriveKey("llmr-gw-session", keys.Current), VerifyKeys: auth.DeriveKeys("llmr-gw-session", keys.Others...),
+		RecordClientIP: cfg.UsageClientIP}
 	gwSync.Register(mux)
 	mg.GatewaySync = gwSync
 	mux.Handle("/", console.SPA())
 
 	gw.Register(mux)
 	serveMetrics(ctx, cfg.MetricsListen, mux, promReg)
+	// /healthz: the process is up. /readyz: it has a config and is not
+	// shutting down. Neither asks Postgres: with it away the control plane
+	// still serves from memory and queues usage, and must stay in rotation.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
+	mux.HandleFunc("GET /readyz", readyz(holder, ctx))
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -204,10 +322,16 @@ func run() error {
 		return err
 	}
 	<-drained
+	stopWriter()
+	select {
+	case <-writerDone:
+	case <-time.After(6 * time.Second):
+		slog.Warn("usage writer did not finish flushing before exit")
+	}
 	stopExport()
 	select {
 	case <-exportDone:
-	case <-time.After(7 * time.Second):
+	case <-time.After(exporter.Drain() + 2*time.Second):
 		slog.Warn("telemetry export did not finish flushing before exit")
 	}
 	return nil

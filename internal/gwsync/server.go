@@ -9,6 +9,7 @@ package gwsync
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/exitcodenihil/llm-router/internal/auth"
 	"github.com/exitcodenihil/llm-router/internal/limits"
@@ -40,6 +42,10 @@ const (
 	staleInstance   = 7 * 24 * time.Hour
 )
 
+// rewindAfter is how long a gateway may stay ahead of this control plane
+// before the database is taken to have gone back (behind).
+var rewindAfter = time.Minute
+
 // Server is mounted on the control plane under /gw/v1/.
 type Server struct {
 	Store     *store.Store
@@ -48,12 +54,21 @@ type Server struct {
 	Export    usage.Writer    // exporters and live metrics; rows are written here directly
 	Nodes     *metrics.NodeStore
 	Key       []byte // session signing key
+	// VerifyKeys are accepted too, during an encryption-key rotation.
+	VerifyKeys [][]byte
 	// Tokens verifies callers' identity tokens for /gw/v1/provision; nil
 	// makes one on first use.
 	Tokens *auth.CloudValidator
+	// RecordClientIP keeps the client address gateways report with usage
+	// (LLMR_USAGE_CLIENT_IP); off, it is dropped.
+	RecordClientIP bool
 
-	mu    sync.Mutex
-	cache map[string]*encoded // by group id
+	mu     sync.Mutex          // guards the two maps, never a build
+	cache  map[string]*encoded // by group and schema: the latest version asked for
+	tracks map[string]*tracker // by group and schema
+	// ahead is since when each gateway has run on a newer config than this
+	// control plane's (behind).
+	ahead map[string]time.Time
 
 	tokensOnce sync.Once
 	provMu     sync.Mutex
@@ -61,12 +76,24 @@ type Server struct {
 	provCount  map[string]int // by instance, this minute
 }
 
-// encoded is one group's config at one snapshot version, gzipped once for
-// every instance of the group that polls it.
+// encoded is one group's config at one snapshot version, built and gzipped
+// once for every instance of the group that asks for it.
 type encoded struct {
+	group   string
 	version int64
+	once    sync.Once
 	gz      []byte
 	built
+	// Schema 3: the tracker this version is the head of, and the deltas cut
+	// from it so far; nil when a newer version was built first.
+	track   *tracker
+	deltaMu sync.Mutex
+	deltas  map[deltaBase][]byte
+}
+
+type deltaBase struct {
+	version int64
+	digest  string
 }
 
 func (s *Server) Register(mux *http.ServeMux) {
@@ -74,6 +101,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.Handle("POST /gw/v1/renew", s.session(s.renew))
 	mux.Handle("GET /gw/v1/config", s.session(s.config))
 	mux.Handle("POST /gw/v1/sync", s.session(s.sync))
+	mux.Handle("POST /gw/v1/replay", s.session(s.replay))
 	mux.Handle("POST /gw/v1/provision", s.session(s.provision))
 }
 
@@ -87,7 +115,7 @@ type sessionHandler func(w http.ResponseWriter, r *http.Request, p peer)
 
 func (s *Server) session(next sessionHandler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sub, err := auth.VerifyToken(s.Key, bearer(r))
+		sub, err := auth.VerifyTokenAny(append([][]byte{s.Key}, s.VerifyKeys...), bearer(r))
 		parts := strings.Split(sub, ":")
 		if err != nil || len(parts) < 2 || len(parts) > 3 {
 			http.Error(w, "invalid or expired session: join again", http.StatusUnauthorized)
@@ -121,11 +149,20 @@ func (s *Server) newSession(p peer) sessionResponse {
 	return sessionResponse{Session: auth.SignToken(s.Key, sub, exp), ExpiresAtMS: exp.UnixMilli()}
 }
 
+// refuse answers 401 as the control plane's own verdict: the join token
+// matches no group, or the instance or its group is gone. The header tells it
+// apart from a 401 a proxy in between sends; a gateway refused on its join for
+// 15 minutes stops serving. Never sent for a failure to look it up.
+func refuse(w http.ResponseWriter, why string) {
+	w.Header().Set("X-Llmr-Refused", "1")
+	http.Error(w, why, http.StatusUnauthorized)
+}
+
 // join registers a new gateway instance in the group whose token it presents.
 func (s *Server) join(w http.ResponseWriter, r *http.Request) {
 	token := bearer(r)
 	if !strings.HasPrefix(token, JoinTokenPrefix) {
-		http.Error(w, "group join token required", http.StatusUnauthorized)
+		refuse(w, "group join token required")
 		return
 	}
 	var req struct {
@@ -145,15 +182,21 @@ func (s *Server) join(w http.ResponseWriter, r *http.Request) {
 	var g Group
 	err := s.Store.Pool.QueryRow(r.Context(), `SELECT id, name, region, data_rule FROM gateway_groups WHERE join_token_hash=$1`,
 		hash[:]).Scan(&g.ID, &g.Name, &g.Region, &g.DataRule)
+	if errors.Is(err, pgx.ErrNoRows) {
+		refuse(w, "unknown join token")
+		return
+	}
 	if err != nil {
-		http.Error(w, "unknown join token", http.StatusUnauthorized)
+		slog.Error("gateway join failed", "err", err)
+		http.Error(w, "join failed", http.StatusServiceUnavailable)
 		return
 	}
 	id := uuid.NewString()
 	if _, err := s.Store.Pool.Exec(r.Context(),
 		`INSERT INTO gateway_instances (id, group_id, name, version, last_seen_at) VALUES ($1,$2,$3,$4,now())`,
 		id, g.ID, trim(req.Name, 200), trim(req.Version, 100)); err != nil {
-		http.Error(w, "join failed", http.StatusInternalServerError)
+		slog.Error("gateway join failed", "group", g.Name, "err", err)
+		http.Error(w, "join failed", http.StatusServiceUnavailable)
 		return
 	}
 	// Autoscaled replicas come and go: forget the ones gone for a week.
@@ -172,39 +215,72 @@ func (s *Server) join(w http.ResponseWriter, r *http.Request) {
 func (s *Server) renew(w http.ResponseWriter, r *http.Request, p peer) {
 	instance, group := p.instance, p.group
 	var one int
-	if err := s.Store.Pool.QueryRow(r.Context(),
-		`SELECT 1 FROM gateway_instances WHERE id=$1 AND group_id=$2`, instance, group).Scan(&one); err != nil {
-		http.Error(w, "instance removed: join again", http.StatusUnauthorized)
+	err := s.Store.Pool.QueryRow(r.Context(),
+		`SELECT 1 FROM gateway_instances WHERE id=$1 AND group_id=$2`, instance, group).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		refuse(w, "instance removed: join again")
+		return
+	}
+	if err != nil {
+		slog.Error("gateway session renew failed", "instance", instance, "err", err)
+		http.Error(w, "renew failed", http.StatusServiceUnavailable)
 		return
 	}
 	writeJSON(w, http.StatusOK, s.newSession(p))
 }
 
-// config long-polls: it answers 304 until the config version differs from the
-// gateway's If-None-Match ("v<version>"), or the wait (seconds) runs out.
+// config long-polls: it answers 304 until there is a config the gateway
+// should have, or the wait (seconds) runs out. The gateway names what it holds
+// in If-None-Match: "v<version>", or from schema 3 "<epoch>-v<version>" with
+// the config's digest in X-Llmr-Config-Digest. A schema 3 gateway whose
+// config this control plane knows gets a delta.
 func (s *Server) config(w http.ResponseWriter, r *http.Request, p peer) {
 	group := p.group
-	have, _ := strconv.ParseInt(strings.TrimPrefix(strings.Trim(r.Header.Get("If-None-Match"), `"`), "v"), 10, 64)
+	haveEpoch, have := parseETag(r.Header.Get("If-None-Match"))
 	wait, _ := strconv.Atoi(r.URL.Query().Get("wait"))
-	deadline := time.Now().Add(min(time.Duration(max(wait, 0))*time.Second, maxWait))
+	deadline := time.NewTimer(min(time.Duration(max(wait, 0))*time.Second, maxWait))
+	defer deadline.Stop()
 	for {
+		changed := s.Snapshots.Changed()
 		snap := s.Snapshots.Get()
 		if snap != nil {
 			if snap.GatewayGroups[group] == nil {
 				http.Error(w, "gateway group removed", http.StatusUnauthorized)
 				return
 			}
-			if snap.Version != have {
+			// In the same database a version only counts when it is newer:
+			// another control plane, a moment ahead, may have given the
+			// gateway a later one. A different database (restored, replaced)
+			// starts over, whatever its number.
+			due := snap.Version != have
+			if p.schema >= 3 && haveEpoch != "" {
+				// Equal numbers in two databases are two configs.
+				due = haveEpoch != snap.Epoch || snap.Version > have
+			}
+			if due {
 				enc := s.encoded(snap, group, p.schema)
+				body, etag := enc.gz, `"v`+strconv.FormatInt(enc.version, 10)+`"`
+				if p.schema >= 3 {
+					etag = `"` + snap.Epoch + `-v` + strconv.FormatInt(enc.version, 10) + `"`
+					if haveEpoch == snap.Epoch {
+						if d := enc.delta(have, r.Header.Get("X-Llmr-Config-Digest")); d != nil {
+							body = d
+						}
+					}
+				}
 				h := w.Header()
 				h.Set("Content-Type", "application/json")
 				h.Set("Content-Encoding", "gzip")
-				h.Set("ETag", `"v`+strconv.FormatInt(enc.version, 10)+`"`)
-				w.Write(enc.gz)
+				h.Set("ETag", etag)
+				w.Write(body)
 				return
 			}
 		}
-		if time.Now().After(deadline) {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-changed:
+		case <-deadline.C:
 			if snap == nil {
 				http.Error(w, "control plane starting", http.StatusServiceUnavailable)
 			} else {
@@ -212,12 +288,17 @@ func (s *Server) config(w http.ResponseWriter, r *http.Request, p peer) {
 			}
 			return
 		}
-		select {
-		case <-r.Context().Done():
-			return
-		case <-time.After(time.Second):
-		}
 	}
+}
+
+// parseETag reads "v12" or "<epoch>-v12".
+func parseETag(v string) (epoch string, version int64) {
+	v = strings.Trim(v, `"`)
+	if i := strings.LastIndex(v, "-v"); i >= 0 {
+		epoch, v = v[:i], v[i+1:]
+	}
+	version, _ = strconv.ParseInt(strings.TrimPrefix(v, "v"), 10, 64)
+	return epoch, version
 }
 
 // encoded returns the group's config for this snapshot, building it once per
@@ -235,28 +316,88 @@ func (s *Server) UnservedProviders(group string, schema int) []string {
 }
 
 func (s *Server) encoded(snap *snapshot.Snapshot, group string, schema int) *encoded {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	key := group + ":" + strconv.Itoa(schema)
-	if e := s.cache[key]; e != nil && e.version == snap.Version {
-		return e
+	s.mu.Lock()
+	e := s.cache[key]
+	switch {
+	case e != nil && e.version == snap.Version:
+	case e != nil && e.version > snap.Version:
+		// A caller still on an older snapshot: build for it alone.
+		e = &encoded{group: group, version: snap.Version}
+	default:
+		if s.cache == nil {
+			s.cache, s.tracks = map[string]*encoded{}, map[string]*tracker{}
+		}
+		for k, old := range s.cache {
+			if snap.GatewayGroups[old.group] == nil { // deleted groups
+				delete(s.cache, k)
+				delete(s.tracks, k)
+			}
+		}
+		e = &encoded{group: group, version: snap.Version}
+		s.cache[key] = e
 	}
-	b := buildConfig(snap, snap.GatewayGroups[group], schema)
-	var buf bytes.Buffer
-	gz, _ := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
-	json.NewEncoder(gz).Encode(b.cfg)
-	gz.Close()
-	if s.cache == nil {
-		s.cache = map[string]*encoded{}
-	}
-	for id, e := range s.cache {
-		if e.version != snap.Version {
-			delete(s.cache, id) // configs from an older snapshot, or for deleted groups
+	var track *tracker
+	if schema >= 3 && s.cache[key] == e {
+		if track = s.tracks[key]; track == nil {
+			track = &tracker{}
+			s.tracks[key] = track
 		}
 	}
-	e := &encoded{version: snap.Version, gz: buf.Bytes(), built: b}
-	s.cache[key] = e
+	s.mu.Unlock()
+
+	// Outside the lock: one group's build holds up only those waiting for
+	// that same config.
+	e.once.Do(func() {
+		e.built = buildConfig(snap, snap.GatewayGroups[group], schema)
+		if schema >= 3 {
+			seal(&e.cfg, snap.Epoch)
+		}
+		if track != nil {
+			track.mu.Lock()
+			if e.cfg.Version > track.version {
+				track.advance(&e.cfg)
+				e.track = track
+			}
+			track.mu.Unlock()
+		}
+		e.gz = gzipJSON(e.cfg)
+	})
 	return e
+}
+
+func gzipJSON(v any) []byte {
+	var buf bytes.Buffer
+	gz, _ := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+	json.NewEncoder(gz).Encode(v)
+	gz.Close()
+	return buf.Bytes()
+}
+
+// delta is the gzipped change from the config a gateway holds to this one,
+// or nil when it has to take the whole config.
+func (e *encoded) delta(base int64, digest string) []byte {
+	if e.track == nil || digest == "" {
+		return nil
+	}
+	e.deltaMu.Lock()
+	defer e.deltaMu.Unlock()
+	k := deltaBase{base, digest}
+	if gz, ok := e.deltas[k]; ok {
+		return gz
+	}
+	e.track.mu.Lock()
+	d := e.track.since(&e.cfg, base, digest)
+	e.track.mu.Unlock()
+	var gz []byte
+	if d != nil {
+		gz = gzipJSON(d)
+	}
+	if e.deltas == nil || len(e.deltas) >= 32 { // gateways are on a handful of versions
+		e.deltas = map[deltaBase][]byte{}
+	}
+	e.deltas[k] = gz
+	return gz
 }
 
 // SyncRequest is one upload from a gateway. Batch numbers start at 1 and only
@@ -268,6 +409,52 @@ type SyncRequest struct {
 	Events []SyncEvent `json:"events"`
 	Rates  []RateDelta `json:"rates"`
 	Stats  Stats       `json:"stats"`
+	// Schema 3: the config the gateway runs on, and its limits cursor for
+	// each control plane it has synced with (Cursor is the latest of them).
+	ConfigVersion int64             `json:"config_version,omitempty"`
+	ConfigEpoch   string            `json:"config_epoch,omitempty"`
+	Cursors       map[string]string `json:"cursors,omitempty"`
+}
+
+// behind reports whether this control plane's snapshot is older than the
+// config a gateway runs on, which another control plane gave it. Its usage
+// may be for keys this one does not know yet and would drop, so the gateway
+// is told to try again; the snapshot catches up within seconds.
+//
+// A control plane is behind for seconds. A gateway that stays ahead for a
+// minute is ahead of the database itself: it was restored to an earlier state
+// in place. The control plane then starts a new epoch, and every gateway
+// takes the restored config.
+func (s *Server) behind(w http.ResponseWriter, snap *snapshot.Snapshot, instance, epoch string, version int64) bool {
+	ahead := epoch == snap.Epoch && version > snap.Version
+	s.mu.Lock()
+	since, seen := s.ahead[instance]
+	switch {
+	case !ahead:
+		delete(s.ahead, instance)
+	case !seen:
+		if s.ahead == nil {
+			s.ahead = map[string]time.Time{}
+		}
+		s.ahead[instance] = time.Now()
+	}
+	s.mu.Unlock()
+	if !ahead {
+		return false
+	}
+	if seen && time.Since(since) > rewindAfter {
+		slog.Warn("a gateway has been ahead of the database for a minute: taking the database as restored to an earlier state",
+			"instance", instance, "gateway_version", version, "version", snap.Version)
+		if err := s.Store.NewConfigEpoch(context.Background(), snap.EpochID); err != nil {
+			slog.Error("starting a new config epoch failed", "err", err)
+		}
+		s.mu.Lock()
+		delete(s.ahead, instance) // a minute more before trying again
+		s.mu.Unlock()
+	}
+	w.Header().Set("Retry-After", "1")
+	http.Error(w, "this control plane is catching up: try again", http.StatusServiceUnavailable)
+	return true
 }
 
 // SyncEvent is a usage event; ts_ms (unix milliseconds) replaces ts.
@@ -305,14 +492,6 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request, p peer) {
 		http.Error(w, "control plane starting", http.StatusServiceUnavailable)
 		return
 	}
-	g := snap.GatewayGroups[group]
-	if g == nil {
-		http.Error(w, "gateway group removed", http.StatusUnauthorized)
-		return
-	}
-	// This snapshot was built before the events below are committed, so their
-	// spend is added on top of it.
-	s.Limits.Observe(snap)
 	body := io.Reader(r.Body)
 	if r.Header.Get("Content-Encoding") == "gzip" {
 		gz, err := gzip.NewReader(r.Body)
@@ -328,44 +507,21 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request, p peer) {
 		http.Error(w, "invalid sync request", http.StatusBadRequest)
 		return
 	}
+	if s.behind(w, snap, instance, req.ConfigEpoch, req.ConfigVersion) {
+		return
+	}
+	g := snap.GatewayGroups[group]
+	if g == nil {
+		http.Error(w, "gateway group removed", http.StatusUnauthorized)
+		return
+	}
+	// This snapshot was built before the events below are committed, so their
+	// spend is added on top of it.
+	s.Limits.Observe(snap)
 
 	// A gateway can only report usage for callers its group serves.
 	enc := s.encoded(snap, group, p.schema)
-	events := make([]usage.Event, 0, len(req.Events))
-	dropped, clamped, fixed := 0, 0, 0
-	now := time.Now()
-	for _, se := range req.Events {
-		e := se.Event
-		if g.AllowedTeams != nil && enc.keys[e.APIKeyID] == nil && !g.AllowedTeams[e.TeamID] &&
-			!memberOfAllowed(snap, g, e.UserID) {
-			dropped++
-			continue
-		}
-		if se.TSMS > 0 {
-			e.TS = time.UnixMilli(se.TSMS)
-		}
-		// A gateway's clock or a corrupt event must not produce a row Postgres
-		// refuses: that would fail the batch, and the gateway would resend it.
-		var moved bool
-		if e.TS, moved = usage.ClampTS(e.TS, now); moved {
-			clamped++
-		}
-		if usage.Sanitize(&e) > 0 {
-			fixed++
-		}
-		e.GatewayID, e.GatewayGroupID = instance, group
-		if e.TraceID == "" {
-			e.TraceID = usage.TraceIDFor(e.RequestID) // gateways before 0.3.0 send none
-		}
-		events = append(events, e)
-	}
-	if dropped > 0 {
-		slog.Warn("gateway reported usage outside its group", "instance", instance, "group", g.Name, "dropped", dropped)
-	}
-	if clamped > 0 || fixed > 0 {
-		slog.Warn("gateway reported usage the control plane corrected", "instance", instance,
-			"timestamps_clamped", clamped, "events_fixed", fixed)
-	}
+	events, _ := s.accept(snap, g, enc, p, req.Events)
 
 	fresh, events, err := s.record(r, instance, req.Batch, events)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -389,7 +545,11 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request, p peer) {
 		}
 	}
 	s.observe(r, instance, g.Name, p.schema, req.Stats)
-	writeJSON(w, http.StatusOK, s.Limits.Export(snap, req.Cursor))
+	cursor := req.Cursor
+	if c, ok := req.Cursors[s.Limits.ID()]; ok {
+		cursor = c
+	}
+	writeJSON(w, http.StatusOK, s.Limits.Export(snap, cursor))
 }
 
 // provisionPerMinute caps provisioning per gateway instance. It's a first
@@ -594,4 +754,10 @@ func trim(s string, n int) string {
 		return s[:n]
 	}
 	return s
+}
+
+// PruneStale deletes gateway instances not seen for a week, in every group.
+func PruneStale(ctx context.Context, pool *pgxpool.Pool) error {
+	_, err := pool.Exec(ctx, `DELETE FROM gateway_instances WHERE last_seen_at < $1`, time.Now().Add(-staleInstance))
+	return err
 }

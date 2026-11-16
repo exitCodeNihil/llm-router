@@ -34,6 +34,9 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "llm-router.gatewayServiceAccountName" . }}
+      {{- with .Values.podSecurityContext }}
+      securityContext: {{- toYaml . | nindent 8 }}
+      {{- end }}
       # Long enough to wait out endpoint removal, finish requests in flight
       # (LLMR_SHUTDOWN_TIMEOUT) and upload the last usage.
       terminationGracePeriodSeconds: {{ .Values.gateway.terminationGracePeriodSeconds }}
@@ -41,6 +44,9 @@ spec:
         - name: gateway
           image: "{{ .Values.gateway.image.repository }}:{{ .Values.gateway.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext: {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - name: http
               containerPort: 8080
@@ -49,14 +55,38 @@ spec:
               value: {{ .Values.gateway.controlPlaneUrl | default (printf "http://%s-llm-router:%v" .Release.Name .Values.service.port) | quote }}
             - name: LLMR_JOIN_TOKEN
               valueFrom: {secretKeyRef: {name: {{ .Values.gateway.existingSecret | default $fullname }}, key: join-token}}
+            {{- if .Values.usageClientIP }}
+            - name: LLMR_USAGE_CLIENT_IP
+              value: "true"
+            {{- with .Values.trustedProxies }}
+            - name: LLMR_TRUSTED_PROXIES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- end }}
+            - name: LLMR_LOG_LEVEL
+              value: {{ .Values.gateway.logLevel | quote }}
+            - name: LLMR_LOG_FORMAT
+              value: {{ .Values.gateway.logFormat | quote }}
+            {{- with .Values.gateway.maxConfigAge }}
+            - name: LLMR_MAX_CONFIG_AGE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.gateway.state.enabled }}
+            - name: LLMR_STATE_DIR
+              value: /var/lib/llmr
+            {{- end }}
             {{- if .Values.anthropicIdentity.enabled }}
             {{- include "llm-router.anthropicIdentityEnv" . | nindent 12 }}
             {{- end }}
             {{- with .Values.gateway.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          {{- if or .Values.anthropicIdentity.enabled .Values.gateway.extraVolumeMounts }}
+          {{- if or .Values.gateway.state.enabled .Values.anthropicIdentity.enabled .Values.gateway.extraVolumeMounts }}
           volumeMounts:
+            {{- if .Values.gateway.state.enabled }}
+            - name: state
+              mountPath: /var/lib/llmr
+            {{- end }}
             {{- if .Values.anthropicIdentity.enabled }}
             {{- include "llm-router.anthropicIdentityMount" . | nindent 12 }}
             {{- end }}
@@ -66,6 +96,10 @@ spec:
           {{- end }}
           readinessProbe:
             httpGet: {path: /healthz, port: 8080}
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: {path: /livez, port: 8080}
+            timeoutSeconds: 3
           {{- if and .Values.gateway.preStopSleepSeconds (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) }}
           # Keep accepting while the endpoint is removed from Services, so a
           # scale-in or rollout refuses no connections.
@@ -74,8 +108,14 @@ spec:
               sleep: {seconds: {{ .Values.gateway.preStopSleepSeconds }}}
           {{- end }}
           resources: {{- toYaml (.Values.gateway.resources | default dict) | nindent 12 }}
-      {{- if or .Values.anthropicIdentity.enabled .Values.gateway.extraVolumes }}
+      {{- if or .Values.gateway.state.enabled .Values.anthropicIdentity.enabled .Values.gateway.extraVolumes }}
       volumes:
+        {{- if .Values.gateway.state.enabled }}
+        # Outlives a container restart, not the pod.
+        - name: state
+          emptyDir:
+            sizeLimit: {{ .Values.gateway.state.sizeLimit }}
+        {{- end }}
         {{- if .Values.anthropicIdentity.enabled }}
         {{- include "llm-router.anthropicIdentityVolume" . | nindent 8 }}
         {{- end }}

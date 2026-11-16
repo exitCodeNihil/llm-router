@@ -47,10 +47,11 @@ func (m *Server) metricsLive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	provName, keyName, s := m.nameMaps()
-	total := m.Live.TotalRPM()
+	live := m.liveSummary()
+	total := live.TotalRPM()
 
 	providers := []map[string]any{}
-	for _, p := range m.Live.Providers() {
+	for _, p := range live.Providers {
 		share := 0.0
 		if total > 0 {
 			share = float64(p.Count) / float64(total) * 100
@@ -66,7 +67,7 @@ func (m *Server) metricsLive(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	edges := []map[string]any{}
-	for _, e := range m.Live.Edges() {
+	for _, e := range live.Edges {
 		edges = append(edges, map[string]any{
 			"key_id": e.KeyID, "key_name": keyName[e.KeyID], "model": e.Model,
 			"provider_id": e.ProviderID, "provider_name": provName[e.ProviderID], "volume": e.Volume,
@@ -74,7 +75,7 @@ func (m *Server) metricsLive(w http.ResponseWriter, r *http.Request) {
 	}
 	nodeNames := m.gatewayNames(r)
 	nodes := []map[string]any{}
-	for _, n := range m.Live.Nodes() {
+	for _, n := range live.Nodes {
 		name := nodeNames[n.ID]
 		if n.ID == "" {
 			name = "control-plane"
@@ -84,7 +85,12 @@ func (m *Server) metricsLive(w http.ResponseWriter, r *http.Request) {
 
 	keys, aliases, upstreams := 0, 0, len(provName)
 	if s != nil {
-		keys, aliases = len(s.KeysByHash), len(s.DeploymentsByModel)
+		aliases = len(s.DeploymentsByModel)
+		for _, k := range s.KeysByHash {
+			if !k.OldHash { // a rotated key's old secret is not another key
+				keys++
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"providers": providers, "edges": edges, "nodes": nodes,
@@ -95,7 +101,7 @@ func (m *Server) metricsLive(w http.ResponseWriter, r *http.Request) {
 // gatewayNames maps gateway instance ids to "group / instance" (best-effort).
 func (m *Server) gatewayNames(r *http.Request) map[string]string {
 	out := map[string]string{}
-	rows, err := listRows(r.Context(), m.Store.Pool,
+	rows, err := listRows(r.Context(), m.reads(),
 		`SELECT i.id, g.name || ' / ' || i.name AS name FROM gateway_instances i JOIN gateway_groups g ON g.id = i.group_id`)
 	if err != nil {
 		return out
@@ -113,34 +119,41 @@ const p50SLOms = 2000 // upstream p50 above this raises a cluster event
 // listNodes returns the control plane and the gateway instances with their ops
 // metrics, plus the cluster-events ring.
 func (m *Server) listNodes(w http.ResponseWriter, r *http.Request) {
-	selfVer := m.Version
-	if selfVer == "" {
-		selfVer = "dev"
-	}
-	selfUptime := int64(0)
-	if !m.Started.IsZero() {
-		selfUptime = int64(time.Since(m.Started).Seconds())
-	}
-	p50, selfP50 := 0, 0
-	if m.Live != nil {
-		p50, selfP50 = m.Live.OverallP50(), m.Live.NodeP50("")
-	}
-	self := metrics.NodeMetric{Version: selfVer, UptimeS: selfUptime, CPUPct: metrics.CPUPct()}
-	self.MemBytes, self.MemLimitBytes = metrics.Memory()
-	if m.HTTP != nil {
-		self.OpenConns, self.InFlight = m.HTTP.OpenConnections(), m.HTTP.InFlight()
-	}
+	self := m.selfMetric()
+	selfVer := self.Version
+	live := m.liveSummary()
+	p50 := live.P50
+	peers := m.peerStates()
+	// The control planes' own traffic is one figure for all of them: a
+	// request reaches whichever the load balancer picks.
 	selfRow := nodeRow(self)
-	for k, v := range map[string]any{"id": "self", "name": "control-plane", "addr": "", "role": "leader",
-		"version_skew": false, "rps": round1(m.liveRPS("")), "p50_ms": selfP50, "last_seen": time.Now().UTC(),
+	name := "control-plane"
+	if len(peers) > 0 {
+		name = "control-plane (this one)"
+	}
+	for k, v := range map[string]any{"id": "self", "name": name, "addr": "", "role": "leader",
+		"version_skew": false, "rps": round1(live.NodeRPS("")), "p50_ms": live.NodeP50[""], "last_seen": time.Now().UTC(),
 		"status": "ok"} {
 		selfRow[k] = v
 	}
 	nodes := []map[string]any{selfRow}
+	for _, p := range peers {
+		row := nodeRow(p.Self)
+		skew := p.Self.Version != selfVer
+		status := "ok"
+		if skew {
+			status = "warn"
+		}
+		for k, v := range map[string]any{"id": "cp-" + p.ID, "name": "control-plane " + p.ID[:min(6, len(p.ID))], "addr": "",
+			"role": "leader", "version_skew": skew, "rps": 0, "p50_ms": 0, "last_seen": p.Self.Updated, "status": status} {
+			row[k] = v
+		}
+		nodes = append(nodes, row)
+	}
 
 	now := time.Now()
 	// Gateway instances sync every 2 s, so a few missed syncs already mean trouble.
-	rows, _ := listRows(r.Context(), m.Store.Pool,
+	rows, _ := listRows(r.Context(), m.reads(),
 		`SELECT i.id, i.name, i.group_id, g.name AS group_name, g.region, i.last_seen_at
 		FROM gateway_instances i JOIN gateway_groups g ON g.id = i.group_id
 		WHERE i.last_seen_at > now() - interval '10 minutes' ORDER BY g.name, i.joined_at`)
@@ -167,12 +180,8 @@ func (m *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 		if m.GatewaySync != nil {
 			gw["unserved_providers"] = m.GatewaySync.UnservedProviders(groupID, nm.Schema)
 		}
-		p50 := 0
-		if m.Live != nil {
-			p50 = m.Live.NodeP50(id)
-		}
 		for k, v := range map[string]any{"id": id, "name": name, "addr": "", "role": "gateway", "group": group,
-			"region": row["region"], "version_skew": skew, "rps": round1(m.liveRPS(id)), "p50_ms": p50,
+			"region": row["region"], "version_skew": skew, "rps": round1(live.NodeRPS(id)), "p50_ms": live.NodeP50[id],
 			"last_seen": row["last_seen_at"], "status": status} {
 			gw[k] = v
 		}
@@ -184,7 +193,7 @@ func (m *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 		if p50 > p50SLOms {
 			m.Events.AddDedup("warn", "upstream p50 above SLO")
 		}
-		for _, e := range m.Events.Snapshot() {
+		for _, e := range m.clusterEvents() {
 			events = append(events, map[string]any{"ts": e.TS, "text": e.Text, "level": e.Level})
 		}
 	}
@@ -202,7 +211,7 @@ func nodeRow(nm metrics.NodeMetric) map[string]any {
 
 // nodesHistory returns each gateway's last hour of open connections, requests
 // in flight and memory, one sample per step (the peak over the step). Steps
-// without a sync are missing. Per process, like the other live metrics.
+// without a sync are missing. Kept in memory, from when this process started.
 func (m *Server) nodesHistory(w http.ResponseWriter, r *http.Request) {
 	gateways := []metrics.NodeHistory{}
 	if m.NodeStore != nil {
@@ -213,13 +222,6 @@ func (m *Server) nodesHistory(w http.ResponseWriter, r *http.Request) {
 		"window_s": int((metrics.HistoryLen * metrics.HistoryStep).Seconds()),
 		"gateways": gateways,
 	})
-}
-
-func (m *Server) liveRPS(id string) float64 {
-	if m.Live == nil {
-		return 0
-	}
-	return m.Live.NodeRPS(id)
 }
 
 func round1(f float64) float64 { return float64(int(f*10+0.5)) / 10 }

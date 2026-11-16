@@ -1,0 +1,76 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-llm-router
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: llm-router
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+    {{- if $np.egress.enabled }}
+    - Egress
+    {{- end }}
+  ingress:
+    # The console, the API, gateways and workspaces.
+    - ports:
+        - port: 8080
+        {{- if .Values.workspaces.enabled }}
+        - port: 8081
+        {{- end }}
+      {{- if $np.from }}
+      from:
+        - podSelector: {}
+        {{- toYaml $np.from | nindent 8 }}
+      {{- end }}
+    {{- if .Values.metrics.port }}
+    - ports:
+        - port: {{ .Values.metrics.port }}
+      {{- with $np.metricsFrom }}
+      from: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+  {{- if $np.egress.enabled }}
+  egress:
+    {{- include "llm-router.egress" . | nindent 4 }}
+  {{- end }}
+{{- if .Values.gateway.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-llm-router-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: llm-router-gateway
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+    {{- if $np.egress.enabled }}
+    - Egress
+    {{- end }}
+  ingress:
+    # Requests, and /metrics on the same port: so who may scrape is only
+    # narrowed where who may call is.
+    - ports:
+        - port: 8080
+      {{- if $np.from }}
+      from:
+        - podSelector: {}
+        {{- with $np.from }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with $np.metricsFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+  {{- if $np.egress.enabled }}
+  egress:
+    {{- include "llm-router.egress" . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}

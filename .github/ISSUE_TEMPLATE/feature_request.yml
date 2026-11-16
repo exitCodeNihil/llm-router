@@ -1,0 +1,38 @@
+name: Feature request
+description: A feature, a provider, or a change in behaviour you need
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you are trying to do
+      description: The situation and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help
+      description: The behaviour you would like. A rough idea is enough.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do instead for now
+      description: Workarounds or other tools you use, if any.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Providers and routing
+        - Keys, teams, budgets and limits
+        - Sign-in and access
+        - Gateways
+        - Observability and monitoring
+        - Console
+        - Deployment
+        - Workspaces
+        - Other

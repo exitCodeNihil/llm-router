@@ -2,6 +2,7 @@ package usage
 
 import (
 	"math"
+	"net/netip"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -19,6 +20,13 @@ func Window(now time.Time) (lo, hi time.Time) {
 	return cur.AddDate(0, -1, 0), cur.AddDate(0, 2, 0)
 }
 
+// HourlyFrom is the start of the oldest month whose hourly rollups are kept:
+// three months before the current one.
+func HourlyFrom(now time.Time) time.Time {
+	now = now.UTC()
+	return time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, -3, 0)
+}
+
 // maxFuture is how far ahead of the control plane's clock an event may be
 // stamped before it is treated as clock skew.
 const maxFuture = 2 * time.Minute
@@ -32,8 +40,8 @@ func ClampTS(ts, now time.Time) (time.Time, bool) {
 	if ts.IsZero() || ts.After(now.Add(maxFuture)) {
 		return now, true
 	}
-	// A day into the window, not its first instant: partition bounds are
-	// dates in the database's time zone, which may not be UTC.
+	// A day into the window, not its first instant: partitions made before
+	// 0.4 have bounds in the database's time zone, which may not be UTC.
 	if lo, _ := Window(now); ts.Before(lo) {
 		return lo.Add(24 * time.Hour), true
 	}
@@ -41,7 +49,7 @@ func ClampTS(ts, now time.Time) (time.Time, bool) {
 }
 
 // Sanitize makes an event reported by a gateway storable: ids that are not
-// uuids are dropped, text loses NUL bytes and invalid UTF-8 and is cut to the
+// uuids and a client address that is not one are dropped, text loses NUL bytes and invalid UTF-8 and is cut to the
 // lengths the console shows, and counts and costs are brought into the
 // columns' ranges. It reports how many fields it changed.
 func Sanitize(e *Event) int {
@@ -75,6 +83,13 @@ func Sanitize(e *Event) int {
 	if e.ParentSpanID != "" && !ValidSpanID(e.ParentSpanID) {
 		e.ParentSpanID = ""
 		fixed++
+	}
+	// An address Postgres cannot read as inet would refuse the whole row.
+	if e.ClientIP != "" {
+		if a, err := netip.ParseAddr(e.ClientIP); err != nil || a.Zone() != "" {
+			e.ClientIP = ""
+			fixed++
+		}
 	}
 	if e.CostBasis < 0 || e.CostBasis > math.MaxInt16 {
 		e.CostBasis = 0

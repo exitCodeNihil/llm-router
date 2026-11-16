@@ -3,10 +3,12 @@ package telemetry
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/exitcodenihil/llm-router/internal/redact"
 	"github.com/exitcodenihil/llm-router/internal/snapshot"
 	"github.com/exitcodenihil/llm-router/internal/usage"
 )
@@ -383,5 +385,44 @@ func TestRunFlushesOnShutdown(t *testing.T) {
 		default:
 			t.Fatalf("run %d: the queued record was not flushed before Run returned", i)
 		}
+	}
+}
+
+// Redaction runs once, before any queue: every destination, and the record
+// kept for the console, gets the redacted text.
+func TestWriteRedactsContent(t *testing.T) {
+	tel := snapshot.Telemetry{CaptureContent: true, Redaction: redact.Config{Enabled: true}}
+	tel.Compile()
+	a, b := dest("red-a", true), dest("red-b", true)
+	m := testManager(t, &snapshot.Snapshot{Telemetry: tel, Destinations: []*snapshot.Destination{a, b}})
+	m.Write(usage.Event{RequestID: "r", Export: true, CaptureContent: true,
+		Input:  []byte(`[{"role":"user","content":"mail me at jane@example.com"}]`),
+		System: []byte(`"key sk-abcdefghijklmnopqrstuvwx"`), Output: "card 4111 1111 1111 1111"})
+	for _, d := range []*snapshot.Destination{a, b} {
+		r := receive(t, sinkFor(t, d.Name))[0]
+		all := string(r.E.Input) + string(r.E.System) + r.E.Output
+		for _, gone := range []string{"jane@example.com", "sk-abcdefghijklmnopqrstuvwx", "4111 1111 1111 1111"} {
+			if strings.Contains(all, gone) {
+				t.Fatalf("%s received %q: %s", d.Name, gone, all)
+			}
+		}
+		if c := ContentOf(r); c == nil || len(c.Input) != 1 || c.Input[0].Parts[0].Content != "mail me at [REDACTED:email]" {
+			t.Fatalf("%s: content %+v", d.Name, c)
+		}
+	}
+}
+
+// A stored redaction that can't be compiled keeps content in: exporting it
+// unredacted is the one thing that must not happen.
+func TestBrokenRedactionWithholdsContent(t *testing.T) {
+	tel := snapshot.Telemetry{CaptureContent: true,
+		Redaction: redact.Config{Enabled: true, Custom: []redact.Pattern{{Name: "bad", Pattern: "("}}}}
+	tel.Compile()
+	d := dest("red-broken", true)
+	m := testManager(t, &snapshot.Snapshot{Telemetry: tel, Destinations: []*snapshot.Destination{d}})
+	m.Write(usage.Event{RequestID: "r", Export: true, CaptureContent: true, Output: "jane@example.com"})
+	r := receive(t, sinkFor(t, d.Name))[0]
+	if r.Content || r.E.Output != "" {
+		t.Fatalf("content exported with a broken redaction: %+v", r.E.Output)
 	}
 }

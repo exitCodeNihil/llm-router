@@ -23,11 +23,10 @@ import {
   useCreateTeam,
   useDeleteTeam,
   useRemoveMember,
-  useTeamMembers,
+  useTeamMembersPage,
   useUpdateMember,
-  useTeams,
+  useTeamsPage,
   useUpdateTeam,
-  useUsers,
 } from "../lib/hooks";
 import { budgetLabel } from "../lib/format";
 import { Empty, ErrorState, Loading, Page } from "../components/Page";
@@ -44,7 +43,8 @@ import {
   type LimitsState,
 } from "../components/forms";
 import { IconEdit, IconPlus, IconTeams, IconTrash } from "../components/icons";
-import { SearchBox, useTableTools } from "../components/tables";
+import { LoadMore, SearchBox, useServerSearch } from "../components/tables";
+import { EntityPicker } from "../components/EntityPicker";
 
 function TeamForm({
   editing,
@@ -199,22 +199,20 @@ function MemberBudgetForm({
 }
 
 function MembersPanel({ team, me }: { team: Team; me: Me }) {
-  const members = useTeamMembers(team.id);
+  const search = useServerSearch();
+  const members = useTeamMembersPage(team.id, { q: search.q });
+  const memberRows = useMemo(
+    () => members.data?.pages.flatMap((p) => p.items) ?? [],
+    [members.data],
+  );
   const add = useAddMember(team.id);
   const remove = useRemoveMember(team.id);
-  const users = useUsers(me.is_admin);
   const showToast = useToast();
 
   const [userId, setUserId] = useState("");
   const [role, setRole] = useState("member");
 
   const canManage = me.is_admin || me.team_roles[team.id] === "admin";
-
-  // Only offer users who are not already on the team.
-  const available = useMemo(() => {
-    const have = new Set((members.data ?? []).map((m) => m.user_id));
-    return (users.data ?? []).filter((u) => !have.has(u.id));
-  }, [users.data, members.data]);
 
   async function addMember(e: React.FormEvent) {
     e.preventDefault();
@@ -251,7 +249,16 @@ function MembersPanel({ team, me }: { team: Team; me: Me }) {
 
   return (
     <VStack gap={4}>
-      <span className="eyebrow">Members</span>
+      <HStack gap={2} hAlign="between" vAlign="end" wrap="wrap">
+        <span className="eyebrow">Members</span>
+        {(search.q || members.hasNextPage) && (
+          <SearchBox
+            value={search.query}
+            onChange={search.setQuery}
+            placeholder="Search members…"
+          />
+        )}
+      </HStack>
 
       {members.isLoading ? (
         <HStack gap={2} vAlign="center">
@@ -260,13 +267,13 @@ function MembersPanel({ team, me }: { team: Team; me: Me }) {
             Loading members…
           </Text>
         </HStack>
-      ) : (members.data?.length ?? 0) === 0 ? (
+      ) : memberRows.length === 0 ? (
         <Text type="supporting" color="secondary">
-          No members yet.
+          {search.q ? "No matching members." : "No members yet."}
         </Text>
       ) : (
         <VStack gap={2}>
-          {(members.data ?? []).map((m) => (
+          {memberRows.map((m) => (
             <HStack key={m.user_id} gap={3} vAlign="center">
               <Avatar name={m.name || m.email} size="sm" />
               <VStack gap={0} width="100%">
@@ -314,6 +321,7 @@ function MembersPanel({ team, me }: { team: Team; me: Me }) {
               )}
             </HStack>
           ))}
+          <LoadMore {...members} />
         </VStack>
       )}
 
@@ -325,16 +333,14 @@ function MembersPanel({ team, me }: { team: Team; me: Me }) {
               <span className="eyebrow">Add member</span>
               <HStack gap={2} vAlign="end" wrap="wrap">
                 {me.is_admin ? (
-                  <Selector
+                  <EntityPicker
+                    kind="user"
                     label="User"
                     value={userId}
                     onChange={setUserId}
-                    placeholder="Select a user…"
-                    hasSearch={available.length > 8}
-                    options={available.map((u) => ({
-                      value: u.id,
-                      label: u.email,
-                    }))}
+                    placeholder="Search users…"
+                    excludeFromTeam={team.id}
+                    hasClear={false}
                   />
                 ) : (
                   <TextInput
@@ -394,7 +400,9 @@ function MembersPanel({ team, me }: { team: Team; me: Me }) {
 }
 
 export default function Teams({ me }: { me: Me }) {
-  const teams = useTeams();
+  const search = useServerSearch();
+  const teams = useTeamsPage({ q: search.q });
+  const rows = useMemo(() => teams.data?.pages.flatMap((p) => p.items) ?? [], [teams.data]);
   const del = useDeleteTeam();
   const showToast = useToast();
 
@@ -407,7 +415,6 @@ export default function Teams({ me }: { me: Me }) {
     {
       key: "name",
       header: "Team",
-      sortable: true,
       width: proportional(1.4),
       renderCell: (t) => (
         <HStack gap={2} vAlign="center">
@@ -489,14 +496,6 @@ export default function Teams({ me }: { me: Me }) {
     },
   ];
 
-  const tools = useTableTools(
-    teams.data as Array<Team & Record<string, unknown>> | undefined,
-    {
-      search: (t) => `${t.name} ${(t.tags ?? []).join(" ")}`,
-      defaultSort: [{ sortKey: "name", direction: "ascending" }],
-    },
-  );
-
   const addButton = me.is_admin ? (
     <Button
       label="New team"
@@ -517,8 +516,8 @@ export default function Teams({ me }: { me: Me }) {
       action={
         <HStack gap={2} vAlign="center">
           <SearchBox
-            value={tools.query}
-            onChange={tools.setQuery}
+            value={search.query}
+            onChange={search.setQuery}
             placeholder="Search teams…"
           />
           {addButton}
@@ -530,23 +529,29 @@ export default function Teams({ me }: { me: Me }) {
           <Loading />
         ) : teams.error ? (
           <ErrorState error={teams.error} onRetry={() => teams.refetch()} />
-        ) : (teams.data?.length ?? 0) === 0 ? (
-          <Empty
-            title="No teams yet"
-            description="Create a team to pool budget across users."
-            action={addButton}
-          />
+        ) : rows.length === 0 ? (
+          search.q ? (
+            <Empty title="No matching teams" description="Search looks at the team name." />
+          ) : (
+            <Empty
+              title="No teams yet"
+              description="Create a team to pool budget across users."
+              action={addButton}
+            />
+          )
         ) : (
-          <Table
-            data={tools.rows}
-            plugins={tools.plugins}
-            columns={columns}
-            idKey="id"
-            density="balanced"
-            dividers="rows"
-            hasHover
-            textOverflow="truncate"
-          />
+          <VStack gap={0}>
+            <Table
+              data={rows as Array<Team & Record<string, unknown>>}
+              columns={columns}
+              idKey="id"
+              density="balanced"
+              dividers="rows"
+              hasHover
+              textOverflow="truncate"
+            />
+            <LoadMore {...teams} />
+          </VStack>
         )}
       </Card>
 

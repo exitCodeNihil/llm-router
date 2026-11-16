@@ -38,7 +38,7 @@ import {
   useDeleteDestination,
   useDestinations,
   useGatewayGroups,
-  useKeys,
+  useLookup,
   useObservabilityExported,
   useObservabilityRuleStats,
   useSetTelemetry,
@@ -47,11 +47,12 @@ import {
   useTelemetryKinds,
   useTestDestination,
   useToggleDestination,
-  useUsers,
 } from "../lib/hooks";
 import { int, money } from "../lib/format";
 import { Empty, ErrorState, Loading, Page } from "../components/Page";
 import { Confirm } from "../components/dialogs";
+import { EntityPicker } from "../components/EntityPicker";
+import { RedactionCard } from "../components/RedactionCard";
 import { CONTROL_PLANE, DestinationDialog } from "../components/DestinationDialog";
 import { IconEdit, IconPlus, IconTrash } from "../components/icons";
 
@@ -414,8 +415,6 @@ export default function Observability() {
   const save = useSetTelemetry();
   const destinations = useDestinations();
   const teams = useTeams();
-  const users = useUsers();
-  const keys = useKeys();
   const exported = useObservabilityExported();
   const stats = useObservabilityRuleStats();
   const showToast = useToast();
@@ -477,20 +476,20 @@ export default function Observability() {
     setScopeValue("");
   }
 
-  // Options for the scope picker follow the selected scope type.
-  const scopeOptions = useMemo(() => {
-    if (scopeType === "team") return (teams.data ?? []).map((t) => ({ value: t.id, label: t.name }));
-    if (scopeType === "user") return (users.data ?? []).map((u) => ({ value: u.id, label: u.email }));
-    if (scopeType === "key")
-      return (keys.data ?? []).map((k) => ({ value: k.id, label: k.name || k.key_prefix }));
-    return [];
-  }, [scopeType, teams.data, users.data, keys.data]);
+  const teamOptions = useMemo(
+    () => (teams.data ?? []).map((t) => ({ value: t.id, label: t.name })),
+    [teams.data],
+  );
+
+  // Names of the users and keys the rules point at, saved and draft alike.
+  const scopedIds = (type: RuleScope) =>
+    [...rules, ...(tel.data?.rules ?? [])].filter((r) => r.scope_type === type).map((r) => r.scope_value);
+  const names = useLookup({ users: scopedIds("user"), keys: scopedIds("key") }).data;
 
   const scopeLabel = (r: TelemetryRule) => {
     if (r.scope_type === "team") return teams.data?.find((t) => t.id === r.scope_value)?.name ?? r.scope_value;
-    if (r.scope_type === "user") return users.data?.find((u) => u.id === r.scope_value)?.email ?? r.scope_value;
-    if (r.scope_type === "key")
-      return keys.data?.find((k) => k.id === r.scope_value)?.name ?? r.scope_value;
+    if (r.scope_type === "user") return names?.users[r.scope_value] ?? r.scope_value;
+    if (r.scope_type === "key") return names?.keys[r.scope_value] ?? r.scope_value;
     return r.scope_value;
   };
 
@@ -530,7 +529,7 @@ export default function Observability() {
     for (const b of saved.rules ?? []) if (!after.has(b.id)) out.push(`Remove rule: ${b.scope_type} ${scopeLabel(b)}`);
     return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [saved, mode, captureContent, rules, teams.data, users.data, keys.data]);
+  }, [saved, mode, captureContent, rules, teams.data, names]);
 
   // Requests per minute that would start or stop having content captured.
   const affected = useMemo(() => {
@@ -542,7 +541,7 @@ export default function Observability() {
 
   async function savePolicy() {
     try {
-      await save.mutateAsync({ mode, capture_content: captureContent, rules });
+      await save.mutateAsync({ ...saved!, mode, capture_content: captureContent, rules });
       showToast({ body: "Capture policy applied" });
     } catch (err) {
       showToast({ body: err instanceof Error ? err.message : "Failed", type: "error" });
@@ -755,14 +754,23 @@ export default function Observability() {
                   />
                   {scopeType === "tag" ? (
                     <TextInput label="Tag" value={scopeValue} onChange={setScopeValue} placeholder="prod" />
+                  ) : scopeType === "user" || scopeType === "key" ? (
+                    <EntityPicker
+                      key={scopeType}
+                      kind={scopeType}
+                      label="Target"
+                      value={scopeValue}
+                      onChange={setScopeValue}
+                      placeholder="Search…"
+                    />
                   ) : (
                     <Selector
                       label="Target"
                       value={scopeValue}
                       onChange={setScopeValue}
                       placeholder="Select…"
-                      hasSearch={scopeOptions.length > 8}
-                      options={scopeOptions}
+                      hasSearch={teamOptions.length > 8}
+                      options={teamOptions}
                     />
                   )}
                   <Selector
@@ -848,6 +856,8 @@ export default function Observability() {
             )}
           </VStack>
         </Card>
+
+        <RedactionCard />
 
         {/* Live export feed */}
         <Card padding={0}>

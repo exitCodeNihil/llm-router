@@ -3,8 +3,6 @@ package store
 import (
 	"context"
 	"fmt"
-
-	"github.com/google/uuid"
 )
 
 // SeedClaudeSubscription registers the pass-through provider that lets Claude
@@ -24,7 +22,7 @@ func (s *Store) SeedClaudeSubscription(ctx context.Context) error {
 	if exists {
 		return nil
 	}
-	pid := uuid.New()
+	pid := NewID()
 	if _, err := s.Pool.Exec(ctx, `
 		INSERT INTO providers (id, name, type, base_url, auth_mode, config)
 		VALUES ($1, $2, 'anthropic', 'https://api.anthropic.com', 'oauth_passthrough', '{}')`,
@@ -33,7 +31,7 @@ func (s *Store) SeedClaudeSubscription(ctx context.Context) error {
 	}
 	if _, err := s.Pool.Exec(ctx, `
 		INSERT INTO model_deployments (id, provider_id, model_name, upstream_name, api_flavor)
-		VALUES ($1, $2, 'claude-*', 'claude-*', 'anthropic')`, uuid.New(), pid); err != nil {
+		VALUES ($1, $2, 'claude-*', 'claude-*', 'anthropic')`, NewID(), pid); err != nil {
 		return fmt.Errorf("seed subscription model: %w", err)
 	}
 	return s.BumpConfigVersion(ctx)

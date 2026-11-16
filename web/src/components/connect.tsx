@@ -99,9 +99,14 @@ export function ConnectDialog({
   secret,
   allowedModels,
   onClose,
+  title,
+  subtitle,
 }: {
-  /** The full key, known only right after creation. */
+  /** The full key, known only right after creation or rotation. */
   secret?: string;
+  /** Override the heading, e.g. after a rotation. */
+  title?: string;
+  subtitle?: string;
   /** null means every model the gateway serves. */
   allowedModels: string[] | null;
   onClose: () => void;
@@ -124,11 +129,12 @@ export function ConnectDialog({
       maxHeight="calc(100vh - 48px)"
     >
       <DialogHeader
-        title={secret ? "API key created" : "Connect a client"}
+        title={title ?? (secret ? "API key created" : "Connect a client")}
         subtitle={
-          secret
+          subtitle ??
+          (secret
             ? "This is the only time the full key is shown — it is already filled into the snippets below."
-            : "Configuration for this key, with every model it may call."
+            : "Configuration for this key, with every model it may call.")
         }
       />
       <VStack gap={4} padding={4} isScrollable style={{ minHeight: 0 }}>

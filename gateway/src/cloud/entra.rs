@@ -77,7 +77,7 @@ pub fn shared() -> Arc<dyn Bearer> {
         .get_or_init(|| match Entra::from_vars(|n| std::env::var(n).ok().filter(|v| !v.is_empty())) {
             Ok(e) => Arc::new(RefreshingToken::new(e)),
             Err(why) => {
-                eprintln!("entra: {why}");
+                crate::log_error!("entra: {why}");
                 Arc::new(Refused(format!("entra: {why}")))
             }
         })
