@@ -236,7 +236,11 @@ pub async fn handle_from(
 ) -> Result<Response<Body>, Infallible> {
     let (slot, n) = InFlight::take();
     let route = route_of(req.method(), req.uri().path());
-    let resp = if n > st.max_in_flight {
+    // Probes and the scrape are answered however busy the gateway is: a
+    // refused liveness probe would have it restarted with every request in
+    // flight, and a refused scrape hides the overload from its own alert.
+    let ops = matches!(req.uri().path(), "/livez" | "/healthz" | "/metrics");
+    let resp = if n > st.max_in_flight && !ops {
         metrics::SHED.fetch_add(1, Ordering::Relaxed);
         let mut r = oai_error(
             StatusCode::SERVICE_UNAVAILABLE,
