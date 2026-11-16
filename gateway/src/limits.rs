@@ -487,8 +487,10 @@ pub fn apply(batch: &[Arc<Scope>], c: &Counters) {
     if c.now_ms > 0 {
         CLOCK_OFFSET_MS.store(c.now_ms - now_ms(), Ordering::Relaxed);
     }
-    discard(batch);
+    // Under the registry lock, so a save never sees the batch gone and the
+    // control plane's figure not yet in.
     let reg = registry().lock().unwrap();
+    discard(batch);
     for s in reg.values() {
         let mut i = s.inner.lock().unwrap();
         if let Some(usd) = c.spend.get(&s.name) {

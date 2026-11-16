@@ -40,6 +40,11 @@ const MAX_BATCH: usize = 50_000;
 const MAX_BATCH_BYTES: usize = 16 << 20;
 const MIN_BATCH_BYTES: usize = 64 << 10;
 
+/// How often usage is written to the spool while there is no session yet.
+const SEAL_BEFORE_JOIN: Duration = Duration::from_secs(2);
+/// Epoch changes closer together than this are control planes settling on
+/// one, not a database restored again.
+const EPOCH_SETTLE: Duration = Duration::from_secs(30);
 /// The control plane marks a 401 that is its own verdict (no such group, join
 /// token or instance) with this header; a 401 without it may come from a proxy
 /// in between.
@@ -472,7 +477,23 @@ impl ControlPlane {
         // The loops end with this task.
         let mut loops = tokio::task::JoinSet::new();
         loops.spawn(self.clone().save_loop());
-        self.rejoin(0).await;
+        // Nothing syncs before the first join, and a gateway that started
+        // from its state directory serves meanwhile: keep that usage on disk
+        // too, as each sync does afterwards.
+        {
+            let joined = self.rejoin(0);
+            tokio::pin!(joined);
+            loop {
+                tokio::select! {
+                    _ = &mut joined => break,
+                    _ = tokio::time::sleep(SEAL_BEFORE_JOIN) => {
+                        if let Some(spool) = &self.spool {
+                            spool.seal().await;
+                        }
+                    }
+                }
+            }
+        }
         loops.spawn(self.clone().renew_loop());
         loops.spawn(self.clone().config_loop(st));
         // Usage an earlier process left goes first, so the first sync's spend
@@ -564,12 +585,15 @@ impl ControlPlane {
         st.ready.set(true);
     }
 
-    /// Write the state directory when something changed, SAVE_INTERVAL
-    /// apart at most.
+    /// Write the state directory every SAVE_INTERVAL. Not only when the
+    /// control plane confirmed something: what this gateway counts itself
+    /// changes with every request, and a gateway killed while the control
+    /// plane is away, also one that started from this directory, must not
+    /// start again from spend older than that. Nothing is written before a
+    /// config was confirmed or once the gateway was refused.
     async fn save_loop(self: Arc<Self>) {
         let Some(state) = self.state.clone() else { return };
         loop {
-            state.changed().await;
             let state = state.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 state.touch();
@@ -634,6 +658,7 @@ impl ControlPlane {
     async fn config_loop(self: Arc<Self>, st: &'static State) {
         let mut discarded = 0u32;
         let mut renegotiated: Option<Instant> = None;
+        let mut epoch_changed: Option<Instant> = None;
         loop {
             let (s, generation) = self.session();
             let schema = self.schema.load(Ordering::Relaxed);
@@ -644,6 +669,7 @@ impl ControlPlane {
             let named = held.as_ref().filter(|_| !unnamed);
             let headers = named.map(|h| poll_headers(h, schema)).unwrap_or_default();
             let unconditional = headers.is_empty();
+            let epoch_held = held.as_ref().map(|h| h.epoch.clone()).filter(|e| !e.is_empty());
             match self.call(Method::GET, "/gw/v1/config?wait=25", &s, None, &headers, Duration::from_secs(40)).await {
                 Ok(Call::Ok(StatusCode::OK, headers, bytes)) => {
                     let gzip = headers.get(header::CONTENT_ENCODING) == Some(&HeaderValue::from_static("gzip"));
@@ -653,6 +679,7 @@ impl ControlPlane {
                     match received.unwrap_or_else(|e| Received::Rejected(e.to_string())) {
                         Received::Config(loaded) => {
                             let Loaded { cfg, held, older } = *loaded;
+                            let other_epoch = epoch_held.is_some_and(|e| e != held.epoch);
                             discarded = 0;
                             self.refetch.store(false, Ordering::Relaxed);
                             self.restored.store(false, Ordering::Relaxed);
@@ -664,6 +691,14 @@ impl ControlPlane {
                             st.ready.config_ok();
                             if older {
                                 self.renegotiate(&mut renegotiated, generation).await;
+                            }
+                            // Control planes that do not yet agree on the epoch
+                            // each answer at once with their own config: do not
+                            // rebuild it back to back while they settle.
+                            if other_epoch
+                                && epoch_changed.replace(Instant::now()).is_some_and(|at| at.elapsed() < EPOCH_SETTLE)
+                            {
+                                tokio::time::sleep(Duration::from_secs(2)).await;
                             }
                         }
                         Received::Kept { why, confirmed, older } => {
