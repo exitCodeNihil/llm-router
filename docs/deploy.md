@@ -202,7 +202,9 @@ readiness, as the chart does. `/metrics` is in Prometheus format; see [Monitorin
 
 With `LLMR_STATE_DIR` (`gateway.state.enabled` in the chart) a gateway saves, at most every 30
 seconds, the config it last received and, beside it, when the control plane last confirmed that
-config and the spend of every budgeted key, user and team as of its last sync. While the control
+config and the spend of every budgeted key, user and team: the control plane's figure as of the last
+sync plus what the gateway has counted since, written every 30 seconds and at shutdown, also while
+the control plane is away. While the control
 plane refuses the gateway, it also keeps since when. The files are encrypted with a key derived from
 the join token.
 
@@ -213,7 +215,8 @@ shorter). Budgets continue from the saved spend; if none was saved, requests und
 control plane's config. Files it cannot read, for example after the join token changed, are deleted
 and it starts as it would without them.
 
-The directory also holds a spool of usage: before each sync, the events queued since the last one are
+The directory also holds a spool of usage: before each sync, and every two seconds while a gateway
+that started from these files has not joined yet, the events queued since the last time are
 written to `spool/`, without captured prompts or responses, and deleted once the control plane has
 acknowledged them. A gateway that starts and finds events there, left by a run that crashed or was
 killed, sends them to the control plane before its first sync, and the control plane stores each
