@@ -25,3 +25,7 @@ web/src/llm-router.variants.d.ts
 # Local agent settings and generated deploy secrets
 .claude/
 deploy/.env
+
+# Scratch benchmark runs: only results cited in docs/benchmarks.md are committed.
+bench/results/*-soak*/
+bench/results/rgw-*/
