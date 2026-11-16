@@ -7,12 +7,15 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -43,16 +46,25 @@ func (b *Builder) Build(ctx context.Context) (*Snapshot, error) {
 		return nil, fmt.Errorf("config_version: %w", err)
 	}
 	// The cluster's identifier and timeline: a restore from a dump is another
-	// cluster, a point-in-time recovery or a failover another timeline.
+	// cluster, a point-in-time recovery or a failover another timeline. A
+	// database that will not tell goes without; a query that fails for now
+	// fails the build, since an epoch with a part missing would
+	// read to gateways as another database.
 	var sysid, timeline int64
-	if err := b.Pool.QueryRow(ctx, `SELECT (pg_control_system()).system_identifier,
-		(pg_control_checkpoint()).timeline_id`).Scan(&sysid, &timeline); err == nil {
+	switch err := b.Pool.QueryRow(ctx, `SELECT (pg_control_system()).system_identifier,
+		(pg_control_checkpoint()).timeline_id`).Scan(&sysid, &timeline); {
+	case err == nil:
 		s.Epoch = strconv.FormatInt(sysid, 36) + "." + strconv.FormatInt(timeline, 36)
+	case unreachable(err):
+		return nil, fmt.Errorf("config epoch: %w", err)
 	}
 	// ... and a value of our own, replaced when the database is found to
 	// have gone back in place.
-	if err := b.Pool.QueryRow(ctx, `SELECT value #>> '{}' FROM settings WHERE key='config_epoch'`).Scan(&s.EpochID); err == nil {
+	switch err := b.Pool.QueryRow(ctx, `SELECT value #>> '{}' FROM settings WHERE key='config_epoch'`).Scan(&s.EpochID); {
+	case err == nil:
 		s.Epoch += "." + s.EpochID
+	case !errors.Is(err, pgx.ErrNoRows):
+		return nil, fmt.Errorf("config epoch: %w", err)
 	}
 
 	rows, err := b.Pool.Query(ctx, `SELECT id, email, role, budget_usd, budget_period, rpm_limit, tpm_limit, tags, allowed_models FROM users WHERE NOT disabled`)
@@ -646,4 +658,22 @@ func setOf(names []string) map[string]bool {
 		set[n] = true
 	}
 	return set
+}
+
+// unreachable reports whether a query failed because the database could not
+// be reached or is not taking work for now, rather than because this server
+// will never answer it (a role without the right, an engine without the
+// function or without a control file).
+func unreachable(err error) bool {
+	var pg *pgconn.PgError
+	if !errors.As(err, &pg) {
+		return true // no answer from the server at all
+	}
+	switch {
+	case strings.HasPrefix(pg.Code, "08"), // connection exception
+		strings.HasPrefix(pg.Code, "53"), // insufficient resources
+		strings.HasPrefix(pg.Code, "57"): // operator intervention: shutting down, cancelled
+		return true
+	}
+	return false
 }
