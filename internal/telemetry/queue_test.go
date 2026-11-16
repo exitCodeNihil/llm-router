@@ -428,3 +428,52 @@ func TestFinalDrainsWithRetries(t *testing.T) {
 		t.Fatalf("delivered %d, want 6", w.st.delivered)
 	}
 }
+
+// The shutdown drain sends up to Parallel batches at once, like the worker
+// does while it runs: a slow backend would otherwise use up Drain on a few
+// batches.
+func TestFinalDrainsInParallel(t *testing.T) {
+	p := fastPolicy()
+	p.BatchSpans, p.Parallel, p.Drain = 1, 4, 5*time.Second
+	s := &slowSink{hold: 60 * time.Millisecond, done: make(chan struct{}, 16)}
+	w := testWorker(p, s)
+	for i := range 12 {
+		w.q.push(rec(fmt.Sprint(i)))
+	}
+	start := time.Now()
+	if left := w.final(); left != 0 {
+		t.Fatalf("%d spans left after the drain", left)
+	}
+	if s.peak != 4 {
+		t.Fatalf("%d exports at once, want 4", s.peak)
+	}
+	if took := time.Since(start); took > 500*time.Millisecond {
+		t.Fatalf("twelve 60 ms exports took %v: not sent in parallel", took)
+	}
+	if w.st.delivered != 12 {
+		t.Fatalf("delivered %d, want 12", w.st.delivered)
+	}
+}
+
+// stuckSink never answers before its context ends.
+type stuckSink struct{}
+
+func (stuckSink) Export(ctx context.Context, b []*Record) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+func (stuckSink) TraceURL(context.Context) string { return "" }
+
+// When Drain runs out, every span that was not delivered is counted: those
+// still queued and those in the batches cut off mid-export.
+func TestFinalCountsWhatDrainCutsOff(t *testing.T) {
+	p := fastPolicy()
+	p.BatchSpans, p.Parallel, p.Drain = 2, 2, 80*time.Millisecond
+	w := testWorker(p, stuckSink{})
+	for i := range 10 {
+		w.q.push(rec(fmt.Sprint(i)))
+	}
+	if left := w.final(); left != 10 {
+		t.Fatalf("final reported %d spans undelivered, want 10", left)
+	}
+}

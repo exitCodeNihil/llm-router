@@ -232,49 +232,74 @@ func (w *worker) linger(ctx context.Context) {
 }
 
 // final delivers what is still queued at shutdown, including batches that
-// were in flight when the worker was stopped, for at most Drain. A batch the
-// backend refuses for now is tried again each second until then.
-func (w *worker) final() {
+// were in flight when the worker was stopped, for at most Drain and Parallel
+// batches at once. A batch the backend refuses for now is tried again each
+// second until then. It returns how many spans were not delivered.
+func (w *worker) final() int {
 	drain := w.p.Drain
 	if drain <= 0 {
 		drain = 5 * time.Second
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), drain)
 	defer cancel()
+	var left atomic.Int64
+	var sending sync.WaitGroup
+	slots := make(chan struct{}, max(w.p.Parallel, 1))
+take:
 	for ctx.Err() == nil {
 		batch := w.q.take()
 		if len(batch) == 0 {
-			return
+			break
 		}
 		if batch = w.admit(batch); len(batch) == 0 {
 			continue
 		}
 		slot := w.sink.Load()
 		if slot.s == nil {
-			return
+			left.Add(int64(len(batch)))
+			break
 		}
-		for {
-			err := slot.s.Export(ctx, batch)
-			if err == nil {
-				w.st.ok(len(batch))
-				break
-			}
-			var xe *ExportError
-			if !errors.As(err, &xe) || !xe.Retryable || ctx.Err() != nil {
-				w.st.failed(err, &w.st.expired, len(batch))
-				if ctx.Err() != nil {
-					return
-				}
-				break
-			}
-			select {
-			case <-time.After(time.Second):
-			case <-ctx.Done():
-			}
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			left.Add(int64(len(batch)))
+			break take
 		}
+		sending.Add(1)
+		go func() {
+			defer func() { <-slots; sending.Done() }()
+			if !w.finalSend(ctx, slot.s, batch) {
+				left.Add(int64(len(batch)))
+			}
+		}()
 	}
-	if n, _ := w.q.depth(); n > 0 {
+	sending.Wait()
+	n, _ := w.q.depth()
+	n += int(left.Load())
+	if n > 0 {
 		slog.Warn("telemetry spans left undelivered at shutdown", "destination", w.dest.Load().Name, "spans", n)
+	}
+	return n
+}
+
+// finalSend exports one batch during the shutdown drain and reports whether
+// it was delivered.
+func (w *worker) finalSend(ctx context.Context, s Sink, batch []*Record) bool {
+	for {
+		err := s.Export(ctx, batch)
+		if err == nil {
+			w.st.ok(len(batch))
+			return true
+		}
+		var xe *ExportError
+		if !errors.As(err, &xe) || !xe.Retryable || ctx.Err() != nil {
+			w.st.failed(err, &w.st.expired, len(batch))
+			return false
+		}
+		select {
+		case <-time.After(time.Second):
+		case <-ctx.Done():
+		}
 	}
 }
 
