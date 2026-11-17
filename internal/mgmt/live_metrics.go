@@ -154,7 +154,8 @@ func (m *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	// Gateway instances sync every 2 s, so a few missed syncs already mean trouble.
 	rows, _ := listRows(r.Context(), m.reads(),
-		`SELECT i.id, i.name, i.group_id, g.name AS group_name, g.region, i.last_seen_at
+		`SELECT i.id, i.name, i.group_id, g.name AS group_name, g.region, i.last_seen_at,
+			coalesce(i.joined_at < g.token_rotated_at, false) AS old_token
 		FROM gateway_instances i JOIN gateway_groups g ON g.id = i.group_id
 		WHERE i.last_seen_at > now() - interval '10 minutes' ORDER BY g.name, i.joined_at`)
 	for _, row := range rows {
@@ -182,7 +183,7 @@ func (m *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 		}
 		for k, v := range map[string]any{"id": id, "name": name, "addr": "", "role": "gateway", "group": group,
 			"region": row["region"], "version_skew": skew, "rps": round1(live.NodeRPS(id)), "p50_ms": live.NodeP50[id],
-			"last_seen": row["last_seen_at"], "status": status} {
+			"last_seen": row["last_seen_at"], "status": status, "old_token": row["old_token"]} {
 			gw[k] = v
 		}
 		nodes = append(nodes, gw)

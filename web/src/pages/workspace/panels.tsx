@@ -72,7 +72,7 @@ export function FilesCard() {
             Stored encrypted; anything under <Code>.ssh/</Code> is written 0600.
           </Text>
         </VStack>
-        <HStack gap={2} vAlign="end" wrap="wrap">
+        <HStack className="help-above" gap={2} vAlign="end" wrap="wrap">
           <TextInput
             label="Folder in $HOME"
             size="sm"

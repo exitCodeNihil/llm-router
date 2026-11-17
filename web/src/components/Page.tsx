@@ -47,6 +47,35 @@ export function Page({
   );
 }
 
+/**
+ * One topic on a settings page: its name and explanation on the left, its
+ * controls on the right. `aside` holds a status badge or a help link.
+ */
+export function SettingsSection({
+  title,
+  description,
+  aside,
+  children,
+}: {
+  title: string;
+  description: string;
+  aside?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <section className="settings-section">
+      <VStack gap={2} hAlign="start">
+        <Heading level={3}>{title}</Heading>
+        <Text type="supporting" color="secondary">
+          {description}
+        </Text>
+        {aside}
+      </VStack>
+      <div style={{ minWidth: 0 }}>{children}</div>
+    </section>
+  );
+}
+
 export function Loading({ label = "Loading" }: { label?: string }) {
   return (
     <Center minHeight={200}>

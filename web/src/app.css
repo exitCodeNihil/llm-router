@@ -30,7 +30,7 @@ body {
 /* The console's signature monospace eyebrow label. */
 .eyebrow {
   font-family: var(--font-family-code);
-  font-size: var(--text-size-xsm);
+  font-size: var(--font-size-sm);
   letter-spacing: 0.14em;
   text-transform: uppercase;
   /* Secondary, not disabled: the disabled tone fails AA contrast on both grounds. */
@@ -61,4 +61,80 @@ body {
 .rowlink:focus-visible {
   color: var(--color-accent);
   text-decoration-style: solid;
+}
+
+/* Field help sits under the input, not between the label and the input, so
+   inputs placed side by side line up whatever their help text says. Astryx
+   renders label, description, input as children of a column; only the order
+   changes, so aria-describedby still points at the description. */
+.astryx-field > .astryx-field-label ~ span[id] {
+  order: 1;
+}
+/* An input with a button beside it, bottom-aligned: help stays above so the
+   button lines up with the input and not with the help text. */
+.help-above .astryx-field > .astryx-field-label ~ span[id] {
+  order: 0;
+}
+
+/* A settings section: what it is on the left, its controls on the right.
+   One column when the content area is too narrow for both. */
+.settings-section {
+  display: grid;
+  grid-template-columns: minmax(200px, 280px) minmax(0, 1fr);
+  gap: var(--spacing-4) var(--spacing-8);
+  align-items: start;
+}
+@media (max-width: 1000px) {
+  .settings-section {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* Plain lists inside dialogs and help text. */
+.prose-list {
+  margin: 0;
+  padding-inline-start: var(--spacing-5);
+  display: grid;
+  gap: var(--spacing-2);
+  font-size: var(--font-size-base);
+  line-height: 1.5;
+  color: var(--color-text-primary);
+}
+ol.prose-list {
+  list-style: decimal;
+}
+ul.prose-list {
+  list-style: disc;
+}
+.prose-list li::marker {
+  color: var(--color-text-secondary);
+}
+
+/* Label and value pairs, aligned in two columns. */
+.kv {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: var(--spacing-2) var(--spacing-4);
+  align-items: baseline;
+  margin: 0;
+  font-size: var(--font-size-base);
+}
+.kv dt {
+  color: var(--color-text-secondary);
+}
+.kv dd {
+  margin: 0;
+  font-family: var(--font-family-code);
+  /* The code face runs larger than the text face at the same size. */
+  font-size: 0.92em;
+  overflow-wrap: anywhere;
+}
+
+/* The design system's tooltip has no width limit: a sentence ran off the
+   page in one line. Wrap it instead. */
+[role="tooltip"] {
+  max-width: min(360px, calc(100vw - 32px));
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-wrap: pretty;
 }

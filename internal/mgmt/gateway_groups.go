@@ -62,7 +62,8 @@ func (m *Server) createGatewayGroup(w http.ResponseWriter, r *http.Request) {
 }
 
 // rotateGatewayToken replaces the join token. Running gateways keep their
-// sessions; new ones need the new token.
+// sessions; new ones need the new token. token_rotated_at lets the console
+// point out the gateways still holding the old one.
 func (m *Server) rotateGatewayToken(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
@@ -70,7 +71,7 @@ func (m *Server) rotateGatewayToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token, hash := newJoinToken()
-	tag, err := m.Store.Pool.Exec(r.Context(), `UPDATE gateway_groups SET join_token_hash=$2 WHERE id=$1`, id, hash)
+	tag, err := m.Store.Pool.Exec(r.Context(), `UPDATE gateway_groups SET join_token_hash=$2, token_rotated_at=now() WHERE id=$1`, id, hash)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -105,7 +106,8 @@ func (m *Server) deleteGatewayGroup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Server) listGatewayInstances(w http.ResponseWriter, r *http.Request) {
-	m.list(w, r, `SELECT i.id, i.group_id, g.name AS group_name, g.region, i.name, i.version, i.joined_at, i.last_seen_at
+	m.list(w, r, `SELECT i.id, i.group_id, g.name AS group_name, g.region, i.name, i.version, i.joined_at, i.last_seen_at,
+			coalesce(i.joined_at < g.token_rotated_at, false) AS old_token
 		FROM gateway_instances i JOIN gateway_groups g ON g.id = i.group_id
 		ORDER BY g.name, i.joined_at`)
 }
