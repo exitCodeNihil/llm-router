@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/exitCodeNihil/llm-router/compare/v0.4.0...v0.4.1) (2026-11-17)
+
+
+### Features
+
+* **console:** settings layout, field help and join token warnings ([#25](https://github.com/exitCodeNihil/llm-router/issues/25)) ([2d11647](https://github.com/exitCodeNihil/llm-router/commit/2d11647666a7066833e8a6761d671166607c6078))
+
 ## [0.4.0](https://github.com/exitCodeNihil/llm-router/compare/v0.3.1...v0.4.0) (2026-11-16)
 
 
